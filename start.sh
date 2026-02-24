@@ -34,6 +34,7 @@ QUEUE_URL=${QUEUE_URL:-http://api.wanly22.com:8001}
 FRIENDLY_NAME=${FRIENDLY_NAME:-runpod-${RUNPOD_POD_ID:-unknown}}
 COMFYUI_URL=http://localhost:8188
 COMFYUI_PATH=/app/ComfyUI
+LORA_CACHE_DIR=/workspace/models/loras
 EOF
 
 echo "Daemon config:"
