@@ -46,7 +46,7 @@ cd /app/ComfyUI
 python3 main.py --listen 0.0.0.0 --port 8188 \
     --extra-model-paths-config extra_model_paths.yaml \
     --preview-method latent2rgb \
-    --cache-none \
+    --cache-none --lowvram \
     > /workspace/logs/comfyui.log 2>&1 &
 COMFYUI_PID=$!
 echo "ComfyUI started (PID $COMFYUI_PID)"
