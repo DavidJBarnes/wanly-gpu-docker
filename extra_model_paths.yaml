@@ -4,3 +4,4 @@ wanly:
     vae: vae/
     diffusion_models: diffusion_models/
     loras: loras/
+    clip_vision: clip_vision/
