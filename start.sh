@@ -42,11 +42,12 @@ cat "$DAEMON_DIR/.env"
 
 # ---------- 3b. Disable ReActor NSFW filter ----------
 # ReActor's hardcoded NSFW filter drops video frames it considers unsafe,
-# which breaks RIFE (needs >= 2 frames). Set threshold to 1.0 to disable.
+# which breaks RIFE (needs >= 2 frames). Inject early return into nsfw_image()
+# so the NSFW model never loads or runs (same approach as local 3090).
 REACTOR_SFW="/app/ComfyUI/custom_nodes/comfyui-reactor-node/scripts/reactor_sfw.py"
 if [ -f "$REACTOR_SFW" ]; then
-    sed -i 's/^SCORE = .*/SCORE = 1.0/' "$REACTOR_SFW"
-    echo "Patched ReActor NSFW threshold to 1.0 (disabled)"
+    sed -i '/^def nsfw_image/a\    return False  # NSFW filter disabled by wanly start.sh' "$REACTOR_SFW"
+    echo "Patched ReActor: nsfw_image() returns False (disabled)"
 fi
 
 # ---------- 4. Start ComfyUI (background, no auth) ----------
