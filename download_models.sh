@@ -11,6 +11,7 @@ mkdir -p "${MODELS_DIR}/clip"
 mkdir -p "${MODELS_DIR}/vae"
 mkdir -p "${MODELS_DIR}/diffusion_models"
 mkdir -p "${MODELS_DIR}/loras"
+mkdir -p "${MODELS_DIR}/clip_vision"
 
 download() {
     local url="$1"
@@ -59,6 +60,10 @@ download "${HF_BASE}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safeten
 
 download "${HF_BASE}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors" \
     "${MODELS_DIR}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
+
+# CLIP Vision model for PainterLongVideo identity anchoring (~3.9 GB)
+download "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors" \
+    "${MODELS_DIR}/clip_vision/clip_vision_h.safetensors"
 
 # ReActor face swap model — goes into ComfyUI/models/insightface (not persistent volume)
 INSIGHTFACE_DIR="/app/ComfyUI/models/insightface"

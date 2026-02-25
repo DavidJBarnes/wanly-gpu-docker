@@ -51,6 +51,10 @@ RUN git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git \
     pip install --no-cache-dir -r ComfyUI/custom_nodes/comfyui-reactor-node/requirements.txt && \
     pip install --no-cache-dir onnxruntime-gpu
 
+# Custom nodes: PainterLongVideo (identity anchoring for chained segments)
+RUN git clone --depth 1 https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
+    ComfyUI/custom_nodes/ComfyUI-PainterLongVideo
+
 # Daemon Python dependencies (daemon code itself is cloned at boot for freshness)
 RUN pip install --no-cache-dir httpx pydantic-settings python-dotenv websockets
 
