@@ -35,6 +35,8 @@ FRIENDLY_NAME=${FRIENDLY_NAME:-runpod-${RUNPOD_POD_ID:-unknown}}
 COMFYUI_URL=http://localhost:8188
 COMFYUI_PATH=/app/ComfyUI
 LORA_CACHE_DIR=/workspace/models/loras
+LIGHTX2V_STRENGTH_HIGH=2.5
+LIGHTX2V_STRENGTH_LOW=1.0
 EOF
 
 echo "Daemon config:"
