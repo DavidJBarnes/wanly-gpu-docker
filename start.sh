@@ -47,10 +47,19 @@ cat "$DAEMON_DIR/.env"
 # ReActor's hardcoded NSFW filter drops video frames it considers unsafe,
 # which breaks RIFE (needs >= 2 frames). Inject early return into nsfw_image()
 # so the NSFW model never loads or runs (same approach as local 3090).
+#
+# We also neutralize reactor_sfw.py's top-level `from transformers import pipeline`.
+# ReActor's requirements.txt is unpinned and now pulls transformers >= 5.x, which
+# references torch.float8_e8m0fnu (torch >= 2.7) at import time. This image pins
+# torch 2.6.0, so that import raises AttributeError, the whole reactor node fails
+# to register, and ComfyUI rejects any workflow using ReActorOptions with a 400.
+# `pipeline` is only used inside nsfw_image(), which we disable above, so the import
+# is dead weight — replacing it with a stub sidesteps the version skew entirely.
 REACTOR_SFW="/app/ComfyUI/custom_nodes/comfyui-reactor-node/scripts/reactor_sfw.py"
 if [ -f "$REACTOR_SFW" ]; then
     sed -i '/^def nsfw_image/a\    return False  # NSFW filter disabled by wanly start.sh' "$REACTOR_SFW"
-    echo "Patched ReActor: nsfw_image() returns False (disabled)"
+    sed -i '1s|^from transformers import pipeline.*|pipeline = None  # transformers import disabled by wanly (torch<2.7 incompat)|' "$REACTOR_SFW"
+    echo "Patched ReActor: nsfw_image() returns False (disabled), transformers import stubbed"
 fi
 
 # ---------- 4. Start ComfyUI (background, no auth) ----------
