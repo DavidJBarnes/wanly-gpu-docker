@@ -29,7 +29,6 @@ pip install --no-cache-dir -q -r "$DAEMON_DIR/requirements.txt" 2>/dev/null || t
 
 # ---------- 3. Write daemon .env ----------
 cat > "$DAEMON_DIR/.env" << EOF
-REGISTRY_URL=${REGISTRY_URL:-http://gpu-registry.wanly22.com:8000}
 QUEUE_URL=${QUEUE_URL:-http://api.wanly22.com:8001}
 FRIENDLY_NAME=${FRIENDLY_NAME:-runpod-${RUNPOD_POD_ID:-unknown}}
 COMFYUI_URL=http://localhost:8188
