@@ -64,8 +64,14 @@ for repo, path, dst in JOBS:
         continue
     print(f"DOWNLOADING {name}")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    src = hf_hub_download(repo_id=repo, filename=path)
-    shutil.copy(src, dst)                          # copy out of the hub cache
+    # Download straight into the destination filesystem (local_dir), then atomically
+    # move into place. Avoids the HF global cache, so we never transiently hold two
+    # copies of a 27GB weight (matters on a fresh pod with a modest volume).
+    stage = os.path.join(os.path.dirname(dst), ".hfstage")
+    os.makedirs(stage, exist_ok=True)
+    src = hf_hub_download(repo_id=repo, filename=path, local_dir=stage)
+    os.replace(src, dst)                          # same filesystem -> instant, no copy
+    shutil.rmtree(stage, ignore_errors=True)
     print(f"OK {name} ({os.path.getsize(dst)//1_000_000} MB)")
 
 print("=== Model download complete ===")
