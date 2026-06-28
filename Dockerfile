@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     add-apt-repository -y ppa:deadsnakes/ppa && \
     apt-get update && apt-get install -y --no-install-recommends \
     python3.11 python3.11-venv python3.11-dev \
-    git ffmpeg aria2 wget curl \
+    git ffmpeg aria2 wget curl openssh-server \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
@@ -30,33 +30,43 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && git checkout ${COMFYUI_COMMIT}
 RUN pip install --no-cache-dir -r ComfyUI/requirements.txt
 
+# Custom node commits — PINNED so a rebuild can never pull a drifted version (the root
+# cause of repeated boot breakage: unpinned clones pulled newer deps that broke import).
+ARG FRAME_INTERP_COMMIT=26545cc2dd95bc3d27f056016300673bdeee78f5
+ARG VHS_COMMIT=4ee72c065db22c9d96c2427954dc69e7b908444b
+ARG REACTOR_COMMIT=6ad6b35a4df250d14cb2abf0808c9ffedf59f747
+ARG PAINTER_COMMIT=889b4ff67909561e52d6ae023f5b9e8c33fdba94
+
 # Custom nodes: Frame Interpolation (RIFE)
 # Install cupy-cuda12x directly (pre-built wheel) — the requirements file's cupy-wheel
 # is a source meta-package that fails on CI runners without a GPU
 RUN pip install --no-cache-dir cupy-cuda12x
-RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git \
+RUN git clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git \
     ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation && \
+    git -C ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation checkout ${FRAME_INTERP_COMMIT} && \
     pip install --no-cache-dir -r ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/requirements-no-cupy.txt
 
 # Custom nodes: Video Helper Suite
-RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
+RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
     ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite && \
+    git -C ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite checkout ${VHS_COMMIT} && \
     pip install --no-cache-dir -r ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
 
 # Custom nodes: ReActor (face swap)
-# Directory name matches daemon's node_checker.py primary key
-# onnxruntime-gpu is required at runtime but not in ReActor's requirements.txt.
-# PIN it: unpinned, newer onnxruntime-gpu wheels link CUDA 13 (libcudart.so.13) and fail
-# to import on this CUDA 12.4 image ("libcudart.so.13: cannot open shared object file").
-# 1.20.x is a CUDA-12 / cuDNN-9 build, satisfied by the libs torch 2.6 (cu124) bundles.
-RUN git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git \
+# Directory name matches daemon's node_checker.py primary key.
+# onnxruntime-gpu / insightface are required at runtime but NOT in ReActor's requirements,
+# and unpinned onnxruntime-gpu now resolves to a CUDA-13 wheel (libcudart.so.13) that can't
+# load on this CUDA 12.4 image. Pin both, and pin the node itself.
+RUN git clone https://github.com/Gourieff/ComfyUI-ReActor.git \
     ComfyUI/custom_nodes/comfyui-reactor-node && \
+    git -C ComfyUI/custom_nodes/comfyui-reactor-node checkout ${REACTOR_COMMIT} && \
     pip install --no-cache-dir -r ComfyUI/custom_nodes/comfyui-reactor-node/requirements.txt && \
     pip install --no-cache-dir "insightface==0.7.3" "onnxruntime-gpu==1.20.1"
 
 # Custom nodes: PainterLongVideo (identity anchoring for chained segments)
-RUN git clone --depth 1 https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
-    ComfyUI/custom_nodes/ComfyUI-PainterLongVideo
+RUN git clone https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
+    ComfyUI/custom_nodes/ComfyUI-PainterLongVideo && \
+    git -C ComfyUI/custom_nodes/ComfyUI-PainterLongVideo checkout ${PAINTER_COMMIT}
 
 # Daemon Python dependencies (daemon code itself is cloned at boot for freshness)
 RUN pip install --no-cache-dir httpx pydantic-settings python-dotenv websockets
