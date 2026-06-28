@@ -1,74 +1,72 @@
 #!/bin/bash
 # Download all required models to /workspace/models (RunPod persistent volume).
-# Uses aria2c for parallel connections and resume support.
-# Skips files that already exist with non-zero size.
+#
+# Uses huggingface_hub's native downloader (NOT aria2). HF has migrated many weights
+# to "Xet" chunked storage, whose presigned URLs carry short-lived per-connection byte
+# ranges that aria2's multi-connection mode cannot satisfy -> 403 mid-download (errorCode=22).
+# Files in the SAME repo are mixed (some Xet, some classic LFS), so aria2 fails on some and
+# not others, intermittently. The hf_hub_download path + hf_xet handles Xet correctly and
+# refreshes URLs. Idempotent: skips files that already exist with a sane size, and clears
+# any leftover aria2 partials from older image versions.
 set -e
 
 MODELS_DIR="/workspace/models"
-HF_BASE="https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files"
+INSIGHTFACE_DIR="/app/ComfyUI/models/insightface"
 
-mkdir -p "${MODELS_DIR}/clip"
-mkdir -p "${MODELS_DIR}/vae"
-mkdir -p "${MODELS_DIR}/diffusion_models"
-mkdir -p "${MODELS_DIR}/loras"
-mkdir -p "${MODELS_DIR}/clip_vision"
+mkdir -p "${MODELS_DIR}/clip" "${MODELS_DIR}/vae" "${MODELS_DIR}/diffusion_models" \
+         "${MODELS_DIR}/loras" "${MODELS_DIR}/clip_vision" "${INSIGHTFACE_DIR}"
 
-download() {
-    local url="$1"
-    local dest="$2"
-
-    # .aria2 control file means a previous download was interrupted
-    if [ -f "${dest}.aria2" ]; then
-        echo "RESUMING: $(basename "$dest") (incomplete from previous run)"
-        rm -f "$dest"
-    elif [ -f "$dest" ] && [ -s "$dest" ]; then
-        echo "SKIP: $(basename "$dest") (already exists)"
-        return 0
-    fi
-
-    echo "DOWNLOADING: $(basename "$dest")"
-    aria2c -x 8 -s 8 --console-log-level=error --summary-interval=30 \
-        -d "$(dirname "$dest")" -o "$(basename "$dest")" "$url"
-
-    if [ ! -f "$dest" ] || [ ! -s "$dest" ]; then
-        echo "ERROR: Failed to download $(basename "$dest")"
-        return 1
-    fi
-    echo "OK: $(basename "$dest")"
-}
+# Xet support, pinned <1.0: huggingface_hub 1.x renames the CLI and trips transformers'
+# `huggingface-hub<1.0` pin used by ComfyUI custom nodes (e.g. ReActor) on this image.
+pip install --no-cache-dir -q "huggingface_hub>=0.34,<1.0" hf_xet || true
 
 echo "=== Downloading models to ${MODELS_DIR} ==="
 
-# Text encoder (~6.7 GB)
-download "${HF_BASE}/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors" \
-    "${MODELS_DIR}/clip/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+MODELS_DIR="$MODELS_DIR" INSIGHTFACE_DIR="$INSIGHTFACE_DIR" python3 - <<'PY'
+import os, shutil
+from huggingface_hub import hf_hub_download
 
-# VAE (~254 MB)
-download "${HF_BASE}/vae/wan_2.1_vae.safetensors" \
-    "${MODELS_DIR}/vae/wan_2.1_vae.safetensors"
+M = os.environ["MODELS_DIR"]
+IF = os.environ["INSIGHTFACE_DIR"]
+WAN = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
 
-# Diffusion models — fp16, ~28.6 GB each
-download "${HF_BASE}/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors" \
-    "${MODELS_DIR}/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"
+# (repo, path-in-repo, local destination)
+JOBS = [
+    (WAN, "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+          f"{M}/clip/umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
+    (WAN, "split_files/vae/wan_2.1_vae.safetensors",
+          f"{M}/vae/wan_2.1_vae.safetensors"),
+    (WAN, "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
+          f"{M}/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"),
+    (WAN, "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
+          f"{M}/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"),
+    (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"),
+    (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"),
+    # CLIP Vision (PainterLongVideo identity anchoring)
+    ("h94/IP-Adapter", "models/image_encoder/model.safetensors",
+          f"{M}/clip_vision/clip_vision_h.safetensors"),
+    # ReActor face-swap model
+    ("Gourieff/ReActor", "models/inswapper_128.onnx",
+          f"{IF}/inswapper_128.onnx"),
+]
 
-download "${HF_BASE}/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors" \
-    "${MODELS_DIR}/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"
+for repo, path, dst in JOBS:
+    name = os.path.basename(dst)
+    ctrl = dst + ".aria2"
+    if os.path.exists(ctrl):                      # leftover aria2 partial -> redownload
+        os.remove(ctrl)
+        if os.path.exists(dst):
+            os.remove(dst)
+    if os.path.exists(dst) and os.path.getsize(dst) > 1_000_000:
+        print(f"SKIP {name} (already exists)")
+        continue
+    print(f"DOWNLOADING {name}")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    src = hf_hub_download(repo_id=repo, filename=path)
+    shutil.copy(src, dst)                          # copy out of the hub cache
+    print(f"OK {name} ({os.path.getsize(dst)//1_000_000} MB)")
 
-# LightX2V acceleration LoRAs
-download "${HF_BASE}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors" \
-    "${MODELS_DIR}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
-
-download "${HF_BASE}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors" \
-    "${MODELS_DIR}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
-
-# CLIP Vision model for PainterLongVideo identity anchoring (~3.9 GB)
-download "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors" \
-    "${MODELS_DIR}/clip_vision/clip_vision_h.safetensors"
-
-# ReActor face swap model — goes into ComfyUI/models/insightface (not persistent volume)
-INSIGHTFACE_DIR="/app/ComfyUI/models/insightface"
-mkdir -p "$INSIGHTFACE_DIR"
-download "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx" \
-    "${INSIGHTFACE_DIR}/inswapper_128.onnx"
-
-echo "=== Model download complete ==="
+print("=== Model download complete ===")
+PY
