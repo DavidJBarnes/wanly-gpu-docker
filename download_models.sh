@@ -32,29 +32,32 @@ M = os.environ["MODELS_DIR"]
 IF = os.environ["INSIGHTFACE_DIR"]
 WAN = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
 
-# (repo, path-in-repo, local destination)
+# (repo, path-in-repo, local destination, repo_type, critical)
+# critical=True  -> generation can't run without it; failure aborts the boot.
+# critical=False -> auxiliary (faceswap / identity-anchor); failure only warns, so a
+#                   gated/moved aux repo never bricks the whole pod boot.
 JOBS = [
     (WAN, "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-          f"{M}/clip/umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
+          f"{M}/clip/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "model", True),
     (WAN, "split_files/vae/wan_2.1_vae.safetensors",
-          f"{M}/vae/wan_2.1_vae.safetensors"),
+          f"{M}/vae/wan_2.1_vae.safetensors", "model", True),
     (WAN, "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
-          f"{M}/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"),
+          f"{M}/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors", "model", True),
     (WAN, "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
-          f"{M}/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"),
+          f"{M}/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors", "model", True),
     (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
-          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"),
+          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", "model", True),
     (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
-          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"),
-    # CLIP Vision (PainterLongVideo identity anchoring)
+          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", "model", True),
+    # CLIP Vision (PainterLongVideo identity anchoring) -- auxiliary
     ("h94/IP-Adapter", "models/image_encoder/model.safetensors",
-          f"{M}/clip_vision/clip_vision_h.safetensors"),
-    # ReActor face-swap model
+          f"{M}/clip_vision/clip_vision_h.safetensors", "model", False),
+    # ReActor face-swap model -- lives in a DATASET repo, and is auxiliary
     ("Gourieff/ReActor", "models/inswapper_128.onnx",
-          f"{IF}/inswapper_128.onnx"),
+          f"{IF}/inswapper_128.onnx", "dataset", False),
 ]
 
-for repo, path, dst in JOBS:
+for repo, path, dst, repo_type, critical in JOBS:
     name = os.path.basename(dst)
     ctrl = dst + ".aria2"
     if os.path.exists(ctrl):                      # leftover aria2 partial -> redownload
@@ -71,10 +74,16 @@ for repo, path, dst in JOBS:
     # copies of a 27GB weight (matters on a fresh pod with a modest volume).
     stage = os.path.join(os.path.dirname(dst), ".hfstage")
     os.makedirs(stage, exist_ok=True)
-    src = hf_hub_download(repo_id=repo, filename=path, local_dir=stage)
-    os.replace(src, dst)                          # same filesystem -> instant, no copy
-    shutil.rmtree(stage, ignore_errors=True)
-    print(f"OK {name} ({os.path.getsize(dst)//1_000_000} MB)")
+    try:
+        src = hf_hub_download(repo_id=repo, filename=path, repo_type=repo_type, local_dir=stage)
+        os.replace(src, dst)                      # same filesystem -> instant, no copy
+        print(f"OK {name} ({os.path.getsize(dst)//1_000_000} MB)")
+    except Exception as e:
+        if critical:
+            raise
+        print(f"WARN: optional {name} failed ({type(e).__name__}); continuing boot")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 print("=== Model download complete ===")
 PY
