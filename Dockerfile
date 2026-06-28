@@ -45,11 +45,14 @@ RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.
 
 # Custom nodes: ReActor (face swap)
 # Directory name matches daemon's node_checker.py primary key
-# onnxruntime-gpu is required at runtime but not in ReActor's requirements.txt
+# onnxruntime-gpu is required at runtime but not in ReActor's requirements.txt.
+# PIN it: unpinned, newer onnxruntime-gpu wheels link CUDA 13 (libcudart.so.13) and fail
+# to import on this CUDA 12.4 image ("libcudart.so.13: cannot open shared object file").
+# 1.20.x is a CUDA-12 / cuDNN-9 build, satisfied by the libs torch 2.6 (cu124) bundles.
 RUN git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git \
     ComfyUI/custom_nodes/comfyui-reactor-node && \
     pip install --no-cache-dir -r ComfyUI/custom_nodes/comfyui-reactor-node/requirements.txt && \
-    pip install --no-cache-dir onnxruntime-gpu
+    pip install --no-cache-dir "onnxruntime-gpu==1.20.1"
 
 # Custom nodes: PainterLongVideo (identity anchoring for chained segments)
 RUN git clone --depth 1 https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
