@@ -52,7 +52,7 @@ RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.
 RUN git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git \
     ComfyUI/custom_nodes/comfyui-reactor-node && \
     pip install --no-cache-dir -r ComfyUI/custom_nodes/comfyui-reactor-node/requirements.txt && \
-    pip install --no-cache-dir "onnxruntime-gpu==1.20.1"
+    pip install --no-cache-dir "insightface==0.7.3" "onnxruntime-gpu==1.20.1"
 
 # Custom nodes: PainterLongVideo (identity anchoring for chained segments)
 RUN git clone --depth 1 https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
