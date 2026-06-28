@@ -3,6 +3,17 @@ set -e
 
 echo "=== Wanly RunPod Worker Starting ==="
 
+# ---------- 0. Start sshd for direct TCP access (RunPod injects PUBLIC_KEY) ----------
+# Lets us SSH straight into the container over exposed TCP instead of the interactive
+# proxy, which can't run scripted commands.
+if [ -n "${PUBLIC_KEY:-}" ]; then
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+    mkdir -p /run/sshd
+    ssh-keygen -A 2>/dev/null || true
+    /usr/sbin/sshd 2>/dev/null && echo "sshd started (direct TCP on port 22)" || echo "WARN: sshd failed to start"
+fi
+
 # ---------- 1. Download models (skips existing) ----------
 /app/download_models.sh
 
