@@ -16,9 +16,11 @@ INSIGHTFACE_DIR="/app/ComfyUI/models/insightface"
 mkdir -p "${MODELS_DIR}/clip" "${MODELS_DIR}/vae" "${MODELS_DIR}/diffusion_models" \
          "${MODELS_DIR}/loras" "${MODELS_DIR}/clip_vision" "${INSIGHTFACE_DIR}"
 
-# Xet support, pinned <1.0: huggingface_hub 1.x renames the CLI and trips transformers'
-# `huggingface-hub<1.0` pin used by ComfyUI custom nodes (e.g. ReActor) on this image.
-pip install --no-cache-dir -q "huggingface_hub>=0.34,<1.0" hf_xet || true
+# Xet support. Install hf_xet and ensure huggingface_hub is recent enough for Xet,
+# but DON'T cap the version: this image ships transformers 5.x which requires
+# huggingface-hub>=1.5.0, so an upper bound would downgrade it and break the resolver.
+# No bound = pip keeps the image's existing (Xet-capable) hub and just adds hf_xet.
+pip install --no-cache-dir -q "huggingface_hub>=0.34" hf_xet || true
 
 echo "=== Downloading models to ${MODELS_DIR} ==="
 
