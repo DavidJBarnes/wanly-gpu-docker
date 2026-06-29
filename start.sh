@@ -39,14 +39,25 @@ fi
 pip install --no-cache-dir -q -r "$DAEMON_DIR/requirements.txt" 2>/dev/null || true
 
 # ---------- 3. Write daemon .env ----------
+# Generation config defaults = the 3090's VALIDATED pipeline (source of truth), so a fresh
+# worker boots on parity. DaSiWa "Lightspeed" remix with the distillation baked in -> external
+# lightx2v OFF (strength 0). All overridable via pod env vars if needed.
 cat > "$DAEMON_DIR/.env" << EOF
 QUEUE_URL=${QUEUE_URL:-http://api.wanly22.com:8001}
 FRIENDLY_NAME=${FRIENDLY_NAME:-runpod-${RUNPOD_POD_ID:-unknown}}
 COMFYUI_URL=http://localhost:8188
 COMFYUI_PATH=/app/ComfyUI
 LORA_CACHE_DIR=/workspace/models/loras
-LIGHTX2V_STRENGTH_HIGH=${LIGHTX2V_STRENGTH_HIGH:-2.0}
-LIGHTX2V_STRENGTH_LOW=${LIGHTX2V_STRENGTH_LOW:-1.0}
+UNET_HIGH_MODEL=${UNET_HIGH_MODEL:-DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors}
+UNET_LOW_MODEL=${UNET_LOW_MODEL:-DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors}
+LIGHTX2V_STRENGTH_HIGH=${LIGHTX2V_STRENGTH_HIGH:-0.0}
+LIGHTX2V_STRENGTH_LOW=${LIGHTX2V_STRENGTH_LOW:-0.0}
+PAINTER_MOTION_AMPLITUDE=${PAINTER_MOTION_AMPLITUDE:-1.4}
+PAINTER_MOTION_FRAMES=${PAINTER_MOTION_FRAMES:-6}
+UNET_WEIGHT_DTYPE=${UNET_WEIGHT_DTYPE:-fp8_e4m3fn}
+HIGH_NOISE_REALISM=${HIGH_NOISE_REALISM:-false}
+STEPS_TOTAL=${STEPS_TOTAL:-4}
+HIGH_NOISE_STEPS=${HIGH_NOISE_STEPS:-2}
 RUNPOD_API_KEY=${RUNPOD_API_KEY:-}
 QUEUE_API_KEY=${QUEUE_API_KEY:-}
 EOF
