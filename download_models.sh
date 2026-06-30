@@ -41,13 +41,14 @@ JOBS = [
           f"{M}/clip/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "model", True),
     (WAN, "split_files/vae/wan_2.1_vae.safetensors",
           f"{M}/vae/wan_2.1_vae.safetensors", "model", True),
-    # Base Wan 2.2 i2v diffusion models (high+low) — matches the 3090's current base config.
-    # fp16 files (~28GB each), loaded as fp8 via UNET_WEIGHT_DTYPE. DaSiWa remix is still
-    # fetched below too, so the worker can run either model via the UNET_*_MODEL env vars.
-    (WAN, "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
-          f"{M}/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors", "model", True),
-    (WAN, "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
-          f"{M}/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors", "model", True),
+    # Base Wan 2.2 i2v diffusion models (high+low) — NATIVE fp8-scaled (~14GB each), matching
+    # the 3090. Pre-quantized fp8 with scale tensors, so ComfyUI uses the native scaled-fp8 path
+    # (no fp16->fp8 runtime cast, no "manual cast to fp16") — the path that runs fast on the
+    # current ComfyUI build. Full base identity, no distillation.
+    (WAN, "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+          f"{M}/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", "model", True),
+    (WAN, "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+          f"{M}/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", "model", True),
     (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
           f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", "model", True),
     (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
@@ -90,30 +91,5 @@ for repo, path, dst, repo_type, critical in JOBS:
 
 print("=== HF model download complete ===")
 PY
-
-# --- DaSiWa "Lightspeed" remix (Civitai) — the VALIDATED inference model (matches 3090) ---
-# These are gated downloads (HTTP 401 without auth), so a Civitai API token is required.
-# Set CIVITAI_TOKEN as a pod env var at launch. The Lightspeed distillation is baked into
-# this model, which is why the validated config runs LIGHTX2V_STRENGTH_* = 0 (see start.sh).
-DASIWA_HIGH_URL="https://civitai.red/api/download/models/2953474?fileId=2837908"
-DASIWA_LOW_URL="https://civitai.red/api/download/models/2953485?fileId=2837910"
-
-dl_civitai() {  # url  dest
-    local url="$1" dst="$2" name; name="$(basename "$dst")"
-    if [ -f "$dst" ] && [ "$(stat -c%s "$dst" 2>/dev/null || echo 0)" -gt 1000000 ]; then
-        echo "SKIP ${name} (already exists)"; return 0
-    fi
-    if [ -z "${CIVITAI_TOKEN:-}" ]; then
-        echo "ERROR: CIVITAI_TOKEN not set — cannot download DaSiWa model ${name}" >&2
-        return 1
-    fi
-    echo "DOWNLOADING ${name} (Civitai)"
-    curl -fL --retry 3 --retry-delay 5 -H "Authorization: Bearer ${CIVITAI_TOKEN}" \
-        -o "${dst}.part" "$url" && mv -f "${dst}.part" "$dst"
-    echo "OK ${name} ($(( $(stat -c%s "$dst") / 1000000 )) MB)"
-}
-
-dl_civitai "$DASIWA_HIGH_URL" "${MODELS_DIR}/diffusion_models/DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors"
-dl_civitai "$DASIWA_LOW_URL"  "${MODELS_DIR}/diffusion_models/DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors"
 
 echo "=== Model download complete ==="

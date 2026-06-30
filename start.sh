@@ -40,17 +40,17 @@ pip install --no-cache-dir -q -r "$DAEMON_DIR/requirements.txt" 2>/dev/null || t
 
 # ---------- 3. Write daemon .env ----------
 # Generation config defaults = the 3090's CURRENT base-model config (source of truth), so a
-# fresh worker boots on parity: base Wan 2.2 i2v (fp16 loaded as fp8), 10 steps (5 high / 5 low),
-# cfg 1. lightx2v/cfg are typically overridden per-job from the Wanly UI. DaSiWa remix is still
-# downloaded too — switch to it via UNET_*_MODEL + STEPS_TOTAL=4 pod env vars if needed.
+# fresh worker boots on parity: base Wan 2.2 i2v, NATIVE fp8-scaled (the fast path on the current
+# ComfyUI build — no fp16->fp8 manual cast), 10 steps (5 high / 5 low), cfg 1. lightx2v/cfg are
+# typically overridden per-job from the Wanly UI.
 cat > "$DAEMON_DIR/.env" << EOF
 QUEUE_URL=${QUEUE_URL:-http://api.wanly22.com:8001}
 FRIENDLY_NAME=${FRIENDLY_NAME:-runpod-${RUNPOD_POD_ID:-unknown}}
 COMFYUI_URL=http://localhost:8188
 COMFYUI_PATH=/app/ComfyUI
 LORA_CACHE_DIR=/workspace/models/loras
-UNET_HIGH_MODEL=${UNET_HIGH_MODEL:-wan2.2_i2v_high_noise_14B_fp16.safetensors}
-UNET_LOW_MODEL=${UNET_LOW_MODEL:-wan2.2_i2v_low_noise_14B_fp16.safetensors}
+UNET_HIGH_MODEL=${UNET_HIGH_MODEL:-wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors}
+UNET_LOW_MODEL=${UNET_LOW_MODEL:-wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors}
 LIGHTX2V_STRENGTH_HIGH=${LIGHTX2V_STRENGTH_HIGH:-0.0}
 LIGHTX2V_STRENGTH_LOW=${LIGHTX2V_STRENGTH_LOW:-0.0}
 PAINTER_MOTION_AMPLITUDE=${PAINTER_MOTION_AMPLITUDE:-1.4}
