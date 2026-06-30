@@ -41,8 +41,13 @@ JOBS = [
           f"{M}/clip/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "model", True),
     (WAN, "split_files/vae/wan_2.1_vae.safetensors",
           f"{M}/vae/wan_2.1_vae.safetensors", "model", True),
-    # NOTE: base Wan 2.2 diffusion models are NOT downloaded — the validated pipeline uses
-    # the DaSiWa "Lightspeed" remix (fetched from Civitai below), matching the 3090.
+    # Base Wan 2.2 i2v diffusion models (high+low) — matches the 3090's current base config.
+    # fp16 files (~28GB each), loaded as fp8 via UNET_WEIGHT_DTYPE. DaSiWa remix is still
+    # fetched below too, so the worker can run either model via the UNET_*_MODEL env vars.
+    (WAN, "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
+          f"{M}/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors", "model", True),
+    (WAN, "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
+          f"{M}/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors", "model", True),
     (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
           f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", "model", True),
     (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
