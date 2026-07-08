@@ -30,6 +30,11 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && git checkout ${COMFYUI_COMMIT}
 RUN pip install --no-cache-dir -r ComfyUI/requirements.txt
 
+# Apply the wanly CFG-aware VRAM-estimate patch to ComfyUI (dynamic /tmp/wanly_estimate;
+# prevents over-reserve slow/OOM on 24GB cards and lets de-distilled/CFG>1 jobs fit).
+COPY patch_comfyui_memory.py /app/patch_comfyui_memory.py
+RUN python3 /app/patch_comfyui_memory.py /app/ComfyUI/comfy/model_base.py
+
 # Custom node commits — PINNED so a rebuild can never pull a drifted version (the root
 # cause of repeated boot breakage: unpinned clones pulled newer deps that broke import).
 ARG FRAME_INTERP_COMMIT=26545cc2dd95bc3d27f056016300673bdeee78f5
