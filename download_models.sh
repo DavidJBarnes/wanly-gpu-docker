@@ -14,7 +14,8 @@ MODELS_DIR="/workspace/models"
 INSIGHTFACE_DIR="/app/ComfyUI/models/insightface"
 
 mkdir -p "${MODELS_DIR}/clip" "${MODELS_DIR}/vae" "${MODELS_DIR}/diffusion_models" \
-         "${MODELS_DIR}/loras" "${MODELS_DIR}/clip_vision" "${INSIGHTFACE_DIR}"
+         "${MODELS_DIR}/loras" "${MODELS_DIR}/clip_vision" "${MODELS_DIR}/text_encoders" \
+         "${INSIGHTFACE_DIR}"
 
 # Xet support. Install hf_xet and ensure huggingface_hub is recent enough for Xet,
 # but DON'T cap the version: this image ships transformers 5.x which requires
@@ -53,6 +54,29 @@ JOBS = [
           f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", "model", True),
     (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
           f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", "model", True),
+    # === VACE continuation stack (identity-anchored multi-segment) ===
+    # Local filenames MUST match the daemon config's vace_* settings (single source of truth), even
+    # where the HF path differs. Critical: with the WanVideoWrapper nodes installed, the daemon
+    # routes continuations to VACE, so a booted pod must have these or VACE segments fail at load.
+    # T2V base (fp16, ~28GB each) — same weights the 3090 uses; block-swap keeps it on 24GB.
+    (WAN, "split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors",
+          f"{M}/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors", "model", True),
+    (WAN, "split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors",
+          f"{M}/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors", "model", True),
+    # Fun-VACE modules (fp8, ~3GB each) — Kijai's VACE/ subfolder.
+    ("Kijai/WanVideo_comfy_fp8_scaled", "VACE/Wan2_2_Fun_VACE_module_A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors",
+          f"{M}/diffusion_models/Wan2_2_Fun_VACE_module_A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors", "model", True),
+    ("Kijai/WanVideo_comfy_fp8_scaled", "VACE/Wan2_2_Fun_VACE_module_A14B_LOW_fp8_e4m3fn_scaled_KJ.safetensors",
+          f"{M}/diffusion_models/Wan2_2_Fun_VACE_module_A14B_LOW_fp8_e4m3fn_scaled_KJ.safetensors", "model", True),
+    # T2V 4-step Lightning distill LoRAs (lightx2v repo names them high/low_noise_model.safetensors;
+    # saved under the daemon's expected names). Rank-64 Seko V1.1.
+    ("lightx2v/Wan2.2-Lightning", "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/high_noise_model.safetensors",
+          f"{M}/loras/Wan2.2-Lightning_T2V-A14B-4steps-lora_HIGH_fp16.safetensors", "model", True),
+    ("lightx2v/Wan2.2-Lightning", "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/low_noise_model.safetensors",
+          f"{M}/loras/Wan2.2-Lightning_T2V-A14B-4steps-lora_LOW_fp16.safetensors", "model", True),
+    # umt5-xxl text encoder, bf16 .pth (~11GB) — native Wan-AI name/path (Kijai ships a renamed .safetensors).
+    ("Wan-AI/Wan2.1-T2V-14B", "models_t5_umt5-xxl-enc-bf16.pth",
+          f"{M}/text_encoders/models_t5_umt5-xxl-enc-bf16.pth", "model", True),
     # CLIP Vision (PainterLongVideo identity anchoring) -- auxiliary
     ("h94/IP-Adapter", "models/image_encoder/model.safetensors",
           f"{M}/clip_vision/clip_vision_h.safetensors", "model", False),

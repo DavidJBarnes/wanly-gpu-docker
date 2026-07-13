@@ -5,3 +5,4 @@ wanly:
     diffusion_models: diffusion_models/
     loras: loras/
     clip_vision: clip_vision/
+    text_encoders: text_encoders/
