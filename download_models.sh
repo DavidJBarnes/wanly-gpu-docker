@@ -64,9 +64,13 @@ COMMON = [
 # Kijai's repacks, not the raw ByteDance/Wan-AI repos: these are already single-file
 # safetensors in the layout WanVideoWrapper's loaders expect.
 LYNX = [
-    # Base T2V 14B, scaled fp8 (~14.5GB) — the quant family Kijai's reference graph uses.
-    (KJ_FP8, "T2V/Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors",
-          f"{M}/diffusion_models/Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors", "model", True),
+    # Base T2V 14B, fp16 (~28GB). NOT fp8: the Lynx adapters are plain nn.Linear and are
+    # not wrapped by the wrapper's fp8-aware linear, so an fp8 base casts their weights to
+    # fp8 while activations stay fp16 and the sampler dies with "self and mat2 must have
+    # the same dtype, but got Half and Float8_e4m3fn". Block swap carries the larger
+    # checkpoint, exactly as the VACE path already runs 28GB fp16 models on 24GB cards.
+    ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/diffusion_models/wan2.1_t2v_14B_fp16.safetensors",
+          f"{M}/diffusion_models/wan2.1_t2v_14B_fp16.safetensors", "model", True),
     # Ref-adapter (dense VAE features cross-attended in the DiT blocks), ~4.2GB.
     (KJ, "Lynx/Wan2_1-T2V-14B-Lynx_full_ref_layers_fp16.safetensors",
           f"{M}/diffusion_models/Wan2_1-T2V-14B-Lynx_full_ref_layers_fp16.safetensors", "model", True),
