@@ -41,10 +41,6 @@ ARG FRAME_INTERP_COMMIT=26545cc2dd95bc3d27f056016300673bdeee78f5
 ARG VHS_COMMIT=4ee72c065db22c9d96c2427954dc69e7b908444b
 ARG REACTOR_COMMIT=6ad6b35a4df250d14cb2abf0808c9ffedf59f747
 ARG PAINTER_COMMIT=889b4ff67909561e52d6ae023f5b9e8c33fdba94
-# WanVideoWrapper (KJ) — provides the VACE nodes (WanVideoVACEEncode/Sampler/...).
-# Pinned to 1.3.9 (e926f7a0), the same 1.3.x minor the 3090 runs (its pyproject reports 1.3.3;
-# there is no matching git tag, and VACE node inputs are stable across 1.3.x).
-ARG WANVIDEO_COMMIT=e926f7a069e3efc25bdcc78e1bf65c39ac1a2cd4
 
 # Custom nodes: Frame Interpolation (RIFE)
 # Install cupy-cuda12x directly (pre-built wheel) — the requirements file's cupy-wheel
@@ -77,12 +73,10 @@ RUN git clone https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
     ComfyUI/custom_nodes/ComfyUI-PainterLongVideo && \
     git -C ComfyUI/custom_nodes/ComfyUI-PainterLongVideo checkout ${PAINTER_COMMIT}
 
-# Custom nodes: WanVideoWrapper (KJ) — the VACE continuation path (nodes 5xx).
-# Directory name matches the daemon's node_checker expectation.
-RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git \
-    ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper && \
-    git -C ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper checkout ${WANVIDEO_COMMIT} && \
-    pip install --no-cache-dir -r ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
+# NOTE: WanVideoWrapper (KJ) was installed here for the VACE continuation and Lynx paths.
+# Both engines were retired from wanly-gpu-daemon, and nothing on the native i2v path uses
+# its nodes, so it is no longer installed — its unpinned requirements were a recurring
+# source of dependency skew against this image's torch 2.6.0 / CUDA 12.4.
 
 # Daemon Python dependencies (daemon code itself is cloned at boot for freshness)
 RUN pip install --no-cache-dir httpx pydantic-settings python-dotenv websockets

@@ -48,9 +48,6 @@ QUEUE_URL=${QUEUE_URL:-http://api.wanly22.com:8001}
 FRIENDLY_NAME=${FRIENDLY_NAME:-runpod-${RUNPOD_POD_ID:-unknown}}
 COMFYUI_URL=http://localhost:8188
 COMFYUI_PATH=/app/ComfyUI
-# Must match the MODEL_PROFILE used by download_models.sh above: the daemon validates
-# exactly the model families it was provisioned with, and a mismatch fails startup.
-MODEL_PROFILE=${MODEL_PROFILE:-full}
 LORA_CACHE_DIR=/workspace/models/loras
 UNET_HIGH_MODEL=${UNET_HIGH_MODEL:-wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors}
 UNET_LOW_MODEL=${UNET_LOW_MODEL:-wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors}
