@@ -62,11 +62,15 @@ RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
 # onnxruntime-gpu / insightface are required at runtime but NOT in ReActor's requirements,
 # and unpinned onnxruntime-gpu now resolves to a CUDA-13 wheel (libcudart.so.13) that can't
 # load on this CUDA 12.4 image. Pin both, and pin the node itself.
+#
+# 1.20.2 not 1.20.1: 1.20.1 was REMOVED from PyPI (the index jumps 1.20.0 -> 1.20.2), so the
+# old pin stopped resolving and broke the build. Staying inside 1.20.x keeps the CUDA-12
+# wheel the pin exists to guarantee — do not bump to >=1.23 without checking libcudart.
 RUN git clone https://github.com/Gourieff/ComfyUI-ReActor.git \
     ComfyUI/custom_nodes/comfyui-reactor-node && \
     git -C ComfyUI/custom_nodes/comfyui-reactor-node checkout ${REACTOR_COMMIT} && \
     pip install --no-cache-dir -r ComfyUI/custom_nodes/comfyui-reactor-node/requirements.txt && \
-    pip install --no-cache-dir "insightface==0.7.3" "onnxruntime-gpu==1.20.1"
+    pip install --no-cache-dir "insightface==0.7.3" "onnxruntime-gpu==1.20.2"
 
 # Custom nodes: PainterLongVideo (identity anchoring for chained segments)
 RUN git clone https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
