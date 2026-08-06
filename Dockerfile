@@ -41,6 +41,7 @@ ARG FRAME_INTERP_COMMIT=26545cc2dd95bc3d27f056016300673bdeee78f5
 ARG VHS_COMMIT=4ee72c065db22c9d96c2427954dc69e7b908444b
 ARG REACTOR_COMMIT=6ad6b35a4df250d14cb2abf0808c9ffedf59f747
 ARG PAINTER_COMMIT=889b4ff67909561e52d6ae023f5b9e8c33fdba94
+ARG FACEFUSION_COMMIT=3e73829
 
 # Custom nodes: Frame Interpolation (RIFE)
 # Install cupy-cuda12x directly (pre-built wheel) — the requirements file's cupy-wheel
@@ -77,13 +78,65 @@ RUN git clone https://github.com/princepainter/ComfyUI-PainterLongVideo.git \
     ComfyUI/custom_nodes/ComfyUI-PainterLongVideo && \
     git -C ComfyUI/custom_nodes/ComfyUI-PainterLongVideo checkout ${PAINTER_COMMIT}
 
+# Custom nodes: FaceFusion — the swapper the validated identity recipe uses.
+# ReActor (above) selects the target face by POSITION only; FaceFusion is what the recipe and
+# the console default (faceswap_method=facefusion) build node 183 `AdvancedSwapFaceImage` from.
+# Without this every job using the recipe fails at ComfyUI prompt validation.
+#
+# A clean clone is NOT sufficient. See patches/README.md — the node needs the NSFW gate
+# disabled, and an import shim without which it does not load at all on this ComfyUI build.
+COPY patches/ /app/patches/
+RUN git clone https://github.com/huygiatrng/Facefusion_comfyui.git \
+    ComfyUI/custom_nodes/Facefusion_comfyui && \
+    git -C ComfyUI/custom_nodes/Facefusion_comfyui checkout ${FACEFUSION_COMMIT} && \
+    pip install --no-cache-dir -r ComfyUI/custom_nodes/Facefusion_comfyui/requirements.txt && \
+    cp /app/patches/comfy_compat.py ComfyUI/custom_nodes/Facefusion_comfyui/facefusion_api/nodes/comfy_compat.py && \
+    git -C ComfyUI/custom_nodes/Facefusion_comfyui apply /app/patches/facefusion_comfyui.patch && \
+    python3 -c "import ast,sys; ast.parse(open('ComfyUI/custom_nodes/Facefusion_comfyui/content_filter/content_filter.py').read())" && \
+    grep -q 'NSFW filter disabled' ComfyUI/custom_nodes/Facefusion_comfyui/content_filter/content_filter.py && \
+    grep -q 'from .comfy_compat import' ComfyUI/custom_nodes/Facefusion_comfyui/facefusion_api/nodes/base.py
+
+# Bake the FaceFusion models the recipe actually uses (~900MB). The node self-downloads on
+# first use into its OWN directory, which lives in the image rather than on the volume -- so
+# without this every container start re-downloads them and the first job stalls. GitHub
+# releases, not HuggingFace, so download_models.sh (hf_hub_download only) cannot stage them.
+#
+# This is exactly the set workflow_builder.py asks for:
+#   inswapper_128         face_swapper_model (David's visual pick over hyperswap_1c_256)
+#   retinaface_10g        face_detector_model
+#   xseg_1                face_occluder_model  -- matters when hands cross the face
+#   bisenet_resnet_34     face_parser_model
+#   arcface_w600k_r50     recognizer, always loaded
+#   scrfd_2.5g            the node's DEFAULT detector; 3MB, kept as a fallback
+ARG FF_ASSETS=https://github.com/facefusion/facefusion-assets/releases/download
+RUN FFM=ComfyUI/custom_nodes/Facefusion_comfyui/models && mkdir -p $FFM && \
+    for u in models-3.0.0/inswapper_128.onnx \
+             models-3.0.0/arcface_w600k_r50.onnx \
+             models-3.0.0/retinaface_10g.onnx \
+             models-3.0.0/scrfd_2.5g.onnx \
+             models-3.0.0/bisenet_resnet_34.onnx \
+             models-3.1.0/xseg_1.onnx ; do \
+        f=$(basename $u); \
+        curl -fsSL --retry 3 --retry-delay 5 -o "$FFM/$f" "${FF_ASSETS}/$u" || exit 1; \
+        [ -s "$FFM/$f" ] || { echo "empty download: $f"; exit 1; }; \
+    done && \
+    ls -la $FFM
+
 # NOTE: WanVideoWrapper (KJ) was installed here for the VACE continuation and Lynx paths.
 # Both engines were retired from wanly-gpu-daemon, and nothing on the native i2v path uses
 # its nodes, so it is no longer installed — its unpinned requirements were a recurring
 # source of dependency skew against this image's torch 2.6.0 / CUDA 12.4.
 
-# Daemon Python dependencies (daemon code itself is cloned at boot for freshness)
-RUN pip install --no-cache-dir httpx pydantic-settings python-dotenv websockets
+# Daemon Python dependencies. The daemon CODE is cloned at boot for freshness, so its
+# requirements.txt is not present at build time -- but hand-listing the deps here means the
+# list silently rots as the daemon grows. It already had: numpy, onnxruntime,
+# opencv-python-headless, Pillow, pyyaml and insightface were all missing, and identity
+# scoring only worked because ComfyUI and the ReActor layer happened to pull them in.
+#
+# Pinned copy of daemon/requirements.txt. When that file changes, this must change with it --
+# start.sh re-checks at boot and warns loudly if they have diverged.
+COPY daemon-requirements.txt /app/daemon-requirements.txt
+RUN pip install --no-cache-dir -r /app/daemon-requirements.txt
 
 # Config and scripts
 COPY extra_model_paths.yaml /app/ComfyUI/extra_model_paths.yaml
