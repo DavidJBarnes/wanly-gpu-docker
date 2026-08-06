@@ -35,8 +35,42 @@ else
     git clone --depth 1 "$DAEMON_REPO" "$DAEMON_DIR"
 fi
 
-# Install/update daemon deps
-pip install --no-cache-dir -q -r "$DAEMON_DIR/requirements.txt" 2>/dev/null || true
+# ---------- Daemon deps ----------
+# The image already installed these from daemon-requirements.txt at build time. This only has
+# to catch deps ADDED to the daemon since the image was built.
+#
+# It used to be `pip install -r requirements.txt 2>/dev/null || true`, which had two problems:
+# every error was swallowed, so a failed install looked identical to a clean one; and it
+# reinstalled onnxruntime (CPU) over the onnxruntime-gpu that ReActor and FaceFusion need,
+# plus opencv-python-headless over opencv-python -- both silently, on every boot, because the
+# two packages in each pair provide the same module.
+#
+# So: skip the two that collide, install the rest, and SAY SO when something fails.
+SKIP_DEPS="onnxruntime|opencv-python-headless"
+if [ -f "$DAEMON_DIR/requirements.txt" ]; then
+    MISSING=""
+    while read -r dep; do
+        [ -z "$dep" ] && continue
+        case "$dep" in \#*) continue ;; esac
+        echo "$dep" | grep -qE "^($SKIP_DEPS)([=<>]|$)" && continue
+        mod=$(echo "$dep" | sed -E 's/[=<>!].*//')
+        pip show "$mod" >/dev/null 2>&1 || MISSING="$MISSING $dep"
+    done < "$DAEMON_DIR/requirements.txt"
+    if [ -n "$MISSING" ]; then
+        echo "Daemon deps added since image build:$MISSING"
+        # shellcheck disable=SC2086
+        pip install --no-cache-dir -q $MISSING || echo "!! DAEMON DEP INSTALL FAILED:$MISSING"
+    fi
+fi
+
+# Loud, early warning if the image's pinned copy has drifted from the daemon's actual list.
+if [ -f /app/daemon-requirements.txt ] && [ -f "$DAEMON_DIR/requirements.txt" ]; then
+    DRIFT=$(comm -13 \
+        <(grep -vE '^\s*(#|$)' /app/daemon-requirements.txt | sed -E 's/[=<>!].*//' | sort -u) \
+        <(grep -vE '^\s*(#|$)' "$DAEMON_DIR/requirements.txt" | sed -E 's/[=<>!].*//' | sort -u) \
+        | grep -vE "^($SKIP_DEPS)$" || true)
+    [ -n "$DRIFT" ] && echo "!! daemon-requirements.txt is stale, missing:" $DRIFT
+fi
 
 # ---------- 3. Write daemon .env ----------
 # Generation config defaults = the 3090's CURRENT base-model config (source of truth), so a

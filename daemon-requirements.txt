@@ -1,0 +1,24 @@
+# Pinned copy of wanly-gpu-daemon/requirements.txt for the image build. The daemon code is
+# cloned at BOOT, so its own requirements.txt does not exist at build time. start.sh diffs this
+# against the cloned copy and warns if they have drifted.
+#
+# TWO deliberate exclusions -- both would collide with packages already installed above:
+#
+#   onnxruntime              onnxruntime-gpu is installed for ReActor/FaceFusion and provides
+#                            the same `onnxruntime` module. Installing the CPU build on top
+#                            replaces it and silently drops GPU execution for the swap.
+#                            The daemon only needs CPUExecutionProvider (identity scoring runs
+#                            on CPU on purpose, to leave the GPU to generation), and the -gpu
+#                            build provides that too.
+#
+#   opencv-python-headless   opencv-python is already pulled in by ReActor and FaceFusion, and
+#                            both packages provide `cv2`. Installing both leaves whichever
+#                            landed last, which is a coin toss across rebuilds.
+httpx
+numpy
+Pillow
+pydantic-settings
+python-dotenv
+pyyaml
+websockets
+insightface==0.7.3
