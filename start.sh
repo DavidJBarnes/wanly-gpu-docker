@@ -73,6 +73,18 @@ if [ -f /app/daemon-requirements.txt ] && [ -f "$DAEMON_DIR/requirements.txt" ];
 fi
 
 # ---------- 3. Write daemon .env ----------
+# Parity with the 3090 is checked by diffing this block against that box's .env, NOT by memory.
+# It drifted once before (DaSiWa + lightx2v 0 vs base + lightx2v 2.0) and cost a full day of
+# bogus LoRA results, because the failure is silent: jobs run and produce plausible output that
+# is not comparable to anything.
+#
+# Last diffed 2026-08-06. Only PAINTER_MOTION_AMPLITUDE differed (was 1.4 here vs 1.7 there);
+# everything else either matched or fell through to an identical daemon default.
+#
+# NOTE: the 3090's .env carries SHIFT_HIGH=5.0, which is a DEAD variable -- the daemon setting
+# is `flow_shift`, there is no `shift_high`, so it has never had any effect. flow_shift defaults
+# to 5.0 regardless, so behaviour is correct by accident. Do not copy it here and do not trust
+# it there.
 # Generation config defaults = the 3090's CURRENT base-model config (source of truth), so a
 # fresh worker boots on parity: base Wan 2.2 i2v, NATIVE fp8-scaled (the fast path on the current
 # ComfyUI build — no fp16->fp8 manual cast), 10 steps (5 high / 5 low), cfg 1. lightx2v/cfg are
@@ -87,7 +99,7 @@ UNET_HIGH_MODEL=${UNET_HIGH_MODEL:-wan2.2_i2v_high_noise_14B_fp8_scaled.safetens
 UNET_LOW_MODEL=${UNET_LOW_MODEL:-wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors}
 LIGHTX2V_STRENGTH_HIGH=${LIGHTX2V_STRENGTH_HIGH:-0.0}
 LIGHTX2V_STRENGTH_LOW=${LIGHTX2V_STRENGTH_LOW:-0.0}
-PAINTER_MOTION_AMPLITUDE=${PAINTER_MOTION_AMPLITUDE:-1.4}
+PAINTER_MOTION_AMPLITUDE=${PAINTER_MOTION_AMPLITUDE:-1.7}
 PAINTER_MOTION_FRAMES=${PAINTER_MOTION_FRAMES:-6}
 UNET_WEIGHT_DTYPE=${UNET_WEIGHT_DTYPE:-fp8_e4m3fn}
 HIGH_NOISE_REALISM=${HIGH_NOISE_REALISM:-false}
@@ -99,8 +111,12 @@ RUNPOD_API_KEY=${RUNPOD_API_KEY:-}
 QUEUE_API_KEY=${QUEUE_API_KEY:-}
 EOF
 
+# Dump the resolved config so a parity problem is visible in the first lines of the boot log
+# rather than after a day of results that quietly are not comparable to anything.
+# Secrets redacted: RunPod surfaces container logs in its console, and `cat` was printing
+# QUEUE_API_KEY and RUNPOD_API_KEY in plaintext.
 echo "Daemon config:"
-cat "$DAEMON_DIR/.env"
+sed -E 's/^(.*(KEY|TOKEN|SECRET|PASSWORD))=.+$/\1=<redacted>/' "$DAEMON_DIR/.env"
 
 # ---------- 3b. Disable ReActor NSFW filter ----------
 # ReActor's hardcoded NSFW filter drops video frames it considers unsafe,
