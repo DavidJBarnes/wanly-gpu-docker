@@ -29,7 +29,15 @@ jobs:
         with:
           context: .
           push: true
+          # Two names on purpose, for now. wanly-gpu-docker matches the repo and the RunPod
+          # template; wanly22-runpod is the legacy name and stays published because Docker Hub
+          # cannot rename a repository, so anything still pointing at it -- a saved pod spec, a
+          # template not in our list -- would simply fail to pull. That failure reads as a RunPod
+          # capacity problem, not a naming one, which is an expensive hour to spend. Cheap to keep
+          # publishing both. Drop the legacy pair once nothing has pulled it for a while (#36).
           tags: |
+            davidjbarnes/wanly-gpu-docker:latest
+            davidjbarnes/wanly-gpu-docker:${{ github.sha }}
             davidjbarnes/wanly22-runpod:latest
             davidjbarnes/wanly22-runpod:${{ github.sha }}
           cache-from: type=gha
