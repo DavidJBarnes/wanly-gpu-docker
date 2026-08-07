@@ -1,7 +1,24 @@
 #!/bin/bash
 set -e
 
+# ---------- Everything this script and the daemon print goes to a file as well as stdout ----
+# The daemon is exec'd at the end of this script, so its stdout IS this script's stdout: the
+# container log stream, and nowhere else. That is fine for RunPod's console and useless for
+# anything automated — you cannot tail it over ssh, grep it, or diff two runs, because inside
+# the container there is no file to read.
+#
+# That gap cost a whole test run. A pod was working through a job while every check for its
+# progress came back empty, because they were reading a daemon.log that only exists when the
+# daemon is started by hand. The pod looked idle and was reported as idle.
+#
+# Process substitution rather than a pipeline, so the final `exec python3 -m daemon.main` still
+# replaces this shell and stays the container's main process — a pipeline would leave the shell
+# alive as PID 1 and change how SIGTERM reaches the daemon on pod stop.
+mkdir -p /workspace/logs
+exec > >(tee -a /workspace/logs/daemon.log) 2>&1
+
 echo "=== Wanly RunPod Worker Starting ==="
+echo "(this log is also at /workspace/logs/daemon.log)"
 
 # ---------- 0. Start sshd for direct TCP access (RunPod injects PUBLIC_KEY) ----------
 # Lets us SSH straight into the container over exposed TCP instead of the interactive
