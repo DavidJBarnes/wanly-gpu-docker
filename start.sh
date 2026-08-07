@@ -137,6 +137,23 @@ if [ -f "$REACTOR_SFW" ]; then
     echo "Patched ReActor: nsfw_image() returns False (disabled), transformers import stubbed"
 fi
 
+# ---------- 3c. Keep FaceFusion's install.py from replacing the pinned onnxruntime ----------
+# The Dockerfile writes this marker at build time; see the long note there. Re-asserting it here
+# costs nothing and covers the case where the node is updated to a commit that clears or renames
+# it. Without the marker, ComfyUI's startup runs FaceFusion's install.py, which uninstalls the
+# pinned onnxruntime-gpu and installs the newest — a CUDA-13 wheel this CUDA-12.4 image cannot
+# load. The swap then runs on CPU, ~100x slower, with no error anywhere: the only symptom is the
+# daemon's "no progress for 300s" watchdog, which reads as a hang.
+FF_MARKER="/app/ComfyUI/custom_nodes/Facefusion_comfyui/.install_complete"
+if [ -d "$(dirname "$FF_MARKER")" ] && [ ! -f "$FF_MARKER" ]; then
+    touch "$FF_MARKER"
+    echo "WARN: FaceFusion .install_complete was missing — recreated (would have clobbered onnxruntime)"
+fi
+
+# Record what onnxruntime we booted with, so a later change is visible rather than inferred.
+ORT_BOOT=$(pip show onnxruntime-gpu 2>/dev/null | awk '/^Version:/{print $2}')
+echo "onnxruntime-gpu at boot: ${ORT_BOOT:-<not installed>}"
+
 # ---------- 4. Start ComfyUI (background, no auth) ----------
 mkdir -p /workspace/logs
 cd /app/ComfyUI
@@ -167,6 +184,23 @@ if ! curl -sf http://localhost:8188/system_stats > /dev/null 2>&1; then
     echo "ERROR: ComfyUI failed to start within 180s"
     tail -50 /workspace/logs/comfyui.log 2>/dev/null || true
     exit 1
+fi
+
+# ---------- 5b. Did anything replace onnxruntime while ComfyUI was starting? ----------
+# ComfyUI runs every custom node's install.py during startup, and at least one of them (see
+# FaceFusion, above) will pip-install over a pinned dependency given the chance. Comparing the
+# version now against the one recorded before ComfyUI started catches ANY such node, not just
+# the one we know about — and catches it before the first job rather than 300s into one.
+#
+# Loud, not fatal: a mismatched onnxruntime still generates video correctly. It only makes the
+# faceswap fall back to CPU, and a worker that produces slow-but-correct output beats a worker
+# that refuses to boot.
+ORT_NOW=$(pip show onnxruntime-gpu 2>/dev/null | awk '/^Version:/{print $2}')
+if [ -n "$ORT_BOOT" ] && [ "$ORT_NOW" != "$ORT_BOOT" ]; then
+    echo "!! onnxruntime-gpu CHANGED during ComfyUI startup: $ORT_BOOT -> $ORT_NOW"
+    echo "!! A custom node's install.py replaced the pinned build. If the new wheel targets a"
+    echo "!! different CUDA major than this image, the GPU faceswap will silently run on CPU"
+    echo "!! (~100x slower) and surface as the daemon's 'no progress for 300s' watchdog."
 fi
 
 # ---------- 6. Start daemon (foreground) ----------
