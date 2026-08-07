@@ -3,8 +3,11 @@
 The GPU worker image for Wanly: ComfyUI, the custom nodes, the pinned CUDA stack, and a boot
 script that stages models and hands off to [`wanly-gpu-daemon`](https://github.com/DavidJBarnes/wanly-gpu-daemon).
 
-Published as **`davidjbarnes/wanly22-runpod:latest`** (image name unchanged by the repo rename —
-renaming it would break every existing RunPod template that references it).
+Published as **`davidjbarnes/wanly-gpu-docker:latest`**.
+
+Also still published as `davidjbarnes/wanly22-runpod:latest` — the legacy name. Docker Hub cannot
+rename a repository, so the transition is "publish both, migrate consumers, then drop the old one"
+rather than a switch. Anything still pointing at the legacy name keeps working until then; see #36.
 
 Originally RunPod-specific, hence the old name. It is now just *the* worker image, and is intended
 to replace the hand-maintained ComfyUI install on the 3090 as well.
@@ -37,13 +40,13 @@ docker run -d --gpus all \
   -e QUEUE_API_KEY=...        # from the 3090's wanly-gpu-daemon/.env
   -e FRIENDLY_NAME=my-worker \
   -e PUBLIC_KEY="ssh-ed25519 ..."   # optional; enables sshd on 22
-  davidjbarnes/wanly22-runpod:latest
+  davidjbarnes/wanly-gpu-docker:latest
 ```
 
 To poke at the image **without** claiming jobs, override the entrypoint — do not just let it boot:
 
 ```bash
-docker run --rm -it --gpus all --entrypoint bash davidjbarnes/wanly22-runpod:latest
+docker run --rm -it --gpus all --entrypoint bash davidjbarnes/wanly-gpu-docker:latest
 ```
 
 Note `--gpus all` is required even for CPU-only inspection: ComfyUI imports `comfy_kitchen` →
@@ -106,7 +109,7 @@ resolved. It uses `ldd` rather than loading the provider, because the CI builder
 only check that catches it is asking onnxruntime which provider it actually chose, on a real GPU:
 
 ```bash
-docker run --rm --gpus all --entrypoint python3 davidjbarnes/wanly22-runpod:latest -c "
+docker run --rm --gpus all --entrypoint python3 davidjbarnes/wanly-gpu-docker:latest -c "
 import onnxruntime as ort
 s = ort.InferenceSession('/app/ComfyUI/custom_nodes/Facefusion_comfyui/models/inswapper_128.onnx',
                          providers=['CUDAExecutionProvider','CPUExecutionProvider'])
@@ -118,7 +121,7 @@ means the swap will run in software.
 
 ## Building
 
-Pushing to `main` builds and pushes `:latest` and `:<sha>` via GitHub Actions. Builds take ~20
+Pushing to `main` builds and pushes `:latest` and `:<sha>` under both the current and legacy names via GitHub Actions. Builds take ~20
 minutes. **Test a dependency change before pushing** — a syntax check will not catch a pip
 resolution failure, and the image is what production runs.
 
