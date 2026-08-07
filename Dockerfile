@@ -94,7 +94,44 @@ RUN git clone https://github.com/huygiatrng/Facefusion_comfyui.git \
     git -C ComfyUI/custom_nodes/Facefusion_comfyui apply /app/patches/facefusion_comfyui.patch && \
     python3 -c "import ast,sys; ast.parse(open('ComfyUI/custom_nodes/Facefusion_comfyui/content_filter/content_filter.py').read())" && \
     grep -q 'NSFW filter disabled' ComfyUI/custom_nodes/Facefusion_comfyui/content_filter/content_filter.py && \
-    grep -q 'from .comfy_compat import' ComfyUI/custom_nodes/Facefusion_comfyui/facefusion_api/nodes/base.py
+    grep -q 'from .comfy_compat import' ComfyUI/custom_nodes/Facefusion_comfyui/facefusion_api/nodes/base.py && \
+    touch ComfyUI/custom_nodes/Facefusion_comfyui/.install_complete
+
+# The marker above is load-bearing, and its absence cost a whole RunPod job.
+#
+# ComfyUI runs every custom node's install.py at startup. FaceFusion's does:
+#
+#     if pip_show('onnxruntime-gpu').ok and exists('.install_complete'): return
+#     pip uninstall onnx onnxruntime onnxruntime-gpu -y
+#     pip install onnxruntime-gpu          # <- UNPINNED
+#
+# It needs BOTH conditions, and the marker is only ever written at RUNTIME. So a freshly built
+# image always fails the guard on its first container start, uninstalls the pinned 1.20.2, and
+# installs whatever is newest -- currently 1.28.0, a CUDA-13 wheel that cannot load against this
+# image's CUDA 12.4 (libcublasLt.so.13: cannot open shared object file).
+#
+# Nothing crashes. onnxruntime just reports the CUDA provider unavailable and runs the swap on
+# CPU: GPU at 0%, one process at 463%, and every RIFE-interpolated frame swapped in software.
+# The daemon's 300s no-progress watchdog then reports "execution appears stuck" -- so the visible
+# symptom is a hang, several layers away from the cause.
+#
+# It never reproduced on the 3090 because that install has long since written its marker. Fresh
+# containers are exactly the case nobody was testing.
+#
+# Writing the marker at build time makes the guard short-circuit forever, keeping the pin the
+# line above it already paid for.
+
+# Fail the BUILD if the onnxruntime CUDA provider needs libraries this image does not ship.
+# Checked via the provider .so's own NEEDED entries rather than by running it, because the
+# builder has no GPU -- and checked at all because the runtime failure mode is silent.
+RUN python3 -c "\
+import glob, subprocess, sys, onnxruntime;\
+so = glob.glob('/usr/local/lib/python3.11/dist-packages/onnxruntime/capi/libonnxruntime_providers_cuda.so');\
+sys.exit('onnxruntime-gpu missing its CUDA provider') if not so else None;\
+need = [l.split()[1] for l in subprocess.run(['objdump','-p',so[0]],capture_output=True,text=True).stdout.splitlines() if 'NEEDED' in l];\
+bad = [n for n in need if n.endswith('.so.13')];\
+print('onnxruntime', onnxruntime.__version__, '| CUDA provider needs:', ' '.join(n for n in need if 'cublas' in n or 'cudart' in n));\
+sys.exit('CUDA-13 libs required by onnxruntime but image is CUDA 12: %s' % bad) if bad else print('OK: onnxruntime CUDA provider matches this image CUDA major')"
 
 # Bake the FaceFusion models the recipe actually uses (~900MB). The node self-downloads on
 # first use into its OWN directory, which lives in the image rather than on the volume -- so
