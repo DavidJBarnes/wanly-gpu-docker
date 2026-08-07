@@ -4,6 +4,21 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
 
+# onnxruntime finds CUDA/cuDNN through the system loader, and nothing else puts pip's copies on
+# its path. torch does not need this — it preloads its bundled libs at import — so the image
+# looks fine until something that ISN'T torch asks for CUDA.
+#
+# That something is the faceswap. Without this, onnxruntime fails to load its CUDA provider
+# (libcudnn_adv.so.9: cannot open shared object file), reports only CPUExecutionProvider, and
+# FaceFusion runs the swap in software: GPU at 0%, ~100x slower, no error raised. The visible
+# symptom is the daemon's "no progress for 300s" watchdog, four steps removed from the cause.
+#
+# Measured on a 4090 pod, same image, same model, only this variable differing:
+#   unset -> InferenceSession providers: ['CPUExecutionProvider']
+#   set   -> InferenceSession providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+ENV NV_PY_LIBS=/usr/local/lib/python3.11/dist-packages/nvidia
+ENV LD_LIBRARY_PATH=${NV_PY_LIBS}/cudnn/lib:${NV_PY_LIBS}/cublas/lib:${NV_PY_LIBS}/cuda_runtime/lib:${NV_PY_LIBS}/curand/lib:${NV_PY_LIBS}/cufft/lib:${NV_PY_LIBS}/cusparse/lib:${NV_PY_LIBS}/cusolver/lib:${NV_PY_LIBS}/nvjitlink/lib
+
 # System deps + Python 3.11 via deadsnakes PPA
 RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common && \
@@ -121,17 +136,18 @@ RUN git clone https://github.com/huygiatrng/Facefusion_comfyui.git \
 # Writing the marker at build time makes the guard short-circuit forever, keeping the pin the
 # line above it already paid for.
 
-# Fail the BUILD if the onnxruntime CUDA provider needs libraries this image does not ship.
-# Checked via the provider .so's own NEEDED entries rather than by running it, because the
-# builder has no GPU -- and checked at all because the runtime failure mode is silent.
-RUN python3 -c "\
-import glob, subprocess, sys, onnxruntime;\
-so = glob.glob('/usr/local/lib/python3.11/dist-packages/onnxruntime/capi/libonnxruntime_providers_cuda.so');\
-sys.exit('onnxruntime-gpu missing its CUDA provider') if not so else None;\
-need = [l.split()[1] for l in subprocess.run(['objdump','-p',so[0]],capture_output=True,text=True).stdout.splitlines() if 'NEEDED' in l];\
-bad = [n for n in need if n.endswith('.so.13')];\
-print('onnxruntime', onnxruntime.__version__, '| CUDA provider needs:', ' '.join(n for n in need if 'cublas' in n or 'cudart' in n));\
-sys.exit('CUDA-13 libs required by onnxruntime but image is CUDA 12: %s' % bad) if bad else print('OK: onnxruntime CUDA provider matches this image CUDA major')"
+# Fail the BUILD if the onnxruntime CUDA provider cannot resolve its libraries.
+#
+# ldd, not a version check: the two ways this has actually broken were a CUDA-major mismatch
+# (a wheel wanting libcublasLt.so.13 on a CUDA-12 image) and a path problem (cuDNN present in
+# site-packages but not on LD_LIBRARY_PATH). A version assertion catches only the first. "Every
+# NEEDED entry resolves" catches both, plus whatever the third one turns out to be.
+#
+# ldd resolves against this image's LD_LIBRARY_PATH, set above -- which is the same loader the
+# runtime uses, so a pass here means a pass in the container. No GPU required, which matters
+# because the CI builder has none.
+COPY assert_onnx_cuda.py /app/assert_onnx_cuda.py
+RUN python3 /app/assert_onnx_cuda.py
 
 # Bake the FaceFusion models the recipe actually uses (~900MB). The node self-downloads on
 # first use into its OWN directory, which lives in the image rather than on the volume -- so
