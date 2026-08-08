@@ -15,7 +15,12 @@ set -e
 # replaces this shell and stays the container's main process — a pipeline would leave the shell
 # alive as PID 1 and change how SIGTERM reaches the daemon on pod stop.
 mkdir -p /workspace/logs
-exec > >(tee -a /workspace/logs/daemon.log) 2>&1
+# Timestamp every line. Without it there is no way to tell a boot that is slow from one that is
+# wedged: both look like a log that has stopped moving. awk rather than `ts` because moreutils is
+# not in the image, and fflush keeps it streaming rather than block-buffering into RunPod's
+# console. Still process substitution, not a pipeline, so the exec at the end of this script
+# still replaces the shell.
+exec > >(awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee -a /workspace/logs/daemon.log) 2>&1
 
 echo "=== Wanly RunPod Worker Starting ==="
 echo "(this log is also at /workspace/logs/daemon.log)"
@@ -32,8 +37,12 @@ if [ -n "${PUBLIC_KEY:-}" ]; then
 fi
 
 # ---------- 1. Download models (skips existing) ----------
+# The slowest phase by far on a cold pod -- roughly 37GB -- and the one most likely to be
+# mistaken for a hang, so it announces each file before starting rather than only on completion.
+echo "PHASE 1/5: staging models (cold pod downloads ~37GB; this is the slow part)"
 /app/download_models.sh
 
+echo "PHASE 2/5: daemon code"
 # ---------- 2. Clone or update daemon ----------
 DAEMON_DIR="/app/wanly-gpu-daemon"
 DAEMON_REPO="https://github.com/DavidJBarnes/wanly-gpu-daemon.git"
@@ -89,6 +98,7 @@ if [ -f /app/daemon-requirements.txt ] && [ -f "$DAEMON_DIR/requirements.txt" ];
     [ -n "$DRIFT" ] && echo "!! daemon-requirements.txt is stale, missing:" $DRIFT
 fi
 
+echo "PHASE 3/5: config and custom-node patches"
 # ---------- 3. Write daemon .env ----------
 # Parity with the 3090 is checked by diffing this block against that box's .env, NOT by memory.
 # It drifted once before (DaSiWa + lightx2v 0 vs base + lightx2v 2.0) and cost a full day of
@@ -180,7 +190,7 @@ python3 main.py --listen 0.0.0.0 --port 8188 \
     --cache-none \
     > /workspace/logs/comfyui.log 2>&1 &
 COMFYUI_PID=$!
-echo "ComfyUI started (PID $COMFYUI_PID)"
+echo "PHASE 4/5: ComfyUI started (PID $COMFYUI_PID), waiting for it to answer"
 
 # ---------- 5. Wait for ComfyUI ready ----------
 echo "Waiting for ComfyUI..."
@@ -221,6 +231,6 @@ if [ -n "$ORT_BOOT" ] && [ "$ORT_NOW" != "$ORT_BOOT" ]; then
 fi
 
 # ---------- 6. Start daemon (foreground) ----------
-echo "Starting wanly-gpu-daemon..."
+echo "PHASE 5/5: starting wanly-gpu-daemon (registers as a worker once models validate)"
 cd "$DAEMON_DIR"
 exec python3 -m daemon.main

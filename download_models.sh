@@ -26,7 +26,7 @@ pip install --no-cache-dir -q "huggingface_hub>=0.34" hf_xet || true
 echo "=== Downloading models to ${MODELS_DIR} ==="
 
 MODELS_DIR="$MODELS_DIR" INSIGHTFACE_DIR="$INSIGHTFACE_DIR" python3 - <<'PY'
-import os, shutil
+import os, shutil, time
 from huggingface_hub import hf_hub_download
 
 M = os.environ["MODELS_DIR"]
@@ -71,7 +71,8 @@ JOBS = [
           f"{IF}/inswapper_128.onnx", "dataset", False),
 ]
 
-for repo, path, dst, repo_type, critical in JOBS:
+total = len(JOBS)
+for idx, (repo, path, dst, repo_type, critical) in enumerate(JOBS, 1):
     name = os.path.basename(dst)
     ctrl = dst + ".aria2"
     if os.path.exists(ctrl):                      # leftover aria2 partial -> redownload
@@ -88,14 +89,23 @@ for repo, path, dst, repo_type, critical in JOBS:
     # copies of a 27GB weight (matters on a fresh pod with a modest volume).
     stage = os.path.join(os.path.dirname(dst), ".hfstage")
     os.makedirs(stage, exist_ok=True)
+    # Announce BEFORE downloading. hf_hub_download prints nothing while a 13GB weight comes
+    # down, so the previous "OK <name>" on completion meant minutes of total silence that were
+    # indistinguishable from a hang -- which is precisely how a boot gets misread as stuck.
+    print(f"[{idx}/{total}] downloading {name} from {repo}/{path} ...", flush=True)
+    started = time.monotonic()
     try:
         src = hf_hub_download(repo_id=repo, filename=path, repo_type=repo_type, local_dir=stage)
         os.replace(src, dst)                      # same filesystem -> instant, no copy
-        print(f"OK {name} ({os.path.getsize(dst)//1_000_000} MB)")
+        mb = os.path.getsize(dst) // 1_000_000
+        secs = max(1, int(time.monotonic() - started))
+        # Rate is the useful number when deciding whether a slow boot is progressing or wedged.
+        print(f"[{idx}/{total}] OK {name} ({mb} MB in {secs}s, {mb // secs} MB/s)", flush=True)
     except Exception as e:
         if critical:
             raise
-        print(f"WARN: optional {name} failed ({type(e).__name__}); continuing boot")
+        print(f"[{idx}/{total}] WARN: optional {name} failed ({type(e).__name__}); continuing boot",
+              flush=True)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
