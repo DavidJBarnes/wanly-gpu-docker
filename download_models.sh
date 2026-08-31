@@ -9,6 +9,12 @@
 # written yet, because inventing download URLs for checkpoints nobody has published to a
 # fixed location would be worse than failing with a clear message. See the TODO below.
 #
+# When that fetch IS written, carry over what #39 established for the WAN downloader it
+# replaced: announce each file BEFORE starting it, and report size, elapsed and MB/s on
+# completion. hf_hub_download prints nothing while a 13 GB weight comes down, so reporting only
+# on success means minutes of silence that are indistinguishable from a hang — which is exactly
+# how a boot gets misread as stuck. At 126 GB that matters more here, not less.
+#
 # Either way, failing here is enormously cheaper than failing 10 minutes into a claimed
 # segment, which is what a missing or half-downloaded model actually costs.
 set -uo pipefail
