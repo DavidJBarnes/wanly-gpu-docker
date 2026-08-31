@@ -86,8 +86,22 @@ RUN pip install --no-cache-dir -r /app/engine-requirements.txt
 # start.sh compares this against the daemon's own requirements.txt at boot and
 # warns loudly when they drift. This only has to cover what the image installs
 # ahead of time; anything added since is installed at boot.
+#
+# insightface ships no wheel and compiles C extensions (face3d/mesh/cython), so this needs a
+# toolchain — dropping build-essential when this image was rewritten for LTX is what failed
+# the first CI build with "x86_64-linux-gnu-gcc: No such file or directory".
+#
+# Installed and purged in ONE layer so the runtime image does not carry a compiler. Separate
+# RUN steps would leave it in the layer below regardless of a later apt-get remove.
+#
+# insightface is not optional here: identity scoring runs on every finished render, LTX
+# included, and it is what produces the identity chips the console shows.
 COPY daemon-requirements.txt /app/daemon-requirements.txt
-RUN pip install --no-cache-dir -r /app/daemon-requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential python3-dev \
+ && pip install --no-cache-dir -r /app/daemon-requirements.txt \
+ && apt-get purge -y --auto-remove build-essential python3-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 # Models are bind-mounted, never baked: the LTX-2.3 set alone is ~126 GB.
 ENV COMFY_PORT=8188 \
