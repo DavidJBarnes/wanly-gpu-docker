@@ -1,116 +1,110 @@
 #!/bin/bash
-# Download all required models to /workspace/models (RunPod persistent volume).
+# Model staging for the LTX 2.3 worker.
 #
-# Uses huggingface_hub's native downloader (NOT aria2). HF has migrated many weights
-# to "Xet" chunked storage, whose presigned URLs carry short-lived per-connection byte
-# ranges that aria2's multi-connection mode cannot satisfy -> 403 mid-download (errorCode=22).
-# Files in the SAME repo are mixed (some Xet, some classic LFS), so aria2 fails on some and
-# not others, intermittently. The hf_hub_download path + hf_xet handles Xet correctly and
-# refreshes URLs. Idempotent: skips files that already exist with a sane size, and clears
-# any leftover aria2 partials from older image versions.
-set -e
-
-MODELS_DIR="/workspace/models"
-INSIGHTFACE_DIR="/app/ComfyUI/models/insightface"
-
-mkdir -p "${MODELS_DIR}/clip" "${MODELS_DIR}/vae" "${MODELS_DIR}/diffusion_models" \
-         "${MODELS_DIR}/loras" "${MODELS_DIR}/clip_vision" "${MODELS_DIR}/text_encoders" \
-         "${INSIGHTFACE_DIR}"
-
-# Xet support. Install hf_xet and ensure huggingface_hub is recent enough for Xet,
-# but DON'T cap the version: this image ships transformers 5.x which requires
-# huggingface-hub>=1.5.0, so an upper bound would downgrade it and break the resolver.
-# No bound = pip keeps the image's existing (Xet-capable) hub and just adds hf_xet.
-pip install --no-cache-dir -q "huggingface_hub>=0.34" hf_xet || true
-
-echo "=== Downloading models to ${MODELS_DIR} ==="
-
-MODELS_DIR="$MODELS_DIR" INSIGHTFACE_DIR="$INSIGHTFACE_DIR" python3 - <<'PY'
-import os, shutil, time
-from huggingface_hub import hf_hub_download
-
-M = os.environ["MODELS_DIR"]
-IF = os.environ["INSIGHTFACE_DIR"]
-WAN = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
-
-# One engine: native Wan 2.2 i2v. ~39GB total.
+# On the 3090 the LTX-2.3 set is BIND-MOUNTED read-only from the host
+# (/home/david/LTX-2/models -> /workspace/models), so there is nothing to fetch and this
+# script only has to prove the mount is really there and really complete.
 #
-# The VACE and Lynx stacks used to be staged here too (behind a MODEL_PROFILE switch),
-# which pushed the full set past 170GB — more than the volume holds, so the last file
-# to download failed and took the whole boot with it. Both engines were retired from
-# wanly-gpu-daemon; this list must stay in sync with MODEL_CHECKS in its
-# daemon/model_validator.py, since the daemon fails startup on anything missing.
+# On a fresh pod with no such mount there IS a fetch to do — roughly 126 GB — and it is not
+# written yet, because inventing download URLs for checkpoints nobody has published to a
+# fixed location would be worse than failing with a clear message. See the TODO below.
 #
-# (repo, path-in-repo, local destination, repo_type, critical)
-# critical=True  -> generation can't run without it; failure aborts the boot.
-# critical=False -> auxiliary (faceswap / identity-anchor); failure only warns, so a
-#                   gated/moved aux repo never bricks the whole pod boot.
+# When that fetch IS written, carry over what #39 established for the WAN downloader it
+# replaced: announce each file BEFORE starting it, and report size, elapsed and MB/s on
+# completion. hf_hub_download prints nothing while a 13 GB weight comes down, so reporting only
+# on success means minutes of silence that are indistinguishable from a hang — which is exactly
+# how a boot gets misread as stuck. At 126 GB that matters more here, not less.
+#
+# Either way, failing here is enormously cheaper than failing 10 minutes into a claimed
+# segment, which is what a missing or half-downloaded model actually costs.
+set -uo pipefail
 
-JOBS = [
-    (WAN, "split_files/vae/wan_2.1_vae.safetensors",
-          f"{M}/vae/wan_2.1_vae.safetensors", "model", True),
-    (WAN, "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-          f"{M}/clip/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "model", True),
-    # Base Wan 2.2 i2v diffusion models (high+low) — NATIVE fp8-scaled (~14GB each), matching
-    # the 3090. Pre-quantized fp8 with scale tensors, so ComfyUI uses the native scaled-fp8 path
-    # (no fp16->fp8 runtime cast, no "manual cast to fp16") — the path that runs fast on the
-    # current ComfyUI build. Full base identity, no distillation.
-    (WAN, "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
-          f"{M}/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", "model", True),
-    (WAN, "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
-          f"{M}/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", "model", True),
-    (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
-          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", "model", True),
-    (WAN, "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
-          f"{M}/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", "model", True),
-    # CLIP Vision (PainterLongVideo identity anchoring) -- auxiliary
-    ("h94/IP-Adapter", "models/image_encoder/model.safetensors",
-          f"{M}/clip_vision/clip_vision_h.safetensors", "model", False),
-    # ReActor face-swap model -- lives in a DATASET repo, and is auxiliary
-    ("Gourieff/ReActor", "models/inswapper_128.onnx",
-          f"{IF}/inswapper_128.onnx", "dataset", False),
-]
+MODELS="${MODELS_DIR:-/workspace/models}"
+LTX="$MODELS/ltx-2.3"
+FAIL=0
 
-total = len(JOBS)
-for idx, (repo, path, dst, repo_type, critical) in enumerate(JOBS, 1):
-    name = os.path.basename(dst)
-    ctrl = dst + ".aria2"
-    if os.path.exists(ctrl):                      # leftover aria2 partial -> redownload
-        os.remove(ctrl)
-        if os.path.exists(dst):
-            os.remove(dst)
-    if os.path.exists(dst) and os.path.getsize(dst) > 1_000_000:
-        print(f"SKIP {name} (already exists)")
-        continue
-    print(f"DOWNLOADING {name}")
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    # Download straight into the destination filesystem (local_dir), then atomically
-    # move into place. Avoids the HF global cache, so we never transiently hold two
-    # copies of a 27GB weight (matters on a fresh pod with a modest volume).
-    stage = os.path.join(os.path.dirname(dst), ".hfstage")
-    os.makedirs(stage, exist_ok=True)
-    # Announce BEFORE downloading. hf_hub_download prints nothing while a 13GB weight comes
-    # down, so the previous "OK <name>" on completion meant minutes of total silence that were
-    # indistinguishable from a hang -- which is precisely how a boot gets misread as stuck.
-    print(f"[{idx}/{total}] downloading {name} from {repo}/{path} ...", flush=True)
-    started = time.monotonic()
+echo "model root: $MODELS"
+if [ ! -d "$MODELS" ]; then
+    echo "!! FATAL: $MODELS does not exist."
+    echo "!! On the 3090 this is a bind mount: -v /home/david/LTX-2/models:/workspace/models:ro"
+    echo "!! TODO: a pod with no mount needs a real download step (~126 GB). Not implemented."
+    exit 1
+fi
+
+for d in diffusion_models loras text_encoders latent_upscale_models; do
+    p="$LTX/$d"
+    if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
+        echo "  $d: $(ls -1 "$p" | wc -l) file(s) — $(ls -1 "$p" | head -3 | tr '\n' ' ')"
+    else
+        # loras also resolves against $MODELS/loras (see extra_model_paths.yaml), so a
+        # missing versioned dir is not automatically fatal for that one.
+        if [ "$d" = "loras" ] && [ -d "$MODELS/loras" ] && [ -n "$(ls -A "$MODELS/loras" 2>/dev/null)" ]; then
+            echo "  $d: (empty under ltx-2.3, using $MODELS/loras)"
+        else
+            echo "  !! $d: MISSING or empty at $p"
+            FAIL=1
+        fi
+    fi
+done
+
+# ---------- Truncated safetensors ----------
+# A partial .safetensors is a VALID HEADER OVER MISSING DATA. It looks fine on disk, passes
+# every existence check, and fails only at load — deep inside a render, on a segment already
+# claimed. One arrived at 14.40 of 27.16 GiB (47% short) and reported nothing at all.
+#
+# The header declares where the data ends, so the file's true size is knowable without
+# reading it: 8 + header_len + the largest data_offsets end.
+#
+# In its own file, deliberately. Embedding this in a nested heredoc once hit a quoting
+# SyntaxError and the check reported success by printing nothing.
+cat > /tmp/check_safetensors.py <<'PYEOF'
+import json, struct, sys
+from pathlib import Path
+
+bad = 0
+for p in sys.argv[1:]:
+    f = Path(p)
     try:
-        src = hf_hub_download(repo_id=repo, filename=path, repo_type=repo_type, local_dir=stage)
-        os.replace(src, dst)                      # same filesystem -> instant, no copy
-        mb = os.path.getsize(dst) // 1_000_000
-        secs = max(1, int(time.monotonic() - started))
-        # Rate is the useful number when deciding whether a slow boot is progressing or wedged.
-        print(f"[{idx}/{total}] OK {name} ({mb} MB in {secs}s, {mb // secs} MB/s)", flush=True)
+        size = f.stat().st_size
+        with f.open("rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            # Sanity-bound before allocating. A non-safetensors file yields a garbage length
+            # here, and reading it raised MemoryError -- technically a failure, but the
+            # message named the wrong problem and on a large file it tries to allocate first.
+            if n <= 0 or n > size:
+                print(f"  !! NOT A SAFETENSORS {f.name}: header length {n} vs file size {size}")
+                bad += 1
+                continue
+            header = json.loads(fh.read(n))
+        ends = [v["data_offsets"][1] for v in header.values()
+                if isinstance(v, dict) and "data_offsets" in v]
+        expected = 8 + n + (max(ends) if ends else 0)
+        actual = size
+        if actual < expected:
+            pct = 100 * actual / expected
+            print(f"  !! TRUNCATED {f.name}: {actual} of {expected} bytes ({pct:.1f}%)")
+            bad += 1
     except Exception as e:
-        if critical:
-            raise
-        print(f"[{idx}/{total}] WARN: optional {name} failed ({type(e).__name__}); continuing boot",
-              flush=True)
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        print(f"  !! UNREADABLE {f.name}: {type(e).__name__}: {e}")
+        bad += 1
+sys.exit(1 if bad else 0)
+PYEOF
 
-print("=== HF model download complete ===")
-PY
+echo "checking safetensors headers against actual byte counts..."
+mapfile -t FILES < <(find "$LTX" "$MODELS/loras" -maxdepth 2 -name '*.safetensors' 2>/dev/null)
+if [ ${#FILES[@]} -eq 0 ]; then
+    echo "  (none found)"
+else
+    if python3 /tmp/check_safetensors.py "${FILES[@]}"; then
+        echo "  ${#FILES[@]} file(s) OK"
+    else
+        echo "  !! at least one model is incomplete — it will fail at load, mid-render"
+        FAIL=1
+    fi
+fi
 
-
-echo "=== Model download complete ==="
+if [ "$FAIL" -ne 0 ]; then
+    echo "!! FATAL: model staging incomplete. Refusing to boot a worker that will fail its claims."
+    exit 1
+fi
+echo "models OK"
