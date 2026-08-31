@@ -47,13 +47,26 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
     DAEMON_REPO="https://${GITHUB_TOKEN}@github.com/DavidJBarnes/wanly-gpu-daemon.git"
 fi
 
+# DAEMON_BRANCH exists so an unmerged branch can be booted on real hardware BEFORE it is
+# merged. Without it the only way to test a daemon change in the image is to merge it first,
+# which is exactly backwards. Defaults to main, and the resolved branch and commit are printed
+# below — a worker running something other than main should never be a thing you have to infer.
+DAEMON_BRANCH="${DAEMON_BRANCH:-main}"
+
 if [ -d "$DAEMON_DIR/.git" ]; then
-    echo "Updating daemon..."
+    echo "Updating daemon ($DAEMON_BRANCH)..."
     cd "$DAEMON_DIR"
-    git pull --ff-only origin main 2>/dev/null || echo "WARN: git pull failed, using existing code"
+    git fetch --depth 1 origin "$DAEMON_BRANCH" 2>/dev/null \
+        && git checkout -B "$DAEMON_BRANCH" FETCH_HEAD 2>/dev/null \
+        || echo "WARN: fetch/checkout failed, using existing code"
 else
-    echo "Cloning daemon..."
-    git clone --depth 1 "$DAEMON_REPO" "$DAEMON_DIR"
+    echo "Cloning daemon ($DAEMON_BRANCH)..."
+    git clone --depth 1 --branch "$DAEMON_BRANCH" "$DAEMON_REPO" "$DAEMON_DIR"
+fi
+cd "$DAEMON_DIR"
+echo "daemon: $DAEMON_BRANCH @ $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ "$DAEMON_BRANCH" != "main" ]; then
+    echo "!! NOT running daemon main — this worker is on branch '$DAEMON_BRANCH'"
 fi
 
 # ---------- Daemon deps ----------
