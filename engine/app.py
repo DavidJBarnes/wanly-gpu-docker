@@ -546,15 +546,29 @@ def free_the_gpu() -> float:
     Paying the reload only when memory is actually tight keeps the fast path
     free and pays the cost exactly when it buys something.
     """
+    # keyframe-server is OPTIONAL. If it is not running there is no GPU for it to free, and
+    # that is success, not failure — this used to raise, so an absent collaborator failed a
+    # render that had already been claimed. Connection refused therefore falls through to
+    # measuring the card directly.
+    #
+    # A server that IS up and refuses to yield stays a hard failure: that is a real conflict
+    # over the GPU, and proceeding into a model load would OOM instead.
+    free = None
     try:
         r = requests.post(f"{KEYFRAME_URL}/free", timeout=180)
         if r.status_code != 200:
-            # A 404 means keyframe-server predates the /free endpoint. Say so
-            # plainly rather than letting LTX die in a model load.
             raise RuntimeError(f"keyframe-server /free -> {r.status_code} {r.text[:200]}")
         free = float(r.json().get("vram_free_gb", 0.0))
-    except requests.RequestException as e:
-        raise RuntimeError(f"keyframe-server unreachable at {KEYFRAME_URL}: {e}")
+    except requests.ConnectionError:
+        print(f"[gpu] keyframe-server not running at {KEYFRAME_URL} — nothing to free",
+              flush=True)
+    except requests.Timeout as e:
+        # Up but not answering. Distinct from absent, and worth failing on: something holds
+        # the card and is not letting go.
+        raise RuntimeError(f"keyframe-server timed out yielding the GPU: {e}")
+
+    if free is None:
+        free = comfy_vram_free_gb()
 
     if free >= MIN_FREE_GB:
         return free
