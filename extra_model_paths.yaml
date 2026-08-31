@@ -1,8 +1,37 @@
-wanly:
-    base_path: /workspace/models
-    clip: clip/
-    vae: vae/
-    diffusion_models: diffusion_models/
-    loras: loras/
-    clip_vision: clip_vision/
-    text_encoders: text_encoders/
+# Maps the LTX-2.3 set already on the host into the directory names ComfyUI's
+# loaders expect. Nothing is copied — the bind mount is read-only and the
+# checkpoints alone are ~92 GB.
+#
+# The workflows reference paths with backslashes ("VIDEO\LTX\LTX-2\...") because
+# they were authored on Windows. ComfyUI resolves those against these roots, so
+# the API-format graph we submit uses the bare filename instead and lets these
+# paths do the work.
+ltx23:
+    base_path: /workspace/models/ltx-2.3
+
+    # The monoliths. CheckpointLoaderSimple, LTXAVTextEncoderLoader and
+    # LTXVAudioVAELoader all take the same file: a 2.3 checkpoint carries the
+    # transformer, both VAEs and the text projection in one.
+    checkpoints: diffusion_models
+
+    # Both LTX's own distilled LoRAs and the content LoRAs. Two roots, because
+    # the content ones live outside the version tree.
+    loras: |
+        loras
+        ../loras
+
+    # LatentUpscaleModelLoader reads the folder key "latent_upscale_models"
+    # (comfy_extras/nodes_hunyuan.py), which is distinct from the "upscale_models"
+    # key used by ordinary ESRGAN-style upscalers. Mapping the wrong one leaves
+    # its dropdown empty with no error until a graph is submitted.
+    latent_upscale_models: latent_upscale_models
+    upscale_models: latent_upscale_models
+
+    # Gemma. NOTE: the HF repo layout downloaded for the CLI's --gemma-root is
+    # NOT what ComfyUI wants here -- LTXAVTextEncoderLoader expects a single
+    # scaled safetensors (gemma_3_12B_it_fp8_scaled.safetensors), not a 5-shard
+    # HF directory. This root is here for when that file is fetched.
+    text_encoders: text_encoders
+
+    vae: vae
+    vae_approx: vae_approx
