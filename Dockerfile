@@ -51,8 +51,13 @@ WORKDIR /app
 #
 # RunPod host drivers vary and cannot be chosen, so the image must run on the older one.
 # cu128 runs on both.
+# 2.11.0, not 2.12.1: the cu128 index tops out at 2.11.0+cu128 (2.12 ships cu130 only).
+# Checked against the index rather than assumed --
+# https://download.pytorch.org/whl/cu128/torch/ lists 2.10.0 and 2.11.0; torchvision 0.26.0
+# is the matching pair. A newer torch is worth less than an image that boots on the drivers
+# RunPod actually gives us.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-    "torch==2.12.1" "torchvision==0.27.1"
+    "torch==2.11.0" "torchvision==0.26.0"
 
 ARG COMFYUI_COMMIT=master
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
