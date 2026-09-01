@@ -132,7 +132,21 @@ FRIENDLY_NAME=${FRIENDLY_NAME:-ltx-${RUNPOD_POD_ID:-$(hostname)}}
 ENGINE=ltx
 LTX_ENGINE_URL=http://localhost:${API_PORT:-8190}
 COMFYUI_URL=http://localhost:${COMFY_PORT:-8188}
-COMFYUI_PATH=/app/ComfyUI
+# EMPTY on purpose. With a path set, the daemon takes ownership of ComfyUI: it checks for
+# custom node packs and clones the ones it thinks are missing, and it runs a "resource sync"
+# that downloads model files from S3. Both are WAN-era jobs and both break an LTX worker:
+#
+#   * the node check cloned Frame-Interpolation and ReActor into the LTX ComfyUI, and
+#     ReActor's unpinned requirements pull transformers >=5, which breaks every workflow
+#   * the resource sync tried to fetch rife49.pth, deleted with WAN, got a 404 from S3 and
+#     exited -- restart-looping a pod that had just got past ComfyUI for the first time:
+#
+#         ERROR Resource rife49.pth: download failed ... HTTP 404
+#         ERROR Resource sync failed. Exiting.
+#
+# ltx-engine owns this ComfyUI. The daemon drives the engine and syncs character LoRAs
+# through LORA_CACHE_DIR; it has no business installing nodes or models.
+COMFYUI_PATH=
 LORA_CACHE_DIR=${LORA_DIR:-/workspace/models/loras}
 RUNPOD_API_KEY=${RUNPOD_API_KEY:-}
 QUEUE_API_KEY=${QUEUE_API_KEY:-}
