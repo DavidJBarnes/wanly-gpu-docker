@@ -196,6 +196,9 @@ class JobRequest(BaseModel):
     seed: int | None = None
     # Steers the graph's negative encoder.
     negative_prompt: str | None = None
+    # Video CRF applied to the conditioning frame before it anchors the render. None leaves
+    # the workflow's own value alone; 0 is meaningful and bypasses the encode entirely.
+    img_compression: int | None = Field(default=None, ge=0, le=51)
     num_inference_steps: int | None = Field(default=None, ge=1, le=50)
     # Steps per pass. None leaves that stage on the schedule the graph ships.
     #
@@ -716,6 +719,7 @@ def run_job(job: Job):
                 char_lora=(lora.name if lora else None),
                 char_s1=(lora.at(1) if lora else 0.8),
                 char_s2=(lora.at(2) if lora else 1.5),
+                img_compression=job.req.img_compression,
             )
             if job.req.num_frames:
                 comfy.set_frames(graph, job.req.num_frames)

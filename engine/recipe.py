@@ -31,7 +31,7 @@ RECIPE_WORKFLOW = "ltx23_recipe.api.json"
 def resolve(graph: dict, image_name: str, width: int, height: int, *,
             prompt: str, negative: str | None = None, checkpoint: str | None = None,
             char_lora: str | None = None, char_s1: float = 0.8, char_s2: float = 1.5,
-            content_lora: str | None = None) -> dict:
+            content_lora: str | None = None, img_compression: int | None = None) -> dict:
     """Patch the validated graph with this render's configuration.
 
     Values only, never topology — the graph template is the validated recipe and this moves
@@ -48,6 +48,13 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     g["167"]["inputs"]["image"] = image_name
     g["292"]["inputs"]["value"] = int(width)
     g["293"]["inputs"]["value"] = int(height)
+    # Conditioning-frame CRF. `is not None` rather than truthiness: 0 is a real setting that
+    # bypasses the encode, and `if img_compression:` would silently ignore it.
+    if img_compression is not None:
+        for v in g.values():
+            if isinstance(v, dict) and v.get("class_type") == "LTXVPreprocess":
+                v["inputs"]["img_compression"] = int(img_compression)
+
     g["121"]["inputs"]["text"] = prompt
     if negative:
         g["110"]["inputs"]["text"] = negative
