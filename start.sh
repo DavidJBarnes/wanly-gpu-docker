@@ -145,6 +145,19 @@ echo "Daemon config:"
 sed -E 's/^(.*(KEY|TOKEN|SECRET|PASSWORD))=.+$/\1=<redacted>/' "$DAEMON_DIR/.env" | sed 's/^/  /'
 
 # ---------- 4. ComfyUI ----------
+# Fail LOUDLY on a driver too old for this torch build, rather than letting ComfyUI die on
+# import with its output going nowhere. A pod spent an hour restart-looping on exactly this:
+# the container died 16s into phase 3 with an empty comfyui.log, and the reason was only
+# visible by running ComfyUI by hand.
+if ! python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "!! FATAL: torch cannot initialise CUDA on this host."
+    echo "!! torch: $(python3 -c 'import torch;print(torch.__version__, torch.version.cuda)' 2>&1 | tail -1)"
+    echo "!! driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+    echo "!! A cu130 build needs driver >= 580. This image pins cu128, which runs on 550+."
+    echo "!! If the driver is older than that, this host cannot run the image — pick another."
+    exit 1
+fi
+
 echo "PHASE 3/6: starting ComfyUI on :${COMFY_PORT:-8188}"
 cd /app/ComfyUI
 python3 main.py --listen 127.0.0.1 --port "${COMFY_PORT:-8188}" \

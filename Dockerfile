@@ -44,7 +44,15 @@ WORKDIR /app
 # pinning it would either fail the build or drag torch backwards to match. If a
 # node turns out to need it, add it explicitly against whatever torch resolves
 # to rather than letting the resolver choose for both.
-RUN pip install --no-cache-dir "torch==2.12.1" "torchvision==0.27.1"
+# CUDA 12.8 wheels, PINNED TO THE INDEX. Plain `pip install torch==2.12.1` resolves to
+# 2.12.1+cu130, which requires an NVIDIA driver >= 580. The 3090 has 580.95 and worked; a
+# RunPod 4090 had 570.195 and ComfyUI died on import with "The NVIDIA driver on your system
+# is too old (found version 12080)", which failed the boot and put the pod in a restart loop.
+#
+# RunPod host drivers vary and cannot be chosen, so the image must run on the older one.
+# cu128 runs on both.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+    "torch==2.12.1" "torchvision==0.27.1"
 
 ARG COMFYUI_COMMIT=master
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
