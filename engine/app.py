@@ -641,12 +641,27 @@ def run_job(job: Job):
         (workdir / "prompt.txt").write_text(job.req.prompt)
 
         for lo in job.req.loras:
-            hit, total = lora_coverage(resolve_lora(lo.name), TRANSFORMER)
+            # Coverage is a DIAGNOSTIC -- how many of the transformer's weights this LoRA
+            # actually fuses into. It must never fail a render, and it did: TRANSFORMER
+            # defaults to ltx-2.3-22b-dev.safetensors, which a worker does not download
+            # (the recipe runs on sulphur_dev_bf16), so every job with a character LoRA died
+            # on a pod with
+            #
+            #   FileNotFoundError: .../ltx-2.3/diffusion_models/ltx-2.3-22b-dev.safetensors
+            #
+            # while working on the 3090 purely because that box happens to keep the file.
+            try:
+                hit, total = lora_coverage(resolve_lora(lo.name), TRANSFORMER)
+            except Exception as e:
+                hit, total = None, None
+                print(f"[{job.id}] lora coverage unavailable ({type(e).__name__}: {e}) "
+                      f"-- rendering anyway", flush=True)
             job.loras.append({"name": lo.name, "strength": lo.strength,
                               "strength_stage_1": lo.at(1), "strength_stage_2": lo.at(2),
                               "fused": hit, "targeted": total})
-            print(f"[{job.id}] lora {lo.name} @{lo.at(1)}/{lo.at(2)} (stage 1/2) "
-                  f"-> fuses {hit}/{total} weights", flush=True)
+            if hit is not None:
+                print(f"[{job.id}] lora {lo.name} @{lo.at(1)}/{lo.at(2)} (stage 1/2) "
+                      f"-> fuses {hit}/{total} weights", flush=True)
 
         # keyframe-server holds ~20 GB once Qwen is loaded and never gives it
         # back on its own; LTX needs essentially the whole card. Ask it to yield
