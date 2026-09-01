@@ -38,33 +38,33 @@ fi
 
 # ---------- Fetch anything missing ----------
 #
-# Sources are RECORDED, never guessed. Every public entry below is the repo the file was
-# actually taken from, carried over from ~/LTX-2/download-ltx23.sh and download-gemma-comfy.sh
-# on the 3090 -- which lived only on that box until now.
+# Sources are RECORDED, never guessed. The Lightricks and Comfy-Org entries come from
+# ~/LTX-2/download-ltx23.sh and download-gemma-comfy.sh on the 3090, which lived only on that
+# box. The two sulphur files are Sulphur 2, a drop-in LTX 2.3 replacement published at
+# SulphurAI/Sulphur-2-base; the distill LoRA is stored here under a shorter name.
+#
+# WHAT a pod needs is what a RENDER loads, which is not what the workflow template names and
+# not what the folder holds. The template says ltx-2.3-22b-dev.safetensors in three loaders,
+# but the recipe patches all three to sulphur_dev_bf16 before submission, so the dev
+# checkpoint never loads -- 43 GB that a pod would download and never open. Same for
+# ltx-2.3-22b-distilled-lora-384-1.1: the recipe substitutes the sulphur distill LoRA.
+# Confirmed against the resolved graph.json of a real render rather than read off the graph
+# template. That is the difference between fetching 58 GB and fetching 108.
 #
 # Xet is disabled deliberately: measured on the 3090 it moved 5 MB/s against ~2.2 MB/s for a
 # single raw curl off the CDN, so parallel plain connections win. It is the link, not the
 # client.
 export HF_HUB_DISABLE_XET=1
 
-# dest_subdir|filename|repo|path_in_repo   (path empty = filename at repo root)
-_PUBLIC=(
-  "diffusion_models|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|"
-  "text_encoders|gemma_3_12B_it_fp8_scaled.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"
-  "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|Lightricks/LTX-2.3|"
-  "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|"
+# dest_dir_under_$MODELS|final_filename|repo|path_in_repo (empty = filename at repo root)
+_WANTED=(
+  "ltx-2.3/diffusion_models|sulphur_dev_bf16.safetensors|SulphurAI/Sulphur-2-base|"
+  "ltx-2.3/text_encoders|gemma_3_12B_it_fp8_scaled.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"
+  "ltx-2.3/latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|"
+  "loras|sulphur_distill_lora_condsafe.safetensors|SulphurAI/Sulphur-2-base|distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
 )
-
-# The recipe patches these over the workflow's defaults, so a pod cannot render the validated
-# stack without them -- and neither has a public home. They are fetched from S3 through the
-# queue API's presigned redirect, the same path the daemon already uses for character LoRAs,
-# so a pod needs QUEUE_API_KEY and no AWS credentials at all.
-#
-# relpath_under_models|s3_uri_env_var
-_PRIVATE=(
-  "ltx-2.3/diffusion_models/sulphur_dev_bf16.safetensors|SULPHUR_CKPT_S3"
-  "loras/sulphur_distill_lora_condsafe.safetensors|SULPHUR_DISTILL_S3"
-)
+# Character LoRAs are NOT here: the daemon syncs those per claim from S3, so a pod carries
+# only the ones its jobs actually name.
 
 _report() {   # path started_at
     local f="$1" t0="$2" bytes elapsed
@@ -75,64 +75,30 @@ _report() {   # path started_at
         "$(echo "$bytes/1000000/$elapsed" | bc -l)"
 }
 
-_fetch_public() {
-    local dest="$LTX/$1" name="$2" repo="$3" path="$4" t0
-    [ -s "$dest/$name" ] && return 0
+_fetch() {
+    local dest_dir="$MODELS/$1" name="$2" repo="$3" path="$4" t0
+    [ -s "$dest_dir/$name" ] && return 0
+    mkdir -p "$dest_dir"
     echo "  fetching $name from $repo"
     t0=$(date +%s)
     if [ -n "$path" ]; then
-        # A repo path lands nested; move the file to where the loader looks for it.
+        # A repo path lands nested, and the stored name differs from the repo's. Staged in
+        # /tmp then moved, so a partial download is never visible under the final name --
+        # the truncation check below exists precisely because that failure is silent.
+        rm -rf /tmp/hfdl
         hf download "$repo" "$path" --local-dir /tmp/hfdl >/dev/null || return 1
-        mv -f "/tmp/hfdl/$path" "$dest/$name" || return 1
+        mv -f "/tmp/hfdl/$path" "$dest_dir/$name" || return 1
+        rm -rf /tmp/hfdl
     else
-        hf download "$repo" "$name" --local-dir "$dest" >/dev/null || return 1
+        hf download "$repo" "$name" --local-dir "$dest_dir" >/dev/null || return 1
     fi
-    _report "$dest/$name" "$t0"
+    _report "$dest_dir/$name" "$t0"
 }
 
-_fetch_private() {
-    local rel="$1" var="$2" uri="${!2:-}" dest="$MODELS/$1" t0
-    [ -s "$dest" ] && return 0
-    if [ -z "$uri" ]; then
-        echo "  !! $rel is missing and \$$var is not set."
-        echo "     It has no public source. Put it in S3 and pass $var=s3://bucket/key,"
-        echo "     or mount the model directory as the 3090 does."
-        return 1
-    fi
-    echo "  fetching $rel from $uri"
-    t0=$(date +%s)
-    mkdir -p "$(dirname "$dest")"
-    # Two steps, deliberately. GET /files answers with a 307 to a presigned S3 URL; following
-    # it with -L would resend X-API-Key to AWS, because curl only strips Authorization across
-    # hosts and passes custom headers straight through. So the redirect is resolved with the
-    # key, and the transfer itself carries no headers at all.
-    local signed
-    signed=$(curl -fsS --retry 3 --retry-delay 5 -o /dev/null -w '%{redirect_url}' \
-        -H "X-API-Key: ${QUEUE_API_KEY:-}" \
-        --get --data-urlencode "path=$uri" \
-        "${QUEUE_URL:-http://api.wanly22.com:8001}/files") || true
-    if [ -z "$signed" ]; then
-        echo "     !! the queue API did not return a presigned URL for $uri"
-        echo "        (check QUEUE_URL and QUEUE_API_KEY, and that the object exists)"
-        return 1
-    fi
-    # .part first: an interrupted download must not masquerade as a complete file, which is
-    # the exact failure the truncation check below exists to catch.
-    curl -fsSL --retry 3 --retry-delay 5 "$signed" -o "$dest.part" \
-        || { echo "     !! transfer failed"; rm -f "$dest.part"; return 1; }
-    mv -f "$dest.part" "$dest"
-    _report "$dest" "$t0"
-}
-
-# Only fetch when something is actually absent, so the 3090's read-only mount is untouched.
 NEED_FETCH=0
-for row in "${_PUBLIC[@]}"; do
+for row in "${_WANTED[@]}"; do
     IFS='|' read -r d n _r _p <<< "$row"
-    [ -s "$LTX/$d/$n" ] || NEED_FETCH=1
-done
-for row in "${_PRIVATE[@]}"; do
-    IFS='|' read -r rel _v <<< "$row"
-    [ -s "$MODELS/$rel" ] || NEED_FETCH=1
+    [ -s "$MODELS/$d/$n" ] || NEED_FETCH=1
 done
 
 if [ "$NEED_FETCH" -eq 1 ]; then
@@ -142,14 +108,10 @@ if [ "$NEED_FETCH" -eq 1 ]; then
         exit 1
     fi
     command -v hf >/dev/null || pip install --no-cache-dir -q "huggingface_hub[cli]" || true
-    echo "staging models (~108 GB on a cold pod; already-present files are skipped)"
-    for row in "${_PUBLIC[@]}"; do
+    echo "staging models (~58 GB on a cold pod; anything already present is skipped)"
+    for row in "${_WANTED[@]}"; do
         IFS='|' read -r d n r pth <<< "$row"
-        _fetch_public "$d" "$n" "$r" "$pth" || FAIL=1
-    done
-    for row in "${_PRIVATE[@]}"; do
-        IFS='|' read -r rel v <<< "$row"
-        _fetch_private "$rel" "$v" || FAIL=1
+        _fetch "$d" "$n" "$r" "$pth" || FAIL=1
     done
 fi
 
