@@ -88,12 +88,15 @@ _WANTED=(
 # only the ones its jobs actually name.
 
 _report() {   # path started_at
-    local f="$1" t0="$2" bytes elapsed
+    # Integers and builtins only. `bc` is NOT in this image, and calling it printed
+    # "bc: command not found" mid-boot and took the download with it.
+    local f="$1" t0="$2" bytes elapsed gb_whole gb_tenth rate
     bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
     elapsed=$(( $(date +%s) - t0 )); [ "$elapsed" -le 0 ] && elapsed=1
-    printf "     %.1f GB in %dm%02ds (%.1f MB/s)\n" \
-        "$(echo "$bytes/1000000000" | bc -l)" $((elapsed/60)) $((elapsed%60)) \
-        "$(echo "$bytes/1000000/$elapsed" | bc -l)"
+    gb_whole=$(( bytes / 1073741824 ))
+    gb_tenth=$(( (bytes % 1073741824) * 10 / 1073741824 ))
+    rate=$(( bytes / 1048576 / elapsed ))
+    echo "     ${gb_whole}.${gb_tenth} GB in $((elapsed/60))m$((elapsed%60))s (${rate} MB/s)"
 }
 
 _fetch() {
@@ -127,28 +130,39 @@ from huggingface_hub import hf_hub_download
 repo, filename, stage = sys.argv[1], sys.argv[2], sys.argv[3]
 hf_hub_download(repo_id=repo, filename=filename, local_dir=stage)
 PYEOF
-    local dl_pid=$! last=0 last_t
-    last_t=$(date +%s)
-    while kill -0 "$dl_pid" 2>/dev/null; do
-        sleep ${PROGRESS_INTERVAL:-30}
-        kill -0 "$dl_pid" 2>/dev/null || break
-        local now bytes elapsed rate
-        now=$(date +%s)
-        # stage AND the hub cache, so the meter is right whichever one the bytes pass
-        # through. The classic path writes a .incomplete under the stage; measuring both
-        # means a future change of mechanism cannot silently blind this.
-        bytes=$(du -sb "$stage" "$HF_HOME" 2>/dev/null | awk '{s+=$1} END {print s+0}')
-        elapsed=$(( now - last_t )); [ "$elapsed" -le 0 ] && elapsed=1
-        rate=$(( (bytes - last) / elapsed / 1048576 ))
-        if [ "$bytes" -ge 1073741824 ]; then
-            printf '     %s: %.1f GB so far, %s MB/s\n' \
-                "$name" "$(echo "$bytes/1073741824" | bc -l)" "$rate"
-        else
-            printf '     %s: %s MB so far, %s MB/s\n' \
-                "$name" "$(( bytes / 1048576 ))" "$rate"
-        fi
-        last=$bytes; last_t=$now
-    done
+    local dl_pid=$!
+
+    # Progress reporting must never be able to break the download it is reporting on. The
+    # first version did exactly that on a 37 MB/s pod: `bc` is not in this image, and awk
+    # printed the byte total as 3.19816e+09, which bash arithmetic cannot parse. The errors
+    # aborted _fetch, the models came up missing, the boot failed, and RunPod restarted it --
+    # a dead loop caused entirely by the logging. So this subshell swallows its own failures
+    # and uses nothing but integers and shell builtins.
+    (
+        local_last=0
+        while kill -0 "$dl_pid" 2>/dev/null; do
+            sleep "${PROGRESS_INTERVAL:-30}"
+            kill -0 "$dl_pid" 2>/dev/null || break
+            # %d, not the default: awk prints a sum above ~1e9 in scientific notation, and
+            # "3.19816e+09" is not a number bash can subtract.
+            now_bytes=$(du -sb "$stage" "$HF_HOME" 2>/dev/null | awk '{s+=$1} END {printf "%d", s+0}')
+            [ -n "$now_bytes" ] || now_bytes=0
+            delta=$(( now_bytes - local_last ))
+            [ "$delta" -lt 0 ] && delta=0
+            rate=$(( delta / ${PROGRESS_INTERVAL:-30} / 1048576 ))
+            # Integer maths only -- one decimal place done by hand, because `bc` is not
+            # installed and reaching for it is what started this.
+            gb_whole=$(( now_bytes / 1073741824 ))
+            gb_tenth=$(( (now_bytes % 1073741824) * 10 / 1073741824 ))
+            if [ "$gb_whole" -gt 0 ]; then
+                echo "     $name: ${gb_whole}.${gb_tenth} GB so far, ${rate} MB/s"
+            else
+                echo "     $name: $(( now_bytes / 1048576 )) MB so far, ${rate} MB/s"
+            fi
+            local_last=$now_bytes
+        done
+    ) 2>/dev/null || true
+
     wait "$dl_pid" || return 1
     mv -f "$stage/${path:-$name}" "$dest_dir/$name" || return 1
     rm -rf "$stage"
