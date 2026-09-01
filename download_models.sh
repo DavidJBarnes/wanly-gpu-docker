@@ -81,17 +81,24 @@ _fetch() {
     mkdir -p "$dest_dir"
     echo "  fetching $name from $repo"
     t0=$(date +%s)
-    if [ -n "$path" ]; then
-        # A repo path lands nested, and the stored name differs from the repo's. Staged in
-        # /tmp then moved, so a partial download is never visible under the final name --
-        # the truncation check below exists precisely because that failure is silent.
-        rm -rf /tmp/hfdl
-        hf download "$repo" "$path" --local-dir /tmp/hfdl >/dev/null || return 1
-        mv -f "/tmp/hfdl/$path" "$dest_dir/$name" || return 1
-        rm -rf /tmp/hfdl
-    else
-        hf download "$repo" "$name" --local-dir "$dest_dir" >/dev/null || return 1
-    fi
+    # The LIBRARY, not the `hf` CLI. ComfyUI's requirements install huggingface_hub, but the
+    # `hf` entry point only exists in newer releases -- so a pod could reach here and die on
+    # "hf: command not found", after which the fallback `pip install huggingface_hub[cli]` is
+    # a no-op because the requirement is already satisfied by an older version.
+    # hf_hub_download has been stable across all of them.
+    #
+    # Always staged in /tmp and moved: a repo path lands nested, the stored name can differ
+    # from the repo's, and a partial download must never be visible under the final name --
+    # which is the silent failure the truncation check below exists to catch.
+    rm -rf /tmp/hfdl
+    python3 - "$repo" "${path:-$name}" <<'PYEOF' || return 1
+import sys
+from huggingface_hub import hf_hub_download
+repo, filename = sys.argv[1], sys.argv[2]
+hf_hub_download(repo_id=repo, filename=filename, local_dir="/tmp/hfdl")
+PYEOF
+    mv -f "/tmp/hfdl/${path:-$name}" "$dest_dir/$name" || return 1
+    rm -rf /tmp/hfdl
     _report "$dest_dir/$name" "$t0"
 }
 
@@ -107,7 +114,9 @@ if [ "$NEED_FETCH" -eq 1 ]; then
         echo "!! That is the 3090's bind mount — fix the mount rather than downloading here."
         exit 1
     fi
-    command -v hf >/dev/null || pip install --no-cache-dir -q "huggingface_hub[cli]" || true
+    python3 -c "import huggingface_hub" 2>/dev/null \
+        || pip install --no-cache-dir -q huggingface_hub \
+        || { echo "!! FATAL: huggingface_hub is not installed and could not be installed"; exit 1; }
     echo "staging models (~58 GB on a cold pod; anything already present is skipped)"
     for row in "${_WANTED[@]}"; do
         IFS='|' read -r d n r pth <<< "$row"
