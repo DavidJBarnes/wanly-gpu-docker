@@ -51,10 +51,31 @@ fi
 # Confirmed against the resolved graph.json of a real render rather than read off the graph
 # template. That is the difference between fetching 58 GB and fetching 108.
 #
-# Xet is disabled deliberately: measured on the 3090 it moved 5 MB/s against ~2.2 MB/s for a
-# single raw curl off the CDN, so parallel plain connections win. It is the link, not the
-# client.
+# Transfer mechanism, decided by measurement rather than by what sounds fastest.
+#
+# Xet is the parallel path in current huggingface_hub, and HF_HUB_ENABLE_HF_TRANSFER is
+# deprecated in favour of it ("hf_transfer is not used anymore"). Enabling Xet was the obvious
+# move and it was measured to be the wrong one, twice:
+#
+#   * it does not stream into --local-dir. Chunks go to its own cache and the file is
+#     assembled at the end, so a progress meter watching the staging tree reports "0 MB so
+#     far" for the entire download -- the exact silence this is meant to end. Pointing
+#     HF_HOME and HF_XET_CACHE at the volume did not change that.
+#   * on the 3090's link it barely moved: 42 KB in 20 seconds, against a classic download
+#     that shows bytes within one 5s sample. The original note in the 3090's own script said
+#     the same thing (5 MB/s Xet against 2.2 MB/s single raw curl, with the caveat that the
+#     chunk cache was empty).
+#
+# So the classic path stays. It is single-stream, and single-stream measured 29 MB/s on a good
+# pod -- fast enough that the ceiling was never the mechanism. On the one bad pod, 8 parallel
+# ranges reached 3 MB/s against 0.7, which is 4x of a hopeless number: that host wanted
+# killing, not tuning.
+#
+# HF_HOME still moves onto $MODELS. Whatever the mechanism, its cache must not land on the
+# container overlay, which is 30-40 GB against a 43 GB file.
 export HF_HUB_DISABLE_XET=1
+export HF_HOME="$MODELS/.hf"
+mkdir -p "$HF_HOME" 2>/dev/null
 
 # dest_dir_under_$MODELS|final_filename|repo|path_in_repo (empty = filename at repo root)
 _WANTED=(
@@ -95,12 +116,40 @@ _fetch() {
     local stage="$MODELS/.staging"
     rm -rf "$stage"
     mkdir -p "$stage"
-    python3 - "$repo" "${path:-$name}" "$stage" <<'PYEOF' || return 1
+    # Run the download in the background and report progress from HERE, rather than letting
+    # huggingface_hub's own bar speak. That bar is drawn with \r and no newlines, so it produces
+    # nothing a line-oriented log can show: a 43 GB file is 45 minutes of total silence, which
+    # is exactly how an hour was spent waiting on a pod whose link had quietly collapsed from
+    # 13 MB/s to 1 MB/s. A rate printed every 30s makes that visible in the first minute.
+    python3 - "$repo" "${path:-$name}" "$stage" <<'PYEOF' &
 import sys
 from huggingface_hub import hf_hub_download
 repo, filename, stage = sys.argv[1], sys.argv[2], sys.argv[3]
 hf_hub_download(repo_id=repo, filename=filename, local_dir=stage)
 PYEOF
+    local dl_pid=$! last=0 last_t
+    last_t=$(date +%s)
+    while kill -0 "$dl_pid" 2>/dev/null; do
+        sleep ${PROGRESS_INTERVAL:-30}
+        kill -0 "$dl_pid" 2>/dev/null || break
+        local now bytes elapsed rate
+        now=$(date +%s)
+        # stage AND the hub cache, so the meter is right whichever one the bytes pass
+        # through. The classic path writes a .incomplete under the stage; measuring both
+        # means a future change of mechanism cannot silently blind this.
+        bytes=$(du -sb "$stage" "$HF_HOME" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+        elapsed=$(( now - last_t )); [ "$elapsed" -le 0 ] && elapsed=1
+        rate=$(( (bytes - last) / elapsed / 1048576 ))
+        if [ "$bytes" -ge 1073741824 ]; then
+            printf '     %s: %.1f GB so far, %s MB/s\n' \
+                "$name" "$(echo "$bytes/1073741824" | bc -l)" "$rate"
+        else
+            printf '     %s: %s MB so far, %s MB/s\n' \
+                "$name" "$(( bytes / 1048576 ))" "$rate"
+        fi
+        last=$bytes; last_t=$now
+    done
+    wait "$dl_pid" || return 1
     mv -f "$stage/${path:-$name}" "$dest_dir/$name" || return 1
     rm -rf "$stage"
     _report "$dest_dir/$name" "$t0"
