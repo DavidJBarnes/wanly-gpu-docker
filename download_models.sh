@@ -5,15 +5,18 @@
 # (/home/david/LTX-2/models -> /workspace/models), so there is nothing to fetch and this
 # script only has to prove the mount is really there and really complete.
 #
-# On a fresh pod with no such mount there IS a fetch to do — roughly 126 GB — and it is not
-# written yet, because inventing download URLs for checkpoints nobody has published to a
-# fixed location would be worse than failing with a clear message. See the TODO below.
+# On a fresh pod with no such mount there IS a fetch to do, and it is written below.
 #
-# When that fetch IS written, carry over what #39 established for the WAN downloader it
-# replaced: announce each file BEFORE starting it, and report size, elapsed and MB/s on
-# completion. hf_hub_download prints nothing while a 13 GB weight comes down, so reporting only
-# on success means minutes of silence that are indistinguishable from a hang — which is exactly
-# how a boot gets misread as stuck. At 126 GB that matters more here, not less.
+# WHAT a pod needs comes from the workflow, not from what happens to sit in the folder on the
+# 3090. That box holds 217 GB because it accumulated alternates -- three 43 GB checkpoints the
+# recipe never names. The workflow template names four files, and the recipe patches in two
+# more, so a working pod needs ~108 GB and not the folder.
+#
+# Progress reporting follows what #39 established for the WAN downloader this replaced:
+# announce each file BEFORE starting it, and report size, elapsed and MB/s on completion.
+# hf downloads print nothing while a 43 GB weight comes down, so reporting only on success
+# means many minutes of silence that are indistinguishable from a hang -- which is exactly how
+# a boot gets misread as stuck.
 #
 # Either way, failing here is enormously cheaper than failing 10 minutes into a claimed
 # segment, which is what a missing or half-downloaded model actually costs.
@@ -24,11 +27,92 @@ LTX="$MODELS/ltx-2.3"
 FAIL=0
 
 echo "model root: $MODELS"
+# A read-only bind mount is the 3090; anything else is a pod that may have to fetch.
+mkdir -p "$LTX/diffusion_models" "$LTX/text_encoders" "$LTX/latent_upscale_models" \
+         "$LTX/loras" "$MODELS/loras" 2>/dev/null || true
 if [ ! -d "$MODELS" ]; then
-    echo "!! FATAL: $MODELS does not exist."
+    echo "!! FATAL: $MODELS does not exist and could not be created."
     echo "!! On the 3090 this is a bind mount: -v /home/david/LTX-2/models:/workspace/models:ro"
-    echo "!! TODO: a pod with no mount needs a real download step (~126 GB). Not implemented."
     exit 1
+fi
+
+# ---------- Fetch anything missing ----------
+#
+# Sources are RECORDED, never guessed. The Lightricks and Comfy-Org entries come from
+# ~/LTX-2/download-ltx23.sh and download-gemma-comfy.sh on the 3090, which lived only on that
+# box. The two sulphur files are Sulphur 2, a drop-in LTX 2.3 replacement published at
+# SulphurAI/Sulphur-2-base; the distill LoRA is stored here under a shorter name.
+#
+# WHAT a pod needs is what a RENDER loads, which is not what the workflow template names and
+# not what the folder holds. The template says ltx-2.3-22b-dev.safetensors in three loaders,
+# but the recipe patches all three to sulphur_dev_bf16 before submission, so the dev
+# checkpoint never loads -- 43 GB that a pod would download and never open. Same for
+# ltx-2.3-22b-distilled-lora-384-1.1: the recipe substitutes the sulphur distill LoRA.
+# Confirmed against the resolved graph.json of a real render rather than read off the graph
+# template. That is the difference between fetching 58 GB and fetching 108.
+#
+# Xet is disabled deliberately: measured on the 3090 it moved 5 MB/s against ~2.2 MB/s for a
+# single raw curl off the CDN, so parallel plain connections win. It is the link, not the
+# client.
+export HF_HUB_DISABLE_XET=1
+
+# dest_dir_under_$MODELS|final_filename|repo|path_in_repo (empty = filename at repo root)
+_WANTED=(
+  "ltx-2.3/diffusion_models|sulphur_dev_bf16.safetensors|SulphurAI/Sulphur-2-base|"
+  "ltx-2.3/text_encoders|gemma_3_12B_it_fp8_scaled.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"
+  "ltx-2.3/latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|"
+  "loras|sulphur_distill_lora_condsafe.safetensors|SulphurAI/Sulphur-2-base|distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
+)
+# Character LoRAs are NOT here: the daemon syncs those per claim from S3, so a pod carries
+# only the ones its jobs actually name.
+
+_report() {   # path started_at
+    local f="$1" t0="$2" bytes elapsed
+    bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    elapsed=$(( $(date +%s) - t0 )); [ "$elapsed" -le 0 ] && elapsed=1
+    printf "     %.1f GB in %dm%02ds (%.1f MB/s)\n" \
+        "$(echo "$bytes/1000000000" | bc -l)" $((elapsed/60)) $((elapsed%60)) \
+        "$(echo "$bytes/1000000/$elapsed" | bc -l)"
+}
+
+_fetch() {
+    local dest_dir="$MODELS/$1" name="$2" repo="$3" path="$4" t0
+    [ -s "$dest_dir/$name" ] && return 0
+    mkdir -p "$dest_dir"
+    echo "  fetching $name from $repo"
+    t0=$(date +%s)
+    if [ -n "$path" ]; then
+        # A repo path lands nested, and the stored name differs from the repo's. Staged in
+        # /tmp then moved, so a partial download is never visible under the final name --
+        # the truncation check below exists precisely because that failure is silent.
+        rm -rf /tmp/hfdl
+        hf download "$repo" "$path" --local-dir /tmp/hfdl >/dev/null || return 1
+        mv -f "/tmp/hfdl/$path" "$dest_dir/$name" || return 1
+        rm -rf /tmp/hfdl
+    else
+        hf download "$repo" "$name" --local-dir "$dest_dir" >/dev/null || return 1
+    fi
+    _report "$dest_dir/$name" "$t0"
+}
+
+NEED_FETCH=0
+for row in "${_WANTED[@]}"; do
+    IFS='|' read -r d n _r _p <<< "$row"
+    [ -s "$MODELS/$d/$n" ] || NEED_FETCH=1
+done
+
+if [ "$NEED_FETCH" -eq 1 ]; then
+    if [ ! -w "$MODELS" ]; then
+        echo "!! FATAL: models are missing and $MODELS is read-only."
+        echo "!! That is the 3090's bind mount — fix the mount rather than downloading here."
+        exit 1
+    fi
+    command -v hf >/dev/null || pip install --no-cache-dir -q "huggingface_hub[cli]" || true
+    echo "staging models (~58 GB on a cold pod; anything already present is skipped)"
+    for row in "${_WANTED[@]}"; do
+        IFS='|' read -r d n r pth <<< "$row"
+        _fetch "$d" "$n" "$r" "$pth" || FAIL=1
+    done
 fi
 
 for d in diffusion_models loras text_encoders latent_upscale_models; do
