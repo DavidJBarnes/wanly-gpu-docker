@@ -143,10 +143,14 @@ PYEOF
         while kill -0 "$dl_pid" 2>/dev/null; do
             sleep "${PROGRESS_INTERVAL:-30}"
             kill -0 "$dl_pid" 2>/dev/null || break
-            # %d, not the default: awk prints a sum above ~1e9 in scientific notation, and
-            # "3.19816e+09" is not a number bash can subtract.
-            now_bytes=$(du -sb "$stage" "$HF_HOME" 2>/dev/null | awk '{s+=$1} END {printf "%d", s+0}')
-            [ -n "$now_bytes" ] || now_bytes=0
+            # No awk. This is the third mawk trap in one day: it buffers input by block
+            # (which swallowed the whole boot log), prints large sums in scientific notation
+            # (which bash cannot subtract), and its printf "%d" SATURATES AT INT32_MAX --
+            # so a 28 GB download reported 2147483647 bytes, i.e. "1.9 GB so far, 0 MB/s",
+            # for as long as it ran. Bash arithmetic is 64-bit; du and cut are enough.
+            stage_bytes=$(du -sb "$stage" 2>/dev/null | cut -f1); stage_bytes=${stage_bytes:-0}
+            hf_bytes=$(du -sb "$HF_HOME" 2>/dev/null | cut -f1); hf_bytes=${hf_bytes:-0}
+            now_bytes=$(( stage_bytes + hf_bytes ))
             delta=$(( now_bytes - local_last ))
             [ "$delta" -lt 0 ] && delta=0
             rate=$(( delta / ${PROGRESS_INTERVAL:-30} / 1048576 ))
