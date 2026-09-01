@@ -683,31 +683,25 @@ def run_job(job: Job):
                            "strength": job.placement[i - 1]["strength"]})
 
         if job.req.recipe:
-            # Recipe path: the graph comes wholly from recipes.json. No
-            # free-form patching, no guide splicing -- the validated workflow
-            # conditions on a single LoadImage which drives size as well.
+            # Recipe path: the graph is the validated workflow, patched with the resolved
+            # configuration this request carries. Nothing is looked up -- the recipe used to
+            # be read by NAME from recipes/recipes.json, which meant a pose created in the
+            # console was unknown here ("unknown recipe 'Doggystyle Side v2'") and an edited
+            # prompt on a seeded pose was silently ignored in favour of the file's copy.
+            # No free-form patching and no guide splicing: the validated workflow conditions
+            # on a single LoadImage which drives size as well.
             graph = comfy.load_workflow(resolve_workflow(recipe_mod.RECIPE_WORKFLOW))
             w, h = derive_size(workdir / "kf1.png")
-            # Fields the sheet marks "ui with defaults" may be overridden. The
-            # rest of the recipe is fixed. An override means this is no longer
-            # the validated configuration, so the hash changes and says so.
-            over = {}
-            if job.req.prompt.strip():
-                over["prompt"] = job.req.prompt
-            if job.req.negative_prompt:
-                over["negative"] = job.req.negative_prompt
-            if job.req.loras:
-                lo = job.req.loras[0]
-                over["char_lora"] = lo.name
-                over["char_s1"] = lo.at(1)
-                over["char_s2"] = lo.at(2)
-            if job.req.steps_stage_1 is not None:
-                over["steps_stage_1"] = job.req.steps_stage_1
-            if job.req.steps_stage_2 is not None:
-                over["steps_stage_2"] = job.req.steps_stage_2
-            graph = recipe_mod.resolve(graph, job.req.recipe, guides[0]["name"], w, h,
-                                       overrides=over or None,
-                                       character=job.req.character)
+            lora = job.req.loras[0] if job.req.loras else None
+            graph = recipe_mod.resolve(
+                graph, guides[0]["name"], w, h,
+                prompt=job.req.prompt,
+                negative=job.req.negative_prompt,
+                checkpoint=job.req.checkpoint,
+                char_lora=(lora.name if lora else None),
+                char_s1=(lora.at(1) if lora else 0.8),
+                char_s2=(lora.at(2) if lora else 1.5),
+            )
             if job.req.num_frames:
                 comfy.set_frames(graph, job.req.num_frames)
             # A recipe pins the configuration, not the draw. Without this the
@@ -716,23 +710,18 @@ def run_job(job: Job):
                            else random.randint(0, 2**31 - 1))
             job.req.width, job.req.height = w, h
             gh = recipe_mod.graph_hash(graph)
-            base_h = recipe_mod.graph_hash(
-                recipe_mod.resolve(comfy.load_workflow(resolve_workflow(recipe_mod.RECIPE_WORKFLOW)),
-                                   job.req.recipe, guides[0]["name"], w, h,
-                                   character=job.req.character))
-            # Name the output for what it IS, not the workflow's leftover default.
-            # <char lora>-<recipe slug>, so a file is identifiable on sight.
-            char = (job.req.loras[0].name if job.req.loras
-                    else recipe_mod.char_lora_for(job.req.recipe, job.req.character))
-            char = re.sub(r"\.safetensors$", "", char or "")
+            # Name the output for what it IS: <char lora>-<recipe slug>.
+            char = re.sub(r"\.safetensors$", "", (lora.name if lora else "") or "")
             if char.lower() in ("", "none"):
                 char = "no-char-lora"
             slug = re.sub(r"[^a-z0-9]+", "-", job.req.recipe.lower()).strip("-")
             graph["140"]["inputs"]["filename_prefix"] = f"{char}-{slug}"
-            # An edited prompt is normal working practice, not a fault: the
-            # baseline is a known-good starting point, not a constraint.
-            tag = "as validated" if gh == base_h else f"edited: {', '.join(sorted(over))}"
-            job.notes.append(f"recipe {job.req.recipe!r} · {char} · graph {gh[:12]} · {tag}")
+            # No "as validated" claim any more. That compared this graph against the sheet's
+            # baseline for the same name; with recipes in the database, whether a pose is
+            # validated is a field on the row and the API and console own it. Asserting it
+            # here would mean re-introducing a second source of truth to compare against,
+            # which is the bug this change removes.
+            job.notes.append(f"recipe {job.req.recipe!r} · {char} · graph {gh[:12]}")
             print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, graph {gh}", flush=True)
             (workdir / "graph.json").write_text(json.dumps(graph, indent=1))
             job.stages = comfy.describe_stages(graph)
