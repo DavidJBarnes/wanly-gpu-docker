@@ -18,15 +18,22 @@ mkdir -p /workspace/logs
 # Timestamp every line. Without it there is no way to tell a boot that is slow from one that is
 # wedged: both look like a log that has stopped moving.
 #
-# stdbuf on both stages is defensive, not a proven fix. On the first real pod (2026-09-01)
-# daemon.log sat at 0 bytes and the RunPod console showed nothing after the NVIDIA banner for
-# twelve minutes while the boot was in fact running normally — the exact ambiguity this line
-# exists to remove. The cause is NOT established: tee block-buffering was the obvious
-# suspect, and measuring it locally disproved that — both pipelines flush a line within a
-# second. So this removes buffering as a possibility rather than fixing a known bug, and the
-# real cause is still open. Do not treat an empty log as explained.
-exec > >(stdbuf -oL awk '{ print strftime("%H:%M:%S"), $0; fflush() }' \
-         | stdbuf -oL tee -a /workspace/logs/daemon.log) 2>&1
+# A bash read loop rather than awk, because `awk` here is MAWK. mawk reads its input in blocks
+# and only processes a block once it is full or the pipe closes -- and `fflush()` flushes its
+# OUTPUT, which is not the side that is holding anything. During a 45-minute silent model
+# download the boot produces a few hundred bytes, so nothing ever reached the log at all: on
+# two real pods daemon.log sat at 0 bytes and the RunPod console showed nothing after the
+# NVIDIA banner while the boot ran normally the whole time. Exactly the wedge/slow ambiguity
+# this timestamping exists to remove, caused by the timestamping.
+#
+# It read as correct because a development box runs GAWK, which does not buffer this way, and
+# because a test that lets the script EXIT flushes on close and passes. Reproduced in
+# ubuntu:22.04 with the script still running: mawk 0 bytes, this loop 120 bytes.
+#
+# `read` on a pipe returns per line, so there is no buffering stage left to get this wrong.
+exec > >(while IFS= read -r line; do
+             printf '%s %s\n' "$(date +%H:%M:%S)" "$line"
+         done | tee -a /workspace/logs/daemon.log) 2>&1
 
 echo "=== Wanly GPU Worker (LTX 2.3) ==="
 echo "image build: ${GIT_SHA:-unknown}"
