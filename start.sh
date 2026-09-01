@@ -17,7 +17,16 @@ set -e
 mkdir -p /workspace/logs
 # Timestamp every line. Without it there is no way to tell a boot that is slow from one that is
 # wedged: both look like a log that has stopped moving.
-exec > >(awk '{ print strftime("%H:%M:%S"), $0; fflush() }' | tee -a /workspace/logs/daemon.log) 2>&1
+#
+# stdbuf on both stages is defensive, not a proven fix. On the first real pod (2026-09-01)
+# daemon.log sat at 0 bytes and the RunPod console showed nothing after the NVIDIA banner for
+# twelve minutes while the boot was in fact running normally — the exact ambiguity this line
+# exists to remove. The cause is NOT established: tee block-buffering was the obvious
+# suspect, and measuring it locally disproved that — both pipelines flush a line within a
+# second. So this removes buffering as a possibility rather than fixing a known bug, and the
+# real cause is still open. Do not treat an empty log as explained.
+exec > >(stdbuf -oL awk '{ print strftime("%H:%M:%S"), $0; fflush() }' \
+         | stdbuf -oL tee -a /workspace/logs/daemon.log) 2>&1
 
 echo "=== Wanly GPU Worker (LTX 2.3) ==="
 echo "image build: ${GIT_SHA:-unknown}"

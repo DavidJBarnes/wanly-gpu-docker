@@ -81,24 +81,28 @@ _fetch() {
     mkdir -p "$dest_dir"
     echo "  fetching $name from $repo"
     t0=$(date +%s)
-    # The LIBRARY, not the `hf` CLI. ComfyUI's requirements install huggingface_hub, but the
-    # `hf` entry point only exists in newer releases -- so a pod could reach here and die on
-    # "hf: command not found", after which the fallback `pip install huggingface_hub[cli]` is
-    # a no-op because the requirement is already satisfied by an older version.
-    # hf_hub_download has been stable across all of them.
+    # Staged INSIDE $MODELS, never /tmp. On the 3090 /tmp is a large host disk; on a pod it is
+    # the container overlay, which is 30-40 GB against a 43 GB checkpoint -- so staging there
+    # cannot finish however big the volume is. The first real pod died exactly this way, at
+    # 28 GB of 43 with the 60 GB volume sitting empty beside it.
     #
-    # Always staged in /tmp and moved: a repo path lands nested, the stored name can differ
-    # from the repo's, and a partial download must never be visible under the final name --
-    # which is the silent failure the truncation check below exists to catch.
-    rm -rf /tmp/hfdl
-    python3 - "$repo" "${path:-$name}" <<'PYEOF' || return 1
+    # Same filesystem as the destination, so the move below is a rename rather than a second
+    # 43 GB copy.
+    #
+    # Staged and moved rather than written in place because a repo path lands nested, the
+    # stored name can differ from the repo's, and a partial download must never be visible
+    # under the final name -- the silent failure the truncation check below exists to catch.
+    local stage="$MODELS/.staging"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    python3 - "$repo" "${path:-$name}" "$stage" <<'PYEOF' || return 1
 import sys
 from huggingface_hub import hf_hub_download
-repo, filename = sys.argv[1], sys.argv[2]
-hf_hub_download(repo_id=repo, filename=filename, local_dir="/tmp/hfdl")
+repo, filename, stage = sys.argv[1], sys.argv[2], sys.argv[3]
+hf_hub_download(repo_id=repo, filename=filename, local_dir=stage)
 PYEOF
-    mv -f "/tmp/hfdl/${path:-$name}" "$dest_dir/$name" || return 1
-    rm -rf /tmp/hfdl
+    mv -f "$stage/${path:-$name}" "$dest_dir/$name" || return 1
+    rm -rf "$stage"
     _report "$dest_dir/$name" "$t0"
 }
 
