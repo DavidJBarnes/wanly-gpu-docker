@@ -40,10 +40,21 @@ WORKDIR /app
 # torch first and alone so a resolver backtrack cannot quietly pick another
 # build. This is the pair proven on the 3090 for LTX 2.3.
 #
-# No torchaudio: there is no 2.12.x release (published stops at 2.11.0), and
-# pinning it would either fail the build or drag torch backwards to match. If a
-# node turns out to need it, add it explicitly against whatever torch resolves
-# to rather than letting the resolver choose for both.
+# torchaudio IS pinned here, in the same line and from the same index. This comment used to
+# say it was deliberately absent because no 2.12.x existed -- and predicted the consequence:
+# "if a node turns out to need it, add it explicitly". A node does: ComfyUI's Lightricks
+# audio VAE imports torchaudio, so pip installed it anyway, from the DEFAULT index, as a
+# cu130 build. Beside a cu128 torch that fails at import with
+#
+#   OSError: libcudart.so.13: cannot open shared object file
+#
+# which killed ComfyUI on startup and restart-looped a pod for half an hour with no error
+# reaching the log.
+#
+# It must be installed HERE, before ComfyUI's own requirements run: pip treats an already
+# present 2.11.0 as satisfying "torchaudio==2.11.0" and will not replace a wrong-CUDA build
+# with the right one. Verified on the pod -- the corrective install did nothing until
+# --force-reinstall.
 # CUDA 12.8 wheels, PINNED TO THE INDEX. Plain `pip install torch==2.12.1` resolves to
 # 2.12.1+cu130, which requires an NVIDIA driver >= 580. The 3090 has 580.95 and worked; a
 # RunPod 4090 had 570.195 and ComfyUI died on import with "The NVIDIA driver on your system
@@ -57,7 +68,7 @@ WORKDIR /app
 # is the matching pair. A newer torch is worth less than an image that boots on the drivers
 # RunPod actually gives us.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-    "torch==2.11.0" "torchvision==0.26.0"
+    "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0"
 
 ARG COMFYUI_COMMIT=master
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
