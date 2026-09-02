@@ -116,3 +116,30 @@ def graph_hash(g: dict) -> str:
             if field in v.get("inputs", {}) and not isinstance(v["inputs"][field], list):
                 v["inputs"][field] = "<seed>"
     return hashlib.sha256(json.dumps(h, sort_keys=True).encode()).hexdigest()
+
+
+def lora_stack_note(graph: dict) -> str:
+    """Which LoRAs this graph actually loads, per stage, as a one-line proof.
+
+    Built by inspecting the resolved graph's LoraLoaderModelOnly nodes rather than the
+    request that produced them, so the line is evidence of what will render. The node ids
+    are the ones recipe.resolve() writes: 9601/9602 content, 9621/9622 character.
+
+    Both stages are printed only when they differ. A character LoRA at 0.8/1.5 is the
+    validated pair and reads better as "@0.8/1.5" than as two identical numbers repeated.
+    """
+    def pair(n1: str, n2: str, label: str) -> str:
+        a, b = graph.get(n1), graph.get(n2)
+        if not a and not b:
+            return f"{label} none"
+        name = (a or b)["inputs"]["lora_name"]
+        s1 = a["inputs"]["strength_model"] if a else None
+        s2 = b["inputs"]["strength_model"] if b else None
+        # A LoRA on one stage only is legal but unusual enough to name explicitly.
+        if s1 is None or s2 is None:
+            stage = "stage1" if s1 is not None else "stage2"
+            return f"{label} {name} @{s1 if s1 is not None else s2} ({stage} only)"
+        strengths = f"{s1}" if s1 == s2 else f"{s1}/{s2}"
+        return f"{label} {name} @{strengths}"
+
+    return f"{pair('9621', '9622', 'char')} · {pair('9601', '9602', 'content')}"

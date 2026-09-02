@@ -112,3 +112,56 @@ def test_the_extension_is_added_when_missing(graph):
     g2 = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
                             content_lora="sfbehind_LTX2_3_v0_1.safetensors")
     assert g2["9601"]["inputs"]["lora_name"] == "sfbehind_LTX2_3_v0_1.safetensors"
+
+
+# ---------------------------------------------------------------------------------------
+# The log line that proves which LoRAs actually loaded.
+#
+# Built from the RESOLVED GRAPH, not the request. Those differ exactly when something has
+# gone wrong — a field silently dropped (the engine request model has no extra="forbid", so
+# an older engine ignores unknown keys without complaint), a "none" check that missed, a
+# strength that fell back to a default. A log echoing the request would agree with itself
+# in precisely the cases worth catching.
+# ---------------------------------------------------------------------------------------
+# Lives in recipe.py, not app.py: it reads the graph resolve() produced, and app.py
+# imports comfy, which a pure test run has no reason to need.
+from engine.recipe import lora_stack_note  # noqa: E402
+
+
+def test_the_note_names_both_loras_and_their_strengths(graph):
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", char_s1=0.8, char_s2=1.5,
+                           content_lora="sfbehind_LTX2_3_v0_1", content_s1=0.35, content_s2=1.25)
+    note = lora_stack_note(g)
+    assert "char k3lly2026_v2.safetensors @0.8/1.5" in note
+    assert "content sfbehind_LTX2_3_v0_1.safetensors @0.35/1.25" in note
+
+
+def test_absence_is_stated_not_implied(graph):
+    """"content none" and no mention at all read identically to someone asking whether a
+    LoRA loaded. Every pose today is this case, so it is the line that will be read most."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2")
+    assert "content none" in lora_stack_note(g)
+
+
+def test_no_character_lora_is_also_stated(graph):
+    g = recipe_mod.resolve(graph, **BASE, char_lora="none",
+                           content_lora="sfbehind_LTX2_3_v0_1")
+    note = lora_stack_note(g)
+    assert "char none" in note
+    assert "content sfbehind_LTX2_3_v0_1.safetensors" in note
+
+
+def test_equal_strengths_are_not_printed_twice(graph):
+    """@0.6 rather than @0.6/0.6 — the common case should be the short one."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
+                           content_lora="sfbehind_LTX2_3_v0_1")
+    assert "content sfbehind_LTX2_3_v0_1.safetensors @0.6" in lora_stack_note(g)
+    assert "@0.6/0.6" not in lora_stack_note(g)
+
+
+def test_a_zero_strength_is_visible_in_the_log(graph):
+    """A LoRA loaded at 0 contributes nothing, and the log must not make that look like a
+    LoRA doing its job — this is the line someone reads when the output looks unchanged."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
+                           content_lora="sfbehind_LTX2_3_v0_1", content_s1=0.0, content_s2=0.0)
+    assert "content sfbehind_LTX2_3_v0_1.safetensors @0.0" in lora_stack_note(g)
