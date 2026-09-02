@@ -31,7 +31,8 @@ RECIPE_WORKFLOW = "ltx23_recipe.api.json"
 def resolve(graph: dict, image_name: str, width: int, height: int, *,
             prompt: str, negative: str | None = None, checkpoint: str | None = None,
             char_lora: str | None = None, char_s1: float = 0.8, char_s2: float = 1.5,
-            content_lora: str | None = None, img_compression: int | None = None) -> dict:
+            content_lora: str | None = None, content_s1: float = 0.6, content_s2: float = 0.6,
+            img_compression: int | None = None) -> dict:
     """Patch the validated graph with this render's configuration.
 
     Values only, never topology — the graph template is the validated recipe and this moves
@@ -72,13 +73,22 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     # for a shot where the start frame already carries the identity.
     char_name = (char_lora or "").strip()
     want_char = char_name.lower() not in ("", "none")
-    for tag, (branch, strength) in {"1": ("337", s1), "2": ("372", s2)}.items():
+    # Per stage, like the character strengths beside them. This was 0.6 hardcoded for BOTH
+    # stages, which is a configuration rather than a default -- stage 1 generates at half
+    # size from noise and stage 2 refines the 2x-upscaled latent, so one number for both is
+    # a different setup, not a simpler one. 0.6/0.6 remains the default so a caller that
+    # says nothing gets exactly the graph that was validated.
+    c1 = float(content_s1)
+    c2 = float(content_s2)
+    for tag, (branch, strength, cstrength) in {
+        "1": ("337", s1, c1), "2": ("372", s2, c2),
+    }.items():
         prev = ["301", 0]
         if has_content:
             cid = f"960{tag}"
             name = content if content.endswith(".safetensors") else content + ".safetensors"
             g[cid] = {"class_type": "LoraLoaderModelOnly",
-                      "inputs": {"lora_name": name, "strength_model": 0.6, "model": prev},
+                      "inputs": {"lora_name": name, "strength_model": cstrength, "model": prev},
                       "_meta": {"title": f"content stage {tag}"}}
             prev = [cid, 0]
         if want_char:

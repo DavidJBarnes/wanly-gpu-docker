@@ -199,6 +199,18 @@ class JobRequest(BaseModel):
     # Video CRF applied to the conditioning frame before it anchors the render. None leaves
     # the workflow's own value alone; 0 is meaningful and bypasses the encode entirely.
     img_compression: int | None = Field(default=None, ge=0, le=51)
+    # The pose's content LoRA -- motion and act -- chained ahead of the character LoRA on
+    # both stage branches. Named explicitly rather than reusing `loras[0]`, which the recipe
+    # path already spends on the CHARACTER LoRA; one list carrying two different roles by
+    # index is how the wrong one gets loaded.
+    #
+    # None and "none" both mean "render without one", which is what every pose does today.
+    content_lora: str | None = None
+    # Per stage, and bounded at 2.0 to match Lora above. Defaults are 0.6/0.6 -- exactly what
+    # resolve() hardcoded for both stages before this was configurable -- so a request that
+    # omits them renders the graph that was validated.
+    content_s1: float = Field(default=0.6, ge=0.0, le=2.0)
+    content_s2: float = Field(default=0.6, ge=0.0, le=2.0)
     num_inference_steps: int | None = Field(default=None, ge=1, le=50)
     # Steps per pass. None leaves that stage on the schedule the graph ships.
     #
@@ -719,6 +731,9 @@ def run_job(job: Job):
                 char_lora=(lora.name if lora else None),
                 char_s1=(lora.at(1) if lora else 0.8),
                 char_s2=(lora.at(2) if lora else 1.5),
+                content_lora=job.req.content_lora,
+                content_s1=job.req.content_s1,
+                content_s2=job.req.content_s2,
                 img_compression=job.req.img_compression,
             )
             if job.req.num_frames:
