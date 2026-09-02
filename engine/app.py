@@ -458,6 +458,21 @@ def resolve_lora(name: str) -> Path:
     return p
 
 
+
+def _checked_content_lora(name: str | None) -> str | None:
+    """Return the content LoRA name, having proven the file is actually there.
+
+    "none" and empty both mean "render without one" and are passed through untouched --
+    resolve() owns that vocabulary, and turning it into a filename lookup here is exactly
+    the bug that would make `none.safetensors` a 422.
+    """
+    if not name or name.strip().lower() == "none":
+        return name
+    n = name.strip()
+    resolve_lora(n if n.endswith(".safetensors") else n + ".safetensors")
+    return name
+
+
 def normalise(path: Path, width: int, height: int, allow_upscale: bool) -> str | None:
     """Bring a keyframe to the exact generation resolution. Returns what it did.
 
@@ -612,6 +627,7 @@ DEV_T = "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
 DISTILLED_LORA = "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 
 
+
 def derive_size(path: Path) -> tuple[int, int]:
     """Recipe resolution is derived, not chosen: take the start frame's native
     size and round DOWN to /64, preserving aspect. 64 because the two-stage
@@ -731,7 +747,17 @@ def run_job(job: Job):
                 char_lora=(lora.name if lora else None),
                 char_s1=(lora.at(1) if lora else 0.8),
                 char_s2=(lora.at(2) if lora else 1.5),
-                content_lora=job.req.content_lora,
+                # Checked here, before anything is submitted. A LoRA that is merely absent
+                # should cost a 422 in the first second, not a failure deep in a render that
+                # has already held the GPU — and the message names the file and lists what IS
+                # present, which is what turned a past "no such lora 'pay_v2_e05'" into a
+                # one-look fix. resolve_lora also refuses anything path-shaped.
+                #
+                # This matters more for content LoRAs than for character ones: they arrive in
+                # the bucket after a worker has booted, and the worker only syncs at boot, so
+                # "the pose names a LoRA this box has never heard of" is the expected failure
+                # rather than an exotic one.
+                content_lora=_checked_content_lora(job.req.content_lora),
                 content_s1=job.req.content_s1,
                 content_s2=job.req.content_s2,
                 img_compression=job.req.img_compression,
@@ -755,8 +781,21 @@ def run_job(job: Job):
             # validated is a field on the row and the API and console own it. Asserting it
             # here would mean re-introducing a second source of truth to compare against,
             # which is the bug this change removes.
-            job.notes.append(f"recipe {job.req.recipe!r} · {char} · graph {gh[:12]}")
-            print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, graph {gh}", flush=True)
+            # Read back from the RESOLVED GRAPH, not from the request. The request is what
+            # was asked for; the graph is what will render, and those differ exactly when
+            # something has gone wrong — a field silently dropped (this model has no
+            # extra="forbid", so an older engine ignores unknown keys without complaint), a
+            # name that failed its "none" check, a strength that fell back to a default.
+            # A log that repeats the request would agree with itself in precisely the cases
+            # worth catching.
+            #
+            # Absence is stated, never implied. "content none" and no line at all look the
+            # same to a reader trying to work out whether a LoRA loaded.
+            job.notes.append(
+                f"recipe {job.req.recipe!r} · {recipe_mod.lora_stack_note(graph)} · graph {gh[:12]}"
+            )
+            print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, "
+                  f"{recipe_mod.lora_stack_note(graph)}, graph {gh}", flush=True)
             (workdir / "graph.json").write_text(json.dumps(graph, indent=1))
             job.stages = comfy.describe_stages(graph)
             job.prompt_id = cf.submit(graph)
