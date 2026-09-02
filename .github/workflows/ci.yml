@@ -1,0 +1,37 @@
+# This repo had no tests and no test CI — only the image build. It contains the recipe
+# resolver, which CLAUDE.md calls load-bearing: the validated DR34 i2v graph is patched
+# VALUES ONLY, never topology, and a change to what resolve() emits is a change to every
+# render that has ever been validated. That is worth more than a build check.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # pytest alone. The resolver tests are pure — they load the workflow JSON and compare
+      # the patched graph. Nothing here touches torch, ComfyUI or a GPU, and it should stay
+      # that way: a test that needs the real stack belongs on a GPU runner, not in CI.
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Test
+        run: python -m pytest tests/ -q
+
+      # Undefined names are the failure class that has cost this project the most: three
+      # production 500s in a month, each a name that imported fine and blew up at request
+      # time. Same guard as wanly-api and wanly-gpu-daemon.
+      - name: No undefined names
+        run: |
+          pip install "ruff>=0.5"
+          python -m ruff check --select F821 --output-format concise engine/
