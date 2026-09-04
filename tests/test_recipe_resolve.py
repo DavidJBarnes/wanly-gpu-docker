@@ -260,3 +260,29 @@ def test_a_single_lora_is_not_numbered(graph):
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
                            content_loras=[{"name": "only"}])
     assert g["9601"]["_meta"]["title"] == "content stage 1"
+
+
+@pytest.mark.parametrize("spelling", ["none", "NONE", "none.safetensors",
+                                      "None.safetensors", " none ", ""])
+def test_no_character_lora_in_any_spelling(graph, spelling):
+    """Seen in production 2026-09-04:
+
+        9621 LoraLoaderModelOnly: lora_name: 'none.safetensors' not in [...]
+
+    A bare "none" was always excluded. "none.safetensors" was not — and that is exactly what
+    arrives once anything upstream normalises the name before sending it. ComfyUI then
+    rejects the whole graph, ten minutes into a claimed segment.
+
+    The engine builds the graph, so it is the last thing that can refuse to build a loader
+    for a file called "none".
+    """
+    g = recipe_mod.resolve(graph, **BASE, char_lora=spelling)
+    assert "9621" not in g and "9622" not in g
+
+
+@pytest.mark.parametrize("spelling", ["none", "none.safetensors", "NONE.SafeTensors"])
+def test_no_content_lora_in_any_spelling(graph, spelling):
+    """Same trap on the content chain, which normalises names the same way."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
+                           content_loras=[{"name": spelling}])
+    assert "9601" not in g and "9602" not in g
