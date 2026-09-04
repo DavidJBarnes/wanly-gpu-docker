@@ -44,6 +44,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import comfy
+import purge as purge_mod
 import recipe as recipe_mod
 import ltx_grid
 
@@ -1062,6 +1063,27 @@ def list_recipes():
     return {"character": d.get("character"), "characters": d.get("characters", {}),
             "sources": d.get("sources", {}), "labels": d.get("labels", {}),
             "definitions": d.get("definitions", {}), "recipes": d.get("recipes", {})}
+
+@app.post("/job/{job_id}/purge")
+def purge_job(job_id: str):
+    """Drop a finished job's local media once it is safely uploaded.
+
+    Called by the daemon AFTER a successful upload, never before — the local file is the
+    only copy until that upload lands, and reclaiming disk is not worth risking a render.
+
+    Keeps graph.json and prompt.txt; see engine/purge.py for why.
+    """
+    return purge_mod.purge_job_dir(JOBS_DIR / job_id)
+
+
+@app.post("/jobs/purge-all")
+def purge_all_jobs(keep_recent: int = 5):
+    """One-time sweep of everything already on disk (console#380)."""
+    r = purge_mod.purge_all(JOBS_DIR, keep_recent=keep_recent)
+    print(f"[purge] swept {r['dirs_purged']} job dirs, {r['files_removed']} files, "
+          f"{r['freed_bytes'] / 1e9:.2f} GB", flush=True)
+    return r
+
 
 @app.get("/health")
 def health():
