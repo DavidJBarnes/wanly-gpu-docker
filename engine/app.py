@@ -838,7 +838,21 @@ def run_job(job: Job):
                 f"recipe {job.req.recipe!r} · base {recipe_mod.base_model_note(graph)} · "
                 f"{recipe_mod.lora_stack_note(graph)} · graph {gh[:12]}"
             )
-            print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, base {ck}, "
+            # base_model_note(graph), NOT the local `ck`. `ck` is assigned inside the
+            # `for lo in job.req.loras` loop above, so a render with NO character LoRA never
+            # binds it and this line raised
+            #
+            #   UnboundLocalError: local variable 'ck' referenced before assignment
+            #
+            # after the graph was already built — a segment failing on its own log line.
+            # Seen in production 2026-09-04, on the very "no character" path that had just
+            # been made selectable.
+            #
+            # The line above was fixed to read from the graph and this one was not, which is
+            # the whole lesson: a loop-scoped variable used after the loop is a bug whether
+            # or not one of its uses has been corrected.
+            print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, "
+                  f"base {recipe_mod.base_model_note(graph)}, "
                   f"{recipe_mod.lora_stack_note(graph)}, graph {gh}", flush=True)
             (workdir / "graph.json").write_text(json.dumps(graph, indent=1))
             job.stages = comfy.describe_stages(graph)

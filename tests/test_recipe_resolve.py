@@ -286,3 +286,29 @@ def test_no_content_lora_in_any_spelling(graph, spelling):
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
                            content_loras=[{"name": spelling}])
     assert "9601" not in g and "9602" not in g
+
+
+def test_every_line_that_names_the_base_model_reads_it_from_the_graph():
+    """Both the segment note and its stdout twin report the base model, and they must derive
+    it from the same place. They did not.
+
+    The note was fixed to read the resolved graph; the print beside it kept using a local
+    `ck` assigned INSIDE the `for lo in job.req.loras` loop — so a render with NO character
+    LoRA never bound it and the segment died on its own log line:
+
+        UnboundLocalError: local variable 'ck' referenced before assignment
+
+    after the graph had already been built. Seen in production 2026-09-04, on the very
+    "no character" path that had just been made selectable.
+
+    Two lines stating one fact from two sources is the bug. This pins every such line to the
+    graph, which is the only thing that knows what will actually render.
+    """
+    import re
+
+    src = open("engine/app.py").read()
+    naming = [ln.strip() for ln in src.split("\n") if re.search(r"base \{", ln)]
+    assert naming, "expected at least one line naming the base model"
+    for ln in naming:
+        assert "base_model_note(graph)" in ln, (
+            f"this line derives the base model some other way: {ln}")
