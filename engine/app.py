@@ -126,6 +126,19 @@ LORA_DIR = Path(os.environ.get("LORA_DIR", MODELS_ROOT / "loras"))
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "5400"))
 
 
+class ContentLora(BaseModel):
+    """One motion/act LoRA in a pose's chain, with its own per-stage strengths.
+
+    Separate strengths because stage 1 generates at half size from noise and stage 2 refines
+    the 2x-upscaled latent. Lowering a competing content LoRA on stage 2 is a recorded lever
+    and one flat number cannot express it.
+    """
+
+    name: str
+    s1: float = Field(default=0.6, ge=0.0, le=2.0)
+    s2: float = Field(default=0.6, ge=0.0, le=2.0)
+
+
 class Lora(BaseModel):
     """A content LoRA by filename, resolved inside LORA_DIR.
 
@@ -205,12 +218,14 @@ class JobRequest(BaseModel):
     # index is how the wrong one gets loaded.
     #
     # None and "none" both mean "render without one", which is what every pose does today.
-    content_lora: str | None = None
-    # Per stage, and bounded at 2.0 to match Lora above. Defaults are 0.6/0.6 -- exactly what
-    # resolve() hardcoded for both stages before this was configurable -- so a request that
-    # omits them renders the graph that was validated.
-    content_s1: float = Field(default=0.6, ge=0.0, le=2.0)
-    content_s2: float = Field(default=0.6, ge=0.0, le=2.0)
+    # Content LoRAs STACK and are applied IN ORDER (console#410). Each carries its own
+    # per-stage strengths, both defaulting to 0.6 -- exactly what resolve() hardcoded before
+    # any of this was configurable -- so an entry naming only a LoRA renders at the
+    # validated strength.
+    #
+    # Capped at 4, matching `loras` above. Order is part of the configuration: the same
+    # LoRAs in a different order are a different render.
+    content_loras: list[ContentLora] = Field(default_factory=list, max_length=4)
     num_inference_steps: int | None = Field(default=None, ge=1, le=50)
     # Steps per pass. None leaves that stage on the schedule the graph ships.
     #
@@ -783,9 +798,10 @@ def run_job(job: Job):
                 # the bucket after a worker has booted, and the worker only syncs at boot, so
                 # "the pose names a LoRA this box has never heard of" is the expected failure
                 # rather than an exotic one.
-                content_lora=_checked_content_lora(job.req.content_lora),
-                content_s1=job.req.content_s1,
-                content_s2=job.req.content_s2,
+                content_loras=[
+                    {"name": _checked_content_lora(c.name), "s1": c.s1, "s2": c.s2}
+                    for c in job.req.content_loras
+                ],
                 img_compression=job.req.img_compression,
             )
             if job.req.num_frames:

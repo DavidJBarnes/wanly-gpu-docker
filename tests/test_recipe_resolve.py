@@ -52,7 +52,7 @@ def test_the_default_strengths_are_the_old_hardcode(graph):
     """0.6 on both stages. A caller that names a LoRA and no strengths must get the
     graph the hardcode produced, not a new number chosen while making it configurable."""
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                           content_lora="sfbehind_LTX2_3_v0_1")
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1"}])
     assert g["9601"]["inputs"]["strength_model"] == 0.6
     assert g["9602"]["inputs"]["strength_model"] == 0.6
 
@@ -62,8 +62,7 @@ def test_the_two_stages_take_different_strengths(graph):
     2x-upscaled latent. A LoRA that carries motion but degrades anatomy wants to be low
     where shape is decided and higher where detail is."""
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                           content_lora="sfbehind_LTX2_3_v0_1",
-                           content_s1=0.3, content_s2=1.1)
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1", "s1": 0.3, "s2": 1.1}])
     assert g["9601"]["inputs"]["strength_model"] == 0.3
     assert g["9602"]["inputs"]["strength_model"] == 1.1
 
@@ -75,8 +74,7 @@ def test_a_content_strength_of_zero_is_honoured(graph):
     then be of the wrong configuration.
     """
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                           content_lora="sfbehind_LTX2_3_v0_1",
-                           content_s1=0.0, content_s2=0.0)
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1", "s1": 0.0, "s2": 0.0}])
     assert g["9601"]["inputs"]["strength_model"] == 0.0
     assert g["9602"]["inputs"]["strength_model"] == 0.0
 
@@ -88,7 +86,7 @@ def test_the_content_lora_is_chained_ahead_of_the_character_lora(graph):
     weights against different base latents. That is the kind of change nothing catches.
     """
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                           content_lora="sfbehind_LTX2_3_v0_1")
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1"}])
     # stage 1: content 9601 feeds char 9621, which feeds branch 337
     assert g["9621"]["inputs"]["model"] == ["9601", 0]
     assert g["337"]["inputs"]["model"] == ["9621", 0]
@@ -100,17 +98,17 @@ def test_the_content_lora_is_chained_ahead_of_the_character_lora(graph):
 @pytest.mark.parametrize("value", ["none", "NONE", "", None])
 def test_none_in_any_spelling_renders_without_a_content_lora(graph, value):
     """"none" is how the stack says off, and it must not become a filename lookup."""
-    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", content_lora=value)
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", content_loras=[{"name": value}] if value is not None else [])
     assert "9601" not in g and "9602" not in g
 
 
 def test_the_extension_is_added_when_missing(graph):
     """The console stores bare names; ComfyUI wants the filename."""
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                           content_lora="sfbehind_LTX2_3_v0_1")
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1"}])
     assert g["9601"]["inputs"]["lora_name"] == "sfbehind_LTX2_3_v0_1.safetensors"
     g2 = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                            content_lora="sfbehind_LTX2_3_v0_1.safetensors")
+                            content_loras=[{"name": "sfbehind_LTX2_3_v0_1.safetensors"}])
     assert g2["9601"]["inputs"]["lora_name"] == "sfbehind_LTX2_3_v0_1.safetensors"
 
 
@@ -130,7 +128,7 @@ from engine.recipe import lora_stack_note  # noqa: E402
 
 def test_the_note_names_both_loras_and_their_strengths(graph):
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", char_s1=0.8, char_s2=1.5,
-                           content_lora="sfbehind_LTX2_3_v0_1", content_s1=0.35, content_s2=1.25)
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1", "s1": 0.35, "s2": 1.25}])
     note = lora_stack_note(g)
     assert "char k3lly2026_v2.safetensors @0.8/1.5" in note
     assert "content sfbehind_LTX2_3_v0_1.safetensors @0.35/1.25" in note
@@ -145,7 +143,7 @@ def test_absence_is_stated_not_implied(graph):
 
 def test_no_character_lora_is_also_stated(graph):
     g = recipe_mod.resolve(graph, **BASE, char_lora="none",
-                           content_lora="sfbehind_LTX2_3_v0_1")
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1"}])
     note = lora_stack_note(g)
     assert "char none" in note
     assert "content sfbehind_LTX2_3_v0_1.safetensors" in note
@@ -154,7 +152,7 @@ def test_no_character_lora_is_also_stated(graph):
 def test_equal_strengths_are_not_printed_twice(graph):
     """@0.6 rather than @0.6/0.6 — the common case should be the short one."""
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                           content_lora="sfbehind_LTX2_3_v0_1")
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1"}])
     assert "content sfbehind_LTX2_3_v0_1.safetensors @0.6" in lora_stack_note(g)
     assert "@0.6/0.6" not in lora_stack_note(g)
 
@@ -163,7 +161,7 @@ def test_a_zero_strength_is_visible_in_the_log(graph):
     """A LoRA loaded at 0 contributes nothing, and the log must not make that look like a
     LoRA doing its job — this is the line someone reads when the output looks unchanged."""
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
-                           content_lora="sfbehind_LTX2_3_v0_1", content_s1=0.0, content_s2=0.0)
+                           content_loras=[{"name": "sfbehind_LTX2_3_v0_1", "s1": 0.0, "s2": 0.0}])
     assert "content sfbehind_LTX2_3_v0_1.safetensors @0.0" in lora_stack_note(g)
 
 
@@ -190,3 +188,75 @@ def test_the_note_works_without_any_lora(graph):
     from engine.recipe import base_model_note
     g = recipe_mod.resolve(graph, **BASE, char_lora="none", checkpoint="ltx-2.3-22b-dev")
     assert base_model_note(g) == "ltx-2.3-22b-dev"
+
+
+# ---------------------------------------------------------------------------------------
+# Stacking (console#410). Motion, act and framing are separable, so a pose may want several.
+# ---------------------------------------------------------------------------------------
+
+
+def test_several_content_loras_chain_in_order(graph):
+    """Order is part of the configuration, not incidental. The same LoRAs in a different
+    order are a different render, so the chain must follow the list exactly."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", content_loras=[
+        {"name": "first", "s1": 0.3, "s2": 0.9},
+        {"name": "second", "s1": 0.5, "s2": 1.0},
+    ])
+    assert g["9601"]["inputs"]["lora_name"] == "first.safetensors"
+    assert g["9603"]["inputs"]["lora_name"] == "second.safetensors"
+    # first -> second -> char -> branch
+    assert g["9601"]["inputs"]["model"] == ["301", 0]
+    assert g["9603"]["inputs"]["model"] == ["9601", 0]
+    assert g["9621"]["inputs"]["model"] == ["9603", 0]
+    assert g["337"]["inputs"]["model"] == ["9621", 0]
+
+
+def test_each_lora_keeps_its_own_per_stage_strengths(graph):
+    """The whole reason for chaining rather than using the rgthree loader at node 301: that
+    node is shared across both stages and cannot express a per-stage difference."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", content_loras=[
+        {"name": "a", "s1": 0.3, "s2": 0.9},
+        {"name": "b", "s1": 0.5, "s2": 1.2},
+    ])
+    assert (g["9601"]["inputs"]["strength_model"], g["9602"]["inputs"]["strength_model"]) == (0.3, 0.9)
+    assert (g["9603"]["inputs"]["strength_model"], g["9604"]["inputs"]["strength_model"]) == (0.5, 1.2)
+
+
+def test_content_ids_never_reach_the_character_pair(graph):
+    """At the cap of 4 the content chain ends at 9608; the character LoRA lives at
+    9621/9622. If those ever collided one would silently overwrite the other."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
+                           content_loras=[{"name": f"c{i}"} for i in range(4)])
+    assert g["9607"]["inputs"]["lora_name"] == "c3.safetensors"
+    assert "9608" in g
+    assert g["9621"]["inputs"]["lora_name"] == "k3lly2026_v2.safetensors"
+
+
+def test_a_none_entry_in_the_list_is_skipped_not_looked_up(graph):
+    """"none" is how a pose says off. Looked up it would be a filename lookup for a file
+    that does not exist, failing the segment ten minutes into a claim."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", content_loras=[
+        {"name": "none"}, {"name": "real"},
+    ])
+    assert g["9601"]["inputs"]["lora_name"] == "real.safetensors"
+    assert "9603" not in g
+
+
+def test_the_note_lists_every_content_lora_in_order(graph):
+    """A result cannot be tied to a chain that is only half reported."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2", content_loras=[
+        {"name": "first", "s1": 0.3, "s2": 0.9},
+        {"name": "second", "s1": 0.5, "s2": 1.0},
+    ])
+    note = lora_stack_note(g)
+    assert "content1 first.safetensors @0.3/0.9" in note
+    assert "content2 second.safetensors @0.5/1.0" in note
+    assert note.index("content1") < note.index("content2")
+
+
+def test_a_single_lora_is_not_numbered(graph):
+    """graph_hash includes _meta, so numbering a lone LoRA "content 1" would change the
+    hash of every existing single-LoRA pose — and that hash is the regression trail."""
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
+                           content_loras=[{"name": "only"}])
+    assert g["9601"]["_meta"]["title"] == "content stage 1"

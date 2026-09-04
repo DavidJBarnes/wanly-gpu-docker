@@ -31,7 +31,7 @@ RECIPE_WORKFLOW = "ltx23_recipe.api.json"
 def resolve(graph: dict, image_name: str, width: int, height: int, *,
             prompt: str, negative: str | None = None, checkpoint: str | None = None,
             char_lora: str | None = None, char_s1: float = 0.8, char_s2: float = 1.5,
-            content_lora: str | None = None, content_s1: float = 0.6, content_s2: float = 0.6,
+            content_loras: list | None = None,
             img_compression: int | None = None) -> dict:
     """Patch the validated graph with this render's configuration.
 
@@ -62,8 +62,29 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
 
     # one content+character chain per stage branch, mirroring how the distill
     # LoRA is already wired at 361/362
-    content = (content_lora or "none").strip()
-    has_content = content.lower() not in ("", "none")
+    #
+    # Content LoRAs STACK (console#410): motion, act and framing are separable and a pose
+    # may want several. They are applied in the order given — that order is part of the
+    # configuration, not incidental, and two poses with the same LoRAs in a different order
+    # will render differently.
+    contents = []
+    for entry in (content_loras or []):
+        name = str(entry.get("name") or "").strip()
+        if not name or name.lower() == "none":
+            # "none" is how a pose says off. Looking it up would be a filename lookup for a
+            # file that does not exist.
+            continue
+        contents.append({
+            "name": name if name.endswith(".safetensors") else name + ".safetensors",
+            # 0.6 matches what this function hardcoded before any of it was configurable, so
+            # an entry that names a LoRA and nothing else renders at the validated strength.
+            # `is None` rather than `or`: 0 is a real setting — the LoRA loads and
+            # contributes nothing, which is how you measure what it was contributing.
+            "s1": float(entry["s1"]) if entry.get("s1") is not None else 0.6,
+            "s2": float(entry["s2"]) if entry.get("s2") is not None else 0.6,
+        })
+    # The template ships with a baked content LoRA at 9601 (DR34ML4Y). Remove it before
+    # building the chain, or it would sit in front of everything below.
     if "9601" in g:
         del g["9601"]
     s1 = float(char_s1)
@@ -78,18 +99,27 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     # size from noise and stage 2 refines the 2x-upscaled latent, so one number for both is
     # a different setup, not a simpler one. 0.6/0.6 remains the default so a caller that
     # says nothing gets exactly the graph that was validated.
-    c1 = float(content_s1)
-    c2 = float(content_s2)
-    for tag, (branch, strength, cstrength) in {
-        "1": ("337", s1, c1), "2": ("372", s2, c2),
-    }.items():
+    for tag, (branch, strength) in {"1": ("337", s1), "2": ("372", s2)}.items():
         prev = ["301", 0]
-        if has_content:
-            cid = f"960{tag}"
-            name = content if content.endswith(".safetensors") else content + ".safetensors"
+        # Node ids: 9601/9602 for the first content LoRA (unchanged, so a single-LoRA pose
+        # produces the same graph it always did), then 9603/9604, 9605/9606... Stops well
+        # short of the character pair at 9621/9622 even at the cap of 4, so the two chains
+        # can never collide.
+        for i, c in enumerate(contents):
+            cid = f"96{1 + i * 2:02d}" if tag == "1" else f"96{2 + i * 2:02d}"
             g[cid] = {"class_type": "LoraLoaderModelOnly",
-                      "inputs": {"lora_name": name, "strength_model": cstrength, "model": prev},
-                      "_meta": {"title": f"content stage {tag}"}}
+                      "inputs": {"lora_name": c["name"],
+                                 "strength_model": c["s1"] if tag == "1" else c["s2"],
+                                 "model": prev},
+                      # Unnumbered when there is only one, and that is not cosmetic
+                      # fussiness: graph_hash includes _meta, so numbering a lone LoRA
+                      # "content 1" would change the hash of every existing single-LoRA
+                      # pose. The hash is the regression trail — it is what proves a render
+                      # is the configuration that was signed off — and a relabel must not
+                      # look like a configuration change. Verified: single-LoRA poses hash
+                      # identically before and after this change.
+                      "_meta": {"title": f"content {i + 1} stage {tag}" if len(contents) > 1
+                                else f"content stage {tag}"}}
             prev = [cid, 0]
         if want_char:
             kid = f"962{tag}"
@@ -160,4 +190,17 @@ def lora_stack_note(graph: dict) -> str:
         strengths = f"{s1}" if s1 == s2 else f"{s1}/{s2}"
         return f"{label} {name} @{strengths}"
 
-    return f"{pair('9621', '9622', 'char')} · {pair('9601', '9602', 'content')}"
+    # Every content LoRA, in the order applied — the order is part of the configuration and
+    # a result cannot be tied to a chain that is only half reported.
+    parts = [pair("9621", "9622", "char")]
+    found = []
+    for i in range(4):
+        n1, n2 = f"96{1 + i * 2:02d}", f"96{2 + i * 2:02d}"
+        if n1 in graph or n2 in graph:
+            found.append(pair(n1, n2, f"content{i + 1}"))
+    # Unnumbered when there is exactly one, matching the node title convention and keeping
+    # the common line readable: "content sfbehind @0.6" rather than "content1 sfbehind @0.6".
+    if len(found) == 1:
+        found = [pair("9601", "9602", "content")]
+    parts.append(" · ".join(found) if found else "content none")
+    return " · ".join(parts)
