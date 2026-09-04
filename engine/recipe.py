@@ -118,6 +118,24 @@ def graph_hash(g: dict) -> str:
     return hashlib.sha256(json.dumps(h, sort_keys=True).encode()).hexdigest()
 
 
+def base_model_note(graph: dict) -> str:
+    """Which checkpoint this graph will actually load.
+
+    Read from the RESOLVED GRAPH rather than the request, for the same reason
+    lora_stack_note is: the request is what was asked for, the graph is what will render,
+    and those differ exactly when something has gone wrong.
+
+    2.3 checkpoints are monoliths, so every loader names the same file — 9500 is the one the
+    others follow.
+    """
+    for nid in ("9500", "9501", "9502"):
+        n = graph.get(nid)
+        if n and n.get("inputs", {}).get("ckpt_name"):
+            name = n["inputs"]["ckpt_name"]
+            return name[: -len(".safetensors")] if name.endswith(".safetensors") else name
+    return "unknown"
+
+
 def lora_stack_note(graph: dict) -> str:
     """Which LoRAs this graph actually loads, per stage, as a one-line proof.
 

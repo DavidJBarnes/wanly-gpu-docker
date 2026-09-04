@@ -818,9 +818,10 @@ def run_job(job: Job):
             # Absence is stated, never implied. "content none" and no line at all look the
             # same to a reader trying to work out whether a LoRA loaded.
             job.notes.append(
-                f"recipe {job.req.recipe!r} · {recipe_mod.lora_stack_note(graph)} · graph {gh[:12]}"
+                f"recipe {job.req.recipe!r} · base {recipe_mod.base_model_note(graph)} · "
+                f"{recipe_mod.lora_stack_note(graph)} · graph {gh[:12]}"
             )
-            print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, "
+            print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, base {ck}, "
                   f"{recipe_mod.lora_stack_note(graph)}, graph {gh}", flush=True)
             (workdir / "graph.json").write_text(json.dumps(graph, indent=1))
             job.stages = comfy.describe_stages(graph)
