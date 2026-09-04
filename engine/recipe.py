@@ -28,6 +28,26 @@ HERE = Path(__file__).parent
 RECIPE_WORKFLOW = "ltx23_recipe.api.json"
 
 
+def _is_none(name: str | None) -> bool:
+    """Is this the caller saying "no LoRA"?
+
+    Compared with the extension STRIPPED, which is the whole point. A bare "none" was always
+    excluded, but "none.safetensors" was not — and that is exactly what arrives once anything
+    upstream normalises the name before sending it. ComfyUI then rejects the graph with
+
+        9621 LoraLoaderModelOnly: lora_name: 'none.safetensors' not in [...]
+
+    ten minutes into a claimed segment. Seen in production 2026-09-04.
+
+    The daemon also filters this, and should. This is the last line: the engine builds the
+    graph, so it is the thing that must never build a loader for a file called "none".
+    """
+    n = (name or "").strip().lower()
+    if n.endswith(".safetensors"):
+        n = n[: -len(".safetensors")]
+    return n in ("", "none")
+
+
 def resolve(graph: dict, image_name: str, width: int, height: int, *,
             prompt: str, negative: str | None = None, checkpoint: str | None = None,
             char_lora: str | None = None, char_s1: float = 0.8, char_s2: float = 1.5,
@@ -70,7 +90,7 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     contents = []
     for entry in (content_loras or []):
         name = str(entry.get("name") or "").strip()
-        if not name or name.lower() == "none":
+        if _is_none(name):
             # "none" is how a pose says off. Looking it up would be a filename lookup for a
             # file that does not exist.
             continue
@@ -93,7 +113,7 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     # alone -- useful for judging what the LoRA is actually contributing, and
     # for a shot where the start frame already carries the identity.
     char_name = (char_lora or "").strip()
-    want_char = char_name.lower() not in ("", "none")
+    want_char = not _is_none(char_name)
     # Per stage, like the character strengths beside them. This was 0.6 hardcoded for BOTH
     # stages, which is a configuration rather than a default -- stage 1 generates at half
     # size from noise and stage 2 refines the 2x-upscaled latent, so one number for both is
