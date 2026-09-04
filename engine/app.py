@@ -681,8 +681,25 @@ def run_job(job: Job):
             #   FileNotFoundError: .../ltx-2.3/diffusion_models/ltx-2.3-22b-dev.safetensors
             #
             # while working on the 3090 purely because that box happens to keep the file.
+            # Measured against the checkpoint THIS JOB renders on, not the LTX_TRANSFORMER
+            # env var. With a per-pose checkpoint (console#404) those differ, and a coverage
+            # number computed against the wrong file is worse than none: it looks like a
+            # check while measuring something the render never touches.
+            #
+            # This number is the whole reason a base-model comparison is readable. Character
+            # LoRAs were trained against sulphur; against another base a LoRA whose keys do
+            # not line up fuses NOTHING and says nothing about it, and the render comes back
+            # as the base model with none of the character in it. "fuses 0/N" is what tells
+            # you that happened, rather than the output being blamed on the prompt.
+            ck = (job.req.checkpoint or "").strip()
+            if ck:
+                if not ck.endswith(".safetensors"):
+                    ck += ".safetensors"
+                target = MODELS_ROOT / "ltx-2.3/diffusion_models" / ck
+            else:
+                target = TRANSFORMER
             try:
-                hit, total = lora_coverage(resolve_lora(lo.name), TRANSFORMER)
+                hit, total = lora_coverage(resolve_lora(lo.name), target)
             except Exception as e:
                 hit, total = None, None
                 print(f"[{job.id}] lora coverage unavailable ({type(e).__name__}: {e}) "
@@ -692,7 +709,16 @@ def run_job(job: Job):
                               "fused": hit, "targeted": total})
             if hit is not None:
                 print(f"[{job.id}] lora {lo.name} @{lo.at(1)}/{lo.at(2)} (stage 1/2) "
-                      f"-> fuses {hit}/{total} weights", flush=True)
+                      f"-> fuses {hit}/{total} weights against {target.name}", flush=True)
+                if hit == 0:
+                    # Not fatal — comparing base models is a legitimate reason to be here —
+                    # but it must be impossible to miss. A 0-fusion render is the base model
+                    # with none of the character in it, and it looks entirely normal.
+                    print(f"[{job.id}] WARNING {lo.name} fused 0 weights against "
+                          f"{target.name}: this render carries NONE of that LoRA",
+                          flush=True)
+                    job.notes.append(f"{lo.name} fused 0/{total} against {target.name} "
+                                     f"— no character in this render")
 
         # keyframe-server holds ~20 GB once Qwen is loaded and never gives it
         # back on its own; LTX needs essentially the whole card. Ask it to yield
