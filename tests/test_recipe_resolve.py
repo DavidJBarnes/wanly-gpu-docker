@@ -165,3 +165,28 @@ def test_a_zero_strength_is_visible_in_the_log(graph):
     g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
                            content_lora="sfbehind_LTX2_3_v0_1", content_s1=0.0, content_s2=0.0)
     assert "content sfbehind_LTX2_3_v0_1.safetensors @0.0" in lora_stack_note(g)
+
+
+def test_the_note_names_the_base_model(graph):
+    """A render's record must say which checkpoint it ran on, or two base models cannot be
+    told apart afterwards — which is the entire point of making it per-pose."""
+    from engine.recipe import base_model_note
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2",
+                           checkpoint="10Eros_v1.5_bf16")
+    assert base_model_note(g) == "10Eros_v1.5_bf16"
+
+
+def test_the_default_base_model_is_named_too(graph):
+    """Not just overrides. A render on the default must say so explicitly, or "no mention"
+    and "the default" become indistinguishable in a log."""
+    from engine.recipe import base_model_note
+    g = recipe_mod.resolve(graph, **BASE, char_lora="k3lly2026_v2")
+    assert base_model_note(g) == "sulphur_dev_bf16"
+
+
+def test_the_note_works_without_any_lora(graph):
+    """`ck` used to be defined inside the LoRA loop, so a pose with no character LoRA would
+    have raised NameError building its own log line. Reading the graph avoids that."""
+    from engine.recipe import base_model_note
+    g = recipe_mod.resolve(graph, **BASE, char_lora="none", checkpoint="ltx-2.3-22b-dev")
+    assert base_model_note(g) == "ltx-2.3-22b-dev"
