@@ -17,11 +17,21 @@ Two facts drive the design.
 strictly one at a time through a single worker thread. Concurrency here would not
 be faster, it would be an OOM.
 
-**The GPU is already occupied.** keyframe-server's ComfyUI holds the Qwen
-checkpoint resident after any edit -- measured 20.4 GB, leaving 888 MB free --
-and never releases it on its own. Every job therefore calls keyframe-server's
-POST /free first and waits for the card to actually come back. Without that step
-LTX does not fail gracefully, it dies mid-load.
+**The GPU may be occupied.** Before a render this measures free VRAM and, if
+there is not enough, drops its own resident ComfyUI models and waits for the
+driver's accounting to catch up.
+
+It used to ask keyframe-server to yield first, because that service held ~20 GB
+of Qwen on the same card and never released it unaided. keyframe-server has been
+retired (#44), so that call is gone -- and it had never once succeeded anyway:
+KEYFRAME_URL defaulted to 127.0.0.1:8189, which inside this container is our own
+loopback, so every render connection-refused and skipped it silently for a month.
+A workaround (#45, which made a missing collaborator a no-op) hid a misconfiguration.
+
+If a VRAM-hungry neighbour returns to this card -- Qwen image edit under
+wanly-console#426 is the live candidate -- it needs a real yield contract, not a
+restored copy of this one. That ticket says so explicitly: one contract, rather
+than the two bespoke schemes it replaces.
 """
 import argparse
 import base64
@@ -54,7 +64,6 @@ import ltx_grid
 MODELS_ROOT = Path(os.environ.get("MODELS_DIR",
                                  os.environ.get("LTX_HOME", "/home/david/LTX-2") + "/models"))
 JOBS_DIR = Path(os.environ.get("JOBS_DIR", "/home/david/ltx-jobs"))
-KEYFRAME_URL = os.environ.get("KEYFRAME_URL", "http://127.0.0.1:8189")
 # ComfyUI, which renders. Was a subprocess against LTX's CLI until that
 # interface turned out to expose no sampler, scheduler or sigma control.
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8191")
@@ -571,18 +580,17 @@ def comfy_vram_free_gb() -> float:
 def free_the_gpu() -> float:
     """Make room for a render. Returns free GB.
 
-    Two tenants, freed in order of what it costs to reload them.
-
-    keyframe-server first: it holds the Qwen checkpoint (~20 GB) and never
-    releases it on its own, and it is not the one about to render.
-
-    Then, ONLY if that was not enough, our own ComfyUI. It keeps the LTX model
-    resident between jobs, which is what we want -- reloading a 46 GB monolith
-    costs far more than the memory is worth while jobs keep arriving. But that
-    residency is OURS and reclaimable, so counting it as "something else holds
-    the card" is simply wrong: measured 18.4 GB held by our own container with
-    keyframe-server down at 256 MB, which failed the floor and refused a render
+    ONE tenant now: our own ComfyUI. It keeps the LTX model resident between
+    jobs, which is what we want -- reloading a 46 GB monolith costs far more
+    than the memory is worth while jobs keep arriving. But that residency is
+    OURS and reclaimable, so counting it as "something else holds the card" is
+    simply wrong: measured 18.4 GB held by our own container while
+    keyframe-server sat at 256 MB, which failed the floor and refused a render
     that would have reused those very weights.
+
+    There used to be a second tenant asked to yield first. See the module
+    docstring for why that call is gone and why a returning neighbour needs a
+    real contract rather than a copy of it (#44, wanly-console#426).
 
     Note the residency is invisible to the obvious check -- `torch_vram_total`
     reads 0.77 GB because ComfyUI stages weights outside torch's caching
@@ -592,35 +600,15 @@ def free_the_gpu() -> float:
     Paying the reload only when memory is actually tight keeps the fast path
     free and pays the cost exactly when it buys something.
     """
-    # keyframe-server is OPTIONAL. If it is not running there is no GPU for it to free, and
-    # that is success, not failure — this used to raise, so an absent collaborator failed a
-    # render that had already been claimed. Connection refused therefore falls through to
-    # measuring the card directly.
-    #
-    # A server that IS up and refuses to yield stays a hard failure: that is a real conflict
-    # over the GPU, and proceeding into a model load would OOM instead.
-    free = None
-    try:
-        r = requests.post(f"{KEYFRAME_URL}/free", timeout=180)
-        if r.status_code != 200:
-            raise RuntimeError(f"keyframe-server /free -> {r.status_code} {r.text[:200]}")
-        free = float(r.json().get("vram_free_gb", 0.0))
-    except requests.ConnectionError:
-        print(f"[gpu] keyframe-server not running at {KEYFRAME_URL} — nothing to free",
-              flush=True)
-    except requests.Timeout as e:
-        # Up but not answering. Distinct from absent, and worth failing on: something holds
-        # the card and is not letting go.
-        raise RuntimeError(f"keyframe-server timed out yielding the GPU: {e}")
-
-    if free is None:
-        free = comfy_vram_free_gb()
+    # Measure the card directly. There is no longer anyone to ask to yield first: the only
+    # other tenant was keyframe-server, which is retired (#44).
+    free = comfy_vram_free_gb()
 
     if free >= MIN_FREE_GB:
         return free
     try:
-        print(f"[gpu] {free:.1f} GB free after keyframe-server yielded; dropping our "
-              f"own resident models too", flush=True)
+        print(f"[gpu] only {free:.1f} GB free; dropping our own resident models",
+              flush=True)
         requests.post(f"{COMFY_URL}/free",
                       json={"unload_models": True, "free_memory": True}, timeout=180)
         # Unloading is not synchronous with the driver's accounting -- reading
@@ -1101,19 +1089,13 @@ def purge_all_jobs(keep_recent: int = 5):
 
 @app.get("/health")
 def health():
-    free = None
-    try:
-        free = requests.get(f"{KEYFRAME_URL}/health", timeout=5).json().get("vram_free_gb")
-    except Exception:
-        pass
     return {"status": "ok", "models_root": str(MODELS_ROOT),
             "workflow": str(WORKFLOW),
             "workflow_present": WORKFLOW.exists(),
             "comfy": COMFY_URL,
             "models_present": MODELS.exists(),
             "queue_depth": QUEUE.qsize(),
-            "running": sum(1 for j in JOBS.values() if j.status == "Processing"),
-            "keyframe_server": KEYFRAME_URL, "keyframe_vram_free_gb": free}
+            "running": sum(1 for j in JOBS.values() if j.status == "Processing")}
 
 
 PUBLIC_BASE = ""
@@ -1129,5 +1111,5 @@ if __name__ == "__main__":
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=worker, daemon=True).start()
     print(f"ltx-engine on {args.host}:{args.port} | models={MODELS_ROOT} | "
-          f"comfy={COMFY_URL} | keyframe-server={KEYFRAME_URL}", flush=True)
+          f"comfy={COMFY_URL}", flush=True)
     uvicorn.run(app, host=args.host, port=args.port)
