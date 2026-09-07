@@ -31,10 +31,14 @@ $EDITOR worker.env          # QUEUE_API_KEY and the host paths
 ## Keeping it current
 
 ```bash
-sudo cp wanly-worker-update.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now wanly-worker-update.timer
+sudo ~/wanly-gpu-docker/deploy/install-timer.sh
 ```
+
+One command, absolute paths, and it **verifies** rather than reporting success. The four-step
+version it replaces was silently skippable: run the `enable` without the `cp` and systemd says
+`Unit wanly-worker-update.timer does not exist`, which names the unit rather than the missing
+copy and reads like the repo is wrong. And a timer can be `enabled` with `Trigger: n/a`, which
+is #76 — installed, enabled, and never going to fire. The script fails on both.
 
 `update-worker.sh` pulls `:latest`, compares its digest against the digest the running
 container was created from, and recreates only if they differ **and** the engine reports
