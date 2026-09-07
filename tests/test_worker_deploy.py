@@ -242,3 +242,46 @@ class TestTheTimerActuallyFires:
         """A box that was off through a release should update on the next boot, not wait for
         the following slot."""
         assert "Persistent=true" in self.TIMER.read_text()
+
+
+class TestTheTimerInstaller:
+    """Installing the timer was four steps and the first two were silently skippable.
+
+    Running `systemctl enable` without the `cp` gives `Unit wanly-worker-update.timer does not
+    exist` — which names the unit rather than the missing copy, reads like the repo is wrong,
+    and kept #72 open an extra day.
+    """
+
+    INSTALL = DEPLOY / "install-timer.sh"
+
+    def test_it_exists_and_is_executable(self):
+        assert self.INSTALL.is_file()
+        assert self.INSTALL.stat().st_mode & 0o111, "not executable"
+
+    def test_it_uses_absolute_paths(self):
+        """The other way to get the same error was running it from the wrong directory."""
+        s = self.INSTALL.read_text()
+        assert 'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' in s
+        assert '"$HERE/$unit"' in s
+
+    def test_it_installs_both_units(self):
+        s = self.INSTALL.read_text()
+        assert "wanly-worker-update.service" in s
+        assert "wanly-worker-update.timer" in s
+
+    def test_it_verifies_a_next_elapse_rather_than_trusting_is_enabled(self):
+        """#76 was a timer that reported `enabled` while `Trigger:` said `n/a` — installed,
+        enabled, and never going to fire. `is-enabled` is not evidence of scheduling."""
+        s = self.INSTALL.read_text()
+        assert "NextElapseUSecRealtime" in s
+        # Code only. The comments explain WHY is-enabled is not evidence, and that explanation
+        # is worth keeping — it is the whole reason the check exists.
+        code = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#"))
+        assert "is-enabled" not in code, "is-enabled proves nothing about whether it will fire"
+
+    def test_it_fails_loudly_when_nothing_is_scheduled(self):
+        s = self.INSTALL.read_text()
+        assert "FATAL" in s and "exit 1" in s
+
+    def test_it_refuses_to_run_without_root(self):
+        assert 'id -u' in self.INSTALL.read_text()
