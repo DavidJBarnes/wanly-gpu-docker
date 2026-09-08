@@ -768,15 +768,16 @@ def run_job(job: Job):
             # on a single LoadImage which drives size as well.
             graph = comfy.load_workflow(resolve_workflow(recipe_mod.RECIPE_WORKFLOW))
             w, h = derive_size(workdir / "kf1.png")
-            lora = job.req.loras[0] if job.req.loras else None
+            # Every entry of `loras` is a CHARACTER on this path (content LoRAs travel in
+            # their own field), one per person in the shot, in slot order (console#473).
+            # The cap is checked at submit, where a 422 reaches the caller.
             graph = recipe_mod.resolve(
                 graph, guides[0]["name"], w, h,
                 prompt=job.req.prompt,
                 negative=job.req.negative_prompt,
                 checkpoint=job.req.checkpoint,
-                char_lora=(lora.name if lora else None),
-                char_s1=(lora.at(1) if lora else 0.8),
-                char_s2=(lora.at(2) if lora else 1.5),
+                char_loras=[{"name": lo.name, "s1": lo.at(1), "s2": lo.at(2)}
+                            for lo in job.req.loras],
                 # Checked here, before anything is submitted. A LoRA that is merely absent
                 # should cost a 422 in the first second, not a failure deep in a render that
                 # has already held the GPU — and the message names the file and lists what IS
@@ -801,10 +802,11 @@ def run_job(job: Job):
                            else random.randint(0, 2**31 - 1))
             job.req.width, job.req.height = w, h
             gh = recipe_mod.graph_hash(graph)
-            # Name the output for what it IS: <char lora>-<recipe slug>.
-            char = re.sub(r"\.safetensors$", "", (lora.name if lora else "") or "")
-            if char.lower() in ("", "none"):
-                char = "no-char-lora"
+            # Name the output for what it IS: <char lora(s)>-<recipe slug>. Two people join
+            # with "+", so the filename says who is in the shot.
+            stems = [re.sub(r"\.safetensors$", "", lo.name) for lo in job.req.loras]
+            stems = [st for st in stems if st.lower() not in ("", "none")]
+            char = "+".join(stems) or "no-char-lora"
             slug = re.sub(r"[^a-z0-9]+", "-", job.req.recipe.lower()).strip("-")
             graph["140"]["inputs"]["filename_prefix"] = f"{char}-{slug}"
             # No "as validated" claim any more. That compared this graph against the sheet's
@@ -959,6 +961,13 @@ def submit(req: JobRequest):
                 f"{name}={v} must be divisible by 64. The two-stage distilled "
                 f"graph (spatial upsampler) requires it; only one-stage "
                 f"graphs accept 32. Nearest: {(v // 64) * 64} or {(v // 64 + 1) * 64}.")
+    # On the recipe path every `loras` entry is a person, and the graph has room for two
+    # (console#473). Refused here, in the first second, rather than as a failed job after
+    # the claim -- and named, so the caller knows it is the count and not a missing file.
+    if req.recipe and len(req.loras) > len(recipe_mod.CHAR_NODE_IDS):
+        raise HTTPException(422,
+            f"{len(req.loras)} character LoRAs; a recipe render takes at most "
+            f"{len(recipe_mod.CHAR_NODE_IDS)}")
     placement = plan(req)
     job = Job(id=uuid.uuid4().hex[:12], req=req, placement=placement)
     with _LOCK:

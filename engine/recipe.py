@@ -64,15 +64,28 @@ def _is_none(name: str | None) -> bool:
     return n in ("", "none")
 
 
+#: Node-id prefixes for the character LoRA pairs, one per slot: slot 0 is 9621/9622 (so
+#: every existing single-character graph hashes exactly as it did), slot 1 is 9631/9632.
+#: Content ids run 9601..9608 and stop well short of either. A third person is one more
+#: entry here -- and a second `<TRIGGER>` slot everywhere upstream (console#473).
+CHAR_NODE_IDS = ("962", "963")
+
+
 def resolve(graph: dict, image_name: str, width: int, height: int, *,
             prompt: str, negative: str | None = None, checkpoint: str | None = None,
             char_lora: str | None = None, char_s1: float = 0.8, char_s2: float = 1.5,
+            char_loras: list | None = None,
             content_loras: list | None = None,
             img_compression: int | None = None) -> dict:
     """Patch the validated graph with this render's configuration.
 
     Values only, never topology — the graph template is the validated recipe and this moves
     the handful of fields that vary between renders.
+
+    `char_loras` is the list form -- `[{name, s1, s2}, ...]`, up to `len(CHAR_NODE_IDS)`,
+    in slot order -- for a shot with two people in it (console#473). `char_lora/char_s1/
+    char_s2` remain as the one-character shorthand every existing caller uses, and produce
+    the identical graph: a single character is `char_loras=[that one]`.
     """
     g = json.loads(json.dumps(graph))
     ck = checkpoint or DEFAULT_CHECKPOINT
@@ -123,19 +136,33 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     # building the chain, or it would sit in front of everything below.
     if "9601" in g:
         del g["9601"]
-    s1 = float(char_s1)
-    s2 = float(char_s2)
     # A character LoRA is optional. "none" renders the recipe on the checkpoint
     # alone -- useful for judging what the LoRA is actually contributing, and
-    # for a shot where the start frame already carries the identity.
-    char_name = (char_lora or "").strip()
-    want_char = not _is_none(char_name)
+    # for a shot where the start frame already carries the identity. In the list form a
+    # "none" in either slot is skipped the same way, so a two-person pose can still be
+    # rendered with one identity to see what the other was contributing.
+    if char_loras is None:
+        char_loras = [{"name": char_lora, "s1": char_s1, "s2": char_s2}]
+    chars = []
+    for entry in char_loras:
+        name = str(entry.get("name") or "").strip()
+        if _is_none(name):
+            continue
+        chars.append({
+            "name": name if name.endswith(".safetensors") else name + ".safetensors",
+            "s1": float(entry["s1"]) if entry.get("s1") is not None else 0.8,
+            "s2": float(entry["s2"]) if entry.get("s2") is not None else 1.5,
+        })
+    if len(chars) > len(CHAR_NODE_IDS):
+        raise ValueError(
+            f"{len(chars)} character LoRAs; the recipe graph has room for "
+            f"{len(CHAR_NODE_IDS)} (console#473)")
     # Per stage, like the character strengths beside them. This was 0.6 hardcoded for BOTH
     # stages, which is a configuration rather than a default -- stage 1 generates at half
     # size from noise and stage 2 refines the 2x-upscaled latent, so one number for both is
     # a different setup, not a simpler one. 0.6/0.6 remains the default so a caller that
     # says nothing gets exactly the graph that was validated.
-    for tag, (branch, strength) in {"1": ("337", s1), "2": ("372", s2)}.items():
+    for tag, branch in {"1": "337", "2": "372"}.items():
         prev = ["301", 0]
         # Node ids: 9601/9602 for the first content LoRA (unchanged, so a single-LoRA pose
         # produces the same graph it always did), then 9603/9604, 9605/9606... Stops well
@@ -157,12 +184,17 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
                       "_meta": {"title": f"content {i + 1} stage {tag}" if len(contents) > 1
                                 else f"content stage {tag}"}}
             prev = [cid, 0]
-        if want_char:
-            kid = f"962{tag}"
-            char = char_name if char_name.endswith(".safetensors") else char_name + ".safetensors"
+        # Character LoRAs LAST, closest to the sampler, one pair per person. Slot 0 keeps
+        # its id and its unnumbered title so a one-person graph hashes as it always has --
+        # the hash is the regression trail. Slot 1 is `char 2`, and reads off slot 0.
+        for i, c in enumerate(chars):
+            kid = f"{CHAR_NODE_IDS[i]}{tag}"
             g[kid] = {"class_type": "LoraLoaderModelOnly",
-                      "inputs": {"lora_name": char, "strength_model": strength, "model": prev},
-                      "_meta": {"title": f"char stage {tag}"}}
+                      "inputs": {"lora_name": c["name"],
+                                 "strength_model": c["s1"] if tag == "1" else c["s2"],
+                                 "model": prev},
+                      "_meta": {"title": f"char stage {tag}" if i == 0
+                                else f"char {i + 1} stage {tag}"}}
             prev = [kid, 0]
         g[branch]["inputs"]["model"] = prev
     return g
@@ -229,6 +261,10 @@ def lora_stack_note(graph: dict) -> str:
     # Every content LoRA, in the order applied — the order is part of the configuration and
     # a result cannot be tied to a chain that is only half reported.
     parts = [pair("9621", "9622", "char")]
+    # A second person, only when there is one -- the common line must not grow a
+    # "char2 none" nobody asked about.
+    if "9631" in graph or "9632" in graph:
+        parts.append(pair("9631", "9632", "char2"))
     found = []
     for i in range(4):
         n1, n2 = f"96{1 + i * 2:02d}", f"96{2 + i * 2:02d}"
