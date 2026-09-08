@@ -133,7 +133,8 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
         trainer_case = "exit 7"
     else:
         training = '"p@y v3"' if trainer == "training" else "null"
-        trainer_case = ("echo '{\"services\":[{\"name\":\"lora-trainer\",\"training\":%s}]}'"
+        # `exit` after the echo, or the workers body below is appended and the JSON is junk.
+        trainer_case = ("echo '{\"services\":[{\"name\":\"lora-trainer\",\"training\":%s}]}'; exit 0"
                         % training)
     (bin_dir / "curl").write_text("\n".join([
         "#!/usr/bin/env bash",
