@@ -89,7 +89,7 @@ class TestTheIdleCheck:
 DEFAULT_NAME = re.search(r'^NAME="\$\{NAME:-([^}]+)\}"', UPDATE.read_text(), re.M).group(1)
 
 
-def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status):
+def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trainer=None):
     """Stage the real update-worker.sh with fakes for every external call it makes.
 
     Two separate fakes, because the script asks two different things:
@@ -126,7 +126,25 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status):
         body = "[]"
     else:
         body = '[{"friendly_name":"3090.zero","status":"%s"}]' % worker_status
-    (bin_dir / "curl").write_text("#!/usr/bin/env bash\ncat <<'JSON'\n%s\nJSON\n" % body)
+    # The host curl answers two things: the API's /workers, and -- since 2026-09-08 -- the
+    # trainer's control API on :8083, which shares the card. `trainer` is None (nothing
+    # answering), "idle", or "training".
+    if trainer is None:
+        trainer_case = "exit 7"
+    else:
+        training = '"p@y v3"' if trainer == "training" else "null"
+        trainer_case = ("echo '{\"services\":[{\"name\":\"lora-trainer\",\"training\":%s}]}'"
+                        % training)
+    (bin_dir / "curl").write_text("\n".join([
+        "#!/usr/bin/env bash",
+        'case "$*" in',
+        '  *":8083/health"*) %s ;;' % trainer_case,
+        "esac",
+        "cat <<'JSON'",
+        body,
+        "JSON",
+        "",
+    ]))
     (bin_dir / "curl").chmod(0o755)
 
     stage = tmp / "deploy"
@@ -139,9 +157,11 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status):
     return bin_dir, stage
 
 
-def _run(tmp_path, *, running_image, latest_image, engine_busy=0, worker_status="online-idle"):
+def _run(tmp_path, *, running_image, latest_image, engine_busy=0, worker_status="online-idle",
+         trainer=None):
     bin_dir, stage = _stage(tmp_path, running_image=running_image, latest_image=latest_image,
-                            engine_busy=engine_busy, worker_status=worker_status)
+                            engine_busy=engine_busy, worker_status=worker_status,
+                            trainer=trainer)
     env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
     return subprocess.run(["bash", str(stage / "update-worker.sh")],
                           capture_output=True, text=True, env=env)
@@ -285,3 +305,28 @@ class TestTheTimerInstaller:
 
     def test_it_refuses_to_run_without_root(self):
         assert 'id -u' in self.INSTALL.read_text()
+
+
+class TestTheTrainerSharesTheCard:
+    """2026-09-08: a training run had drained the render worker; the drained daemon had
+    exited and its container come back with no drain, looking idle. This timer recreated it
+    on the new image, it claimed a render beside the training, and the box hard-reset."""
+
+    SAME = "sha256:aaa"
+    NEW = "sha256:bbb"
+
+    def test_a_training_trainer_blocks_the_recreate(self, tmp_path):
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, trainer="training")
+        assert "RECREATED" not in r.stdout, r.stdout
+        assert "training=yes" in r.stdout
+
+    def test_an_idle_trainer_does_not(self, tmp_path):
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, trainer="idle")
+        assert "RECREATED" in r.stdout, r.stdout
+
+    def test_no_trainer_on_the_box_is_fine(self, tmp_path):
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, trainer=None)
+        assert "RECREATED" in r.stdout, r.stdout
+
+    def test_the_check_is_in_the_script(self):
+        assert ':${TRAINER_CONTROL_PORT:-8083}/health' in UPDATE.read_text()

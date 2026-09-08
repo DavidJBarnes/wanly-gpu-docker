@@ -120,6 +120,29 @@ if [ "$busy" != "0" ]; then
     exit 0
 fi
 
+# THE TRAINER SHARES THIS CARD. A training run drains the render worker, and a drained
+# worker is exactly what looks idle. Recreating it mid-run brought it back with no drain on
+# 2026-09-08; it claimed a render beside the training and the box hard-reset. The trainer's
+# control API says whether it is training; if it cannot be asked, assume it is.
+if curl -sf --max-time 5 "http://127.0.0.1:${TRAINER_CONTROL_PORT:-8083}/health" >/dev/null 2>&1; then
+    training=$(curl -sf --max-time 5 "http://127.0.0.1:${TRAINER_CONTROL_PORT:-8083}/health" \
+               | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("unknown"); raise SystemExit
+# Only a trainer answers with a services list; anything else on that port is not one.
+services = d.get("services") if isinstance(d, dict) else None
+if not isinstance(services, list):
+    print("no"); raise SystemExit
+print("yes" if any(isinstance(s, dict) and s.get("training") for s in services) else "no")
+' 2>/dev/null || echo unknown)
+    if [ "$training" != "no" ]; then
+        log "the trainer on this box reports training=$training — leaving the worker alone, will retry next run"
+        exit 0
+    fi
+fi
 log "worker is idle — recreating on the new image"
 "$HERE/run-worker.sh"
 log "done"
