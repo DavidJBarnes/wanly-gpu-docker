@@ -2,7 +2,13 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
+
+# ONE BUILD AT A TIME. The tags are moving pointers; two overlapping runs would leave
+# whichever finished last as :latest regardless of which commit it was.
+concurrency:
+  group: build-push
+  cancel-in-progress: false
 
 jobs:
   build-push:
@@ -25,6 +31,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # The `next` branch publishes :next only, so the 3090 can run a change before main
+      # moves and RunPod (which pulls :latest) never sees it (wanly-gpu-docker#83).
+      - name: Tags for this branch
+        id: tags
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "next" ]; then
+            echo "tags=davidjbarnes/wanly-gpu-docker:next,davidjbarnes/wanly-gpu-docker:next-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=davidjbarnes/wanly-gpu-docker:latest,davidjbarnes/wanly-gpu-docker:${GITHUB_SHA},davidjbarnes/wanly22-runpod:latest,davidjbarnes/wanly22-runpod:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -35,11 +52,7 @@ jobs:
           # template not in our list -- would simply fail to pull. That failure reads as a RunPod
           # capacity problem, not a naming one, which is an expensive hour to spend. Cheap to keep
           # publishing both. Drop the legacy pair once nothing has pulled it for a while (#36).
-          tags: |
-            davidjbarnes/wanly-gpu-docker:latest
-            davidjbarnes/wanly-gpu-docker:${{ github.sha }}
-            davidjbarnes/wanly22-runpod:latest
-            davidjbarnes/wanly22-runpod:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.tags }}
           # Without this the image reports GIT_SHA=unknown, which is what every build
           # before #72 did -- start.sh has printed "image build: unknown" on every boot since
           # the line was added, and the daemon now reports the same value upstream so two

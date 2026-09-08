@@ -33,6 +33,15 @@ for d in "$JOBS_DIR" "$MODELS_DIR"; do
     [ -d "$d" ] || { echo "!! $d does not exist — refusing to create a worker with a broken mount"; exit 1; }
 done
 
+# The supervisor answers /health on CONTROL_PORT (wanly-gpu-docker#83); the update timer
+# reads it. Refuse before removing anything if something else already listens there.
+CONTROL_PORT="${CONTROL_PORT:-8081}"
+if ss -tlnp 2>/dev/null | grep -q ":${CONTROL_PORT} " \
+   && ! docker port "$NAME" 2>/dev/null | grep -q ":${CONTROL_PORT}$"; then
+    echo "!! something other than $NAME already listens on :${CONTROL_PORT} — set CONTROL_PORT"
+    exit 1
+fi
+
 echo "recreating $NAME from $IMAGE"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
@@ -44,11 +53,13 @@ docker run -d \
     --gpus all \
     -p "${COMFY_HOST_PORT:-8191}:8188" \
     -p "${ENGINE_HOST_PORT:-8190}:8190" \
+    -p "${CONTROL_PORT}:8081" \
     -v "$JOBS_DIR:/jobs" \
     -v "$RECIPES_DIR:/opt/engine/recipes:ro" \
     -v "$MODELS_DIR:/workspace/models:ro" \
     -v "$MODELS_DIR/loras:/workspace/models/loras" \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
+    -e "SERVICES=${SERVICES:-ltx-engine}" \
     -e "ENGINE=ltx" \
     -e "QUEUE_URL=$QUEUE_URL" \
     -e "QUEUE_API_KEY=$QUEUE_API_KEY" \

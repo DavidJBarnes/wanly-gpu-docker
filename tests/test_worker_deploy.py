@@ -331,3 +331,24 @@ class TestTheTrainerSharesTheCard:
 
     def test_the_check_is_in_the_script(self):
         assert ':${TRAINER_CONTROL_PORT:-8083}/health' in UPDATE.read_text()
+
+
+class TestTheEngineIsAskedThroughTheSupervisor:
+    """update-worker.sh reads the engine's running/queue_depth from the supervisor's /health
+    (wanly-gpu-docker#83) and falls back to the engine itself for an image from before it."""
+
+    SAME = "sha256:aaa"
+    NEW = "sha256:bbb"
+
+    def test_the_script_asks_the_control_port_first(self):
+        text = UPDATE.read_text()
+        assert '${CONTROL_PORT:-8081}/health' in text
+        assert text.index('${CONTROL_PORT:-8081}/health') < text.index("127.0.0.1:8190/health")
+
+    def test_a_pre_supervisor_image_still_answers_through_the_fallback(self, tmp_path):
+        """The docker stub answers every in-container curl with the engine's own body, which
+        has no `services` list -- the supervisor path exits 4 and the fallback decides."""
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, engine_busy=0)
+        assert "RECREATED" in r.stdout, r.stdout
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, engine_busy=1)
+        assert "RECREATED" not in r.stdout, r.stdout

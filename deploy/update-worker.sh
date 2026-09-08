@@ -104,8 +104,22 @@ if [ "$worker_status" != "online-idle" ]; then
     exit 0
 fi
 
-busy=$(docker exec "$NAME" curl -sf --max-time 10 http://127.0.0.1:8190/health 2>/dev/null \
-       | python3 -c 'import json,sys;d=json.load(sys.stdin);print((d.get("running") or 0)+(d.get("queue_depth") or 0))' 2>/dev/null || echo unknown)
+# Through the supervisor's /health (wanly-gpu-docker#83): the ltx-engine-api entry carries the
+# engine's own running/queue_depth. `curl -s`, not `-sf`: a degraded container answers 503
+# and its body is still the truth. An image from before the supervisor answers nothing on
+# 8081; fall back to asking the engine directly so the timer can still update it.
+busy=$(docker exec "$NAME" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
+       | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+svc = {s.get("name"): s for s in d.get("services", []) if isinstance(s, dict)}
+e = svc.get("ltx-engine-api")
+if e is None: raise SystemExit(4)
+print((e.get("running") or 0) + (e.get("queue_depth") or 0))
+' 2>/dev/null \
+       || docker exec "$NAME" curl -sf --max-time 10 http://127.0.0.1:8190/health 2>/dev/null \
+       | python3 -c 'import json,sys;d=json.load(sys.stdin);print((d.get("running") or 0)+(d.get("queue_depth") or 0))' 2>/dev/null \
+       || echo unknown)
 
 if [ "$busy" = "unknown" ]; then
     # Fail SAFE: an unreachable engine is not evidence of idleness. It may be mid-boot, and

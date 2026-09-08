@@ -142,7 +142,12 @@ ENV COMFY_PORT=8188 \
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
+COPY fetch_daemon.sh /app/fetch_daemon.sh
 COPY start.sh /app/start.sh
+# The supervisor (wanly-gpu-docker#83): starts the enabled SERVICES in order, proves each one
+# answers, stops the container when one dies, and answers /health on CONTROL_PORT.
+COPY wanly_worker/ /app/wanly_worker/
+RUN pip install -r /app/wanly_worker/requirements.txt && mkdir -p /run/wanly
 RUN chmod +x /app/start.sh /app/download_models.sh && mkdir -p /jobs /workspace/logs
 
 # The commit this IMAGE was built from. Distinct from the daemon's commit, which is cloned
@@ -154,10 +159,15 @@ RUN chmod +x /app/start.sh /app/download_models.sh && mkdir -p /jobs /workspace/
 # "image build: ${GIT_SHA:-unknown}" since it was added, and it has always said unknown.
 ARG GIT_SHA=unknown
 ENV GIT_SHA=$GIT_SHA
+# Which services this container runs. A pod's environment never sets it, so the default is
+# the render stack alone; the 3090 sets SERVICES=ltx-engine,lora-trainer,... in worker.env.
+ENV SERVICES=ltx-engine \
+    CONTROL_PORT=8081 \
+    PYTHONPATH=/app
 # Same value under the name the daemon reports upstream. Named rather than reusing GIT_SHA
 # directly so the heartbeat field cannot be confused with any other component's sha inside an
 # image that also clones ComfyUI and five node packs.
 ENV WANLY_IMAGE_REF=$GIT_SHA
 
-EXPOSE 8188 8190 22
+EXPOSE 8188 8190 8081 22
 CMD ["/app/start.sh"]
