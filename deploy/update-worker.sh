@@ -134,28 +134,32 @@ if [ "$busy" != "0" ]; then
     exit 0
 fi
 
-# THE TRAINER SHARES THIS CARD. A training run drains the render worker, and a drained
-# worker is exactly what looks idle. Recreating it mid-run brought it back with no drain on
-# 2026-09-08; it claimed a render beside the training and the box hard-reset. The trainer's
-# control API says whether it is training; if it cannot be asked, assume it is.
-if curl -sf --max-time 5 "http://127.0.0.1:${TRAINER_CONTROL_PORT:-8083}/health" >/dev/null 2>&1; then
-    training=$(curl -sf --max-time 5 "http://127.0.0.1:${TRAINER_CONTROL_PORT:-8083}/health" \
-               | python3 -c '
+# THE TRAINER SHARES THIS CARD -- and since wanly-gpu-docker#83 it shares this CONTAINER. A
+# training run drains the render worker, and a drained worker is exactly what looks idle.
+# Recreating it mid-run brought it back with no drain on 2026-09-08; it claimed a render
+# beside the training and the box hard-reset. The container's own /health carries the
+# lora-trainer entry when the trainer is enabled: `training` is non-null while a run is on.
+# `curl -s`, not `-sf`: a degraded container answers 503 and its body is still the truth.
+# Unparseable counts as training. A container without the trainer has no such entry and
+# nothing to wait for.
+training=$(docker exec "$NAME" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
+           | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
     print("unknown"); raise SystemExit
-# Only a trainer answers with a services list; anything else on that port is not one.
 services = d.get("services") if isinstance(d, dict) else None
 if not isinstance(services, list):
+    print("unknown"); raise SystemExit
+trainer = [s for s in services if isinstance(s, dict) and s.get("name") == "lora-trainer"]
+if not trainer:
     print("no"); raise SystemExit
-print("yes" if any(isinstance(s, dict) and s.get("training") for s in services) else "no")
+print("yes" if any(s.get("training") for s in trainer) else "no")
 ' 2>/dev/null || echo unknown)
-    if [ "$training" != "no" ]; then
-        log "the trainer on this box reports training=$training — leaving the worker alone, will retry next run"
-        exit 0
-    fi
+if [ "$training" != "no" ]; then
+    log "the trainer in this container reports training=$training — leaving the worker alone, will retry next run"
+    exit 0
 fi
 log "worker is idle — recreating on the new image"
 "$HERE/run-worker.sh"

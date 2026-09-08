@@ -52,6 +52,25 @@ systemctl list-timers wanly-worker-update.timer
 journalctl -u wanly-worker-update.service -n 50
 ```
 
+## One container per GPU (#83)
+
+`SERVICES` in `worker.env` says what the container runs. The render stack (`ltx-engine`) is
+the default and is all a RunPod pod ever runs. The 3090 runs everything:
+
+```
+IMAGE=davidjbarnes/wanly-gpu-docker:full
+SERVICES=ltx-engine,lora-trainer,image-description,face-crop
+LORA_RUNS_DIR=/home/david/projects/loras
+OLLAMA_HOST_STORE=/usr/share/ollama/.ollama
+```
+
+`lora-trainer` and `image-description` live in the `:full` tag only; `run-worker.sh` refuses
+the lean tag with them enabled, before it removes anything. The box registers ONCE, as
+`render` + `trainer`, and the Workers page shows one row listing every service. A training run
+drains that row: the render daemon parks, the card frees, training runs, the drain is
+released. The update timer reads `training` off the container's own `/health` and leaves it
+alone throughout.
+
 ## Rollback
 
 `run-worker.sh` honours `IMAGE`, so pinning an older build is:

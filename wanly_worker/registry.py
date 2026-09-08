@@ -20,14 +20,36 @@ from __future__ import annotations
 from typing import Callable
 
 from wanly_worker.service import Service
+from wanly_worker.services.face_crop import FaceCrop
+from wanly_worker.services.image_description import ImageDescription
+from wanly_worker.services.lora_trainer import LoraTrainer
 from wanly_worker.services.ltx_engine import ltx_engine_group
 
 #: Every service the image can run, by the name the SERVICES flag uses. A value is a factory
-#: returning the ordered list of processes that name stands for. Adding one here is the only
-#: registration step.
-KNOWN: dict[str, Callable[[], list[Service]]] = {
+#: returning the ordered list of processes that name stands for (or one Service). Adding one
+#: here is the only registration step.
+KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
     "ltx-engine": ltx_engine_group,
+    "lora-trainer": LoraTrainer,
+    "image-description": ImageDescription,
+    "face-crop": FaceCrop,
 }
+
+#: Services whose presence changes what KIND of worker this box is. The API's claim gates key
+#: on kinds, not on `provides` -- a gate keyed on names needs an allowlist, and an engine
+#: missing from that allowlist claims nothing, indistinguishable from an empty queue. So the
+#: mapping lives here, in the one place that decides what to register as. image-description
+#: and face-crop add no kind: they are called, they claim nothing.
+KIND_BY_SERVICE = {"ltx-engine": "render", "lora-trainer": "trainer"}
+
+
+def kinds_for(names: list[str]) -> list[str]:
+    """What this box registers as, render first (wanly-api's `kind` is kinds[0]). A box that
+    runs only image-description is a `service`: it takes no work of any kind."""
+    out = [KIND_BY_SERVICE[n] for n in names if n in KIND_BY_SERVICE]
+    if "render" in out:
+        out = ["render", *[k for k in out if k != "render"]]
+    return out or ["service"]
 
 
 class ConfigError(RuntimeError):
