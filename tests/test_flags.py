@@ -168,6 +168,21 @@ class TestTheTrainerDrainsItsOwnRow:
         assert calls == ["http://api/workers/own-id/drain"]
         assert not looked_up
 
+    def test_the_id_file_is_read_at_call_time_from_the_environment(self, tmp_path, monkeypatch):
+        """The control plane exports WORKER_ID_FILE after gpu.py may already be imported."""
+        from wanly_worker.services.lora_trainer import gpu
+        monkeypatch.setattr(gpu, "WORKER_ID_FILE", "")
+        f = tmp_path / "worker-id"; f.write_text("late-id")
+        monkeypatch.setenv("WORKER_ID_FILE", str(f))
+        assert gpu.own_worker_id() == "late-id"
+
+    def test_the_control_plane_exports_the_id_file_for_itself(self):
+        import inspect
+        from wanly_worker import control
+        src = inspect.getsource(control.lifespan)
+        assert 'os.environ["WORKER_ID_FILE"] = WORKER_ID_FILE' in src
+        assert src.index('os.environ["WORKER_ID_FILE"]') < src.index("Supervisor(")
+
     def test_the_poller_reads_the_daemons_id(self):
         import inspect
         from wanly_worker import control
