@@ -111,12 +111,15 @@ def test_the_default_model_matches_wanly_apis_default():
     cfg = pathlib.Path(__file__).resolve().parents[2] / "wanly-api" / "app" / "config.py"
     if not cfg.exists():
         pytest.skip("wanly-api is not checked out beside this repo")
-    for line in cfg.read_text().splitlines():
-        if line.strip().startswith(("image_description_model:", "joycaption_model:")):
-            want = line.split("=", 1)[1].strip().strip('"').strip("'")
-            assert jc.MODEL == want, f"this image defaults to {jc.MODEL}, wanly-api asks for {want}"
-            return
-    pytest.fail("image_description_model/joycaption_model not found in wanly-api/app/config.py")
+    import re
+    # `image_description_model: str = Field("joycaption:beta-one", validation_alias=...)` --
+    # the first quoted string after the field name, whichever line it lands on.
+    m = re.search(r"(?:image_description_model|joycaption_model)\s*:\s*str\s*=\s*(?:Field\(\s*)?[\"']([^\"']+)[\"']",
+                  cfg.read_text())
+    if not m:
+        pytest.fail("image_description_model/joycaption_model not found in wanly-api/app/config.py")
+    want = m.group(1)
+    assert jc.MODEL == want, f"this image defaults to {jc.MODEL}, wanly-api asks for {want}"
 
 
 class TestAMissingModelIsBuilt:
