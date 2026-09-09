@@ -40,6 +40,11 @@ EPOCH_RE = re.compile(r"-(\d+)\.comfy\.safetensors$")
 #: what makes a request satisfiable, and those are not cleaned up, but polling every job
 #: this box ever trained on every tick is not free either.
 PUBLISH_WATCH_DAYS = int(os.environ.get("PUBLISH_WATCH_DAYS", "14"))
+#: How often the no-worker-id warning repeats. A tick with no id must SAY SO -- a silent
+#: return is invisible behind an entirely healthy-looking box, which is how Payton v1 sat in
+#: the queue for an hour on its first night. Repeating because docker logs are not
+#: necessarily watched as they happen.
+NO_WORKER_ID_LOG_S = int(os.environ.get("NO_WORKER_ID_LOG_S", "300"))
 
 
 def _log(msg: str) -> None:
@@ -82,6 +87,8 @@ class Poller:
         #: fact -- the two things that decide which of the files on disk are wanted.
         self._policy: dict[str, str] = {}
         self._requested: dict[str, set[str]] = {}
+        #: When the no-worker-id warning was last said, so the loud tick is not a flood.
+        self._no_id_said_at: float = 0.0
 
     def start(self) -> None:
         if not enabled():
@@ -107,6 +114,16 @@ class Poller:
     async def tick(self) -> None:
         wid = self._worker_id()
         if not wid:
+            # SAY WHY, then say it again every few minutes. Every other part of a broken
+            # claim path can be seen by asking elsewhere -- the row is green, the service
+            # is ready, the store is idle -- so this line is the ONLY thing that tells
+            # "the queue is empty" apart from "this box can never ask".
+            if time.time() - self._no_id_said_at >= NO_WORKER_ID_LOG_S:
+                _log("no worker id — NOT claiming any work. In one-container mode the render "
+                     "daemon owns the row and writes its id to WORKER_ID_FILE; if this keeps "
+                     "appearing while the worker row is registered, the control plane never "
+                     "saw that id.")
+                self._no_id_said_at = time.time()
             return
         await self.check_publish_requests()
         # Do not even ask while busy. Claiming marks the row on the API side, so asking for work

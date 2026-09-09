@@ -1054,3 +1054,71 @@ class TestARunTheRestartInterruptedMidUploadIsFinished:
         assert 'self._patch(job, {"status": "completed"' in src
         # only after the sweep, so a missing final is queued before it is judged
         assert src.index("self._sweep_checkpoints(job)") < src.index('"status": "completed"')
+
+
+class TestATickWithNoWorkerIdIsLoud:
+    """The first night the trainer polled with no worker id and silently returned: the worker
+    row was green and heartbeating, the service answered ready, the store was empty -- and
+    Payton v1 sat pending for an hour while the poll tick said nothing to no one. Every other
+    part of that failure can be seen by proxy; this line is the only thing that says the queue
+    is not empty, the box just cannot ask."""
+
+    def test_a_tick_with_no_id_says_so_and_claims_nothing(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import poller as mod
+        said = []
+        monkeypatch.setattr(mod, "_log", lambda m: said.append(m))
+        p = mod.Poller(client=None, worker_id_getter=lambda: None)
+
+        class C:
+            async def get(self, *a, **k):
+                raise AssertionError("the poll must never reach the API without an id")
+        p._client = C()
+
+        async def go():
+            await p.tick()
+        _run(go())
+        assert said and "no worker id" in said[0]
+
+    def test_the_warning_repeats_on_its_interval_not_every_tick(self, monkeypatch):
+        import time as time_mod
+        from wanly_worker.services.lora_trainer import poller as mod
+        said = []
+        monkeypatch.setattr(mod, "_log", lambda m: said.append(m))
+        p = mod.Poller(client=None, worker_id_getter=lambda: None)
+
+        async def go():
+            await p.tick()
+            await p.tick()
+            await p.tick()
+        real_time = time_mod.time
+        t = [1000.0]
+
+        def fake_time():
+            return t[0]
+        monkeypatch.setattr(mod.time, "time", fake_time)
+        _run(go())
+        assert len(said) == 1
+        # Past the interval, and it is said again -- three silent hours must not be possible.
+        t[0] = 1000.0 + mod.NO_WORKER_ID_LOG_S + 1
+        _run(go())
+        assert len(said) == 2
+
+    def test_a_tick_with_an_id_stays_quiet(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import poller as mod
+        said = []
+        monkeypatch.setattr(mod, "_log", lambda m: said.append(m))
+        p = mod.Poller(client=lambda *a, **k: None, worker_id_getter=lambda: "w")
+        # tick would now call check_publish_requests against a disabled env: QUEUE_URL unset.
+        monkeypatch.setattr(mod, "QUEUE_URL", "")
+        monkeypatch.setattr(mod, "QUEUE_API_KEY", "")
+        app_mod = __import__("wanly_worker.services.lora_trainer.app", fromlist=["STORE"])
+
+        class NowhereStore:
+            def claim_slot(self):
+                return False
+        monkeypatch.setattr(app_mod, "STORE", NowhereStore())
+
+        async def go():
+            await p.tick()
+        _run(go())
+        assert said == []
