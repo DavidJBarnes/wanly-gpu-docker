@@ -214,6 +214,29 @@ class Poller:
             return True
         return label in self._requested.get(job.id, set())
 
+    @staticmethod
+    def _readable(path: Path) -> bool:
+        """Is this a safetensors file at all? The header is a little-endian u64 length and a
+        JSON blob; a file whose first eight bytes are zero has NO header.
+
+        2026-09-08: the host hard-reset seconds after the final checkpoint was written. ext4
+        kept the file's size and replaced its contents with zeros, the poller's "interrupted
+        run" path uploaded it as Me_v2_final, and every render with that character failed at
+        LoraLoaderModelOnly with "Expecting value: line 1 column 1" -- a JSON error that names
+        nothing. The musubi-format twin beside it was intact. Checked here so a file like that
+        is reported and never published.
+        """
+        try:
+            with path.open("rb") as fh:
+                n = int.from_bytes(fh.read(8), "little")
+                if not 0 < n < 64 * 1024 * 1024:
+                    return False
+                import json
+                json.loads(fh.read(n))
+            return True
+        except Exception:
+            return False
+
     def _settled(self, path: Path) -> bool:
         """Has this file stopped growing? The trainer writes it in place, so a checkpoint that
         is still being written looks like a checkpoint with a smaller size."""
@@ -249,6 +272,13 @@ class Poller:
             if not self._wanted(job, path):
                 continue
             if self._settled(path):
+                if not self._readable(path):
+                    _log(f"!! {path.name} is not a readable safetensors file (no header) — "
+                         f"NOT publishing it. If the host reset right after it was written, "
+                         f"the .safetensors twin beside it is usually intact: regenerate with "
+                         f"musubi_tuner.ltx_2.convert_lora_to_comfy.")
+                    failed.append(str(path))
+                    continue
                 queue.append(path)
         task = self._uploader.get(job.id)
         if queue and (task is None or task.done()):

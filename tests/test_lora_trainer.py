@@ -20,6 +20,14 @@ import re
 import pytest
 
 
+def _real_safetensors(path):
+    """A tiny but genuine safetensors file: u64 header length, JSON header, then bytes."""
+    import json
+    import struct
+    header = json.dumps({"w": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+    path.write_bytes(struct.pack("<Q", len(header)) + header + b"\0" * 4)
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -899,7 +907,7 @@ class TestAFileGoingUpIsNotQueuedAgain:
         out = recipe.run_dir(job.character, job.version) / "output"
         out.mkdir(parents=True)
         f = out / "p@y_v2.comfy.safetensors"
-        f.write_bytes(b"x" * 16)
+        _real_safetensors(f)   # a file with a header, or the sweep refuses it (2026-09-08)
         async def idle(_job):
             return None
         p._upload_worker = idle
