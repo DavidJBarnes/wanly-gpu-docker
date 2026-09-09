@@ -47,11 +47,18 @@ WORKER_ID_FILE = os.environ.get("WORKER_ID_FILE", "")
 
 def own_worker_id() -> str:
     """The id of this box's own worker row, when the render daemon in this container wrote
-    it. Empty on a trainer-only box, which then falls back to finding the render worker."""
-    if not WORKER_ID_FILE:
+    it. Empty on a trainer-only box, which then falls back to finding the render worker.
+
+    READ AT CALL TIME, from the environment, not from the import-time constant: the
+    control plane sets WORKER_ID_FILE for itself (and the daemon child) after parsing
+    SERVICES, and this module can be imported before that. The first night's Payton v1
+    sat in the queue for an hour because the poller saw no worker id and never asked.
+    """
+    path = os.environ.get("WORKER_ID_FILE", "") or WORKER_ID_FILE
+    if not path:
         return ""
     try:
-        return open(WORKER_ID_FILE).read().strip()
+        return open(path).read().strip()
     except OSError:
         return ""
 

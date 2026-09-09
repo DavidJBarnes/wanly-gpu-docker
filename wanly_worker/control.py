@@ -45,8 +45,14 @@ async def lifespan(app: FastAPI):
         names = registry.parse_services(os.environ.get("SERVICES"))
         print(f"SERVICES={','.join(names)}", flush=True)
         # Before any child starts: the render daemon reads these from its env and registers
-        # the box with them (one row per box, wanly-gpu-docker#83).
+        # the box with them (one row per box, wanly-gpu-docker#83). WORKER_ID_FILE too, and
+        # for THIS process as much as for the daemon: the trainer's poller and its drain read
+        # the box's own row id from that file, and without the variable in the control
+        # process's env they saw no id and never claimed (Payton v1, first night).
         os.environ.update(export_identity(names))
+        if "ltx-engine" in names:
+            from wanly_worker.services.ltx_engine import WORKER_ID_FILE
+            os.environ["WORKER_ID_FILE"] = WORKER_ID_FILE
         _sup = Supervisor(registry.build(names))
     except Exception as e:
         _fatal(e)
