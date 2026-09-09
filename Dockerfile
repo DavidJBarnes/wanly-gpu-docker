@@ -139,6 +139,57 @@ ENV COMFY_PORT=8188 \
     YOLO_CONFIG_DIR=/tmp/ultralytics \
     ENGINE=ltx
 
+# ---------------------------------------------------------------- the :full layer
+#
+# OPT-IN, producing two tags from one Dockerfile (wanly-gpu-docker#83): :latest without it,
+# :full with. It is a PAYLOAD split, not a behaviour split -- SERVICES still decides what runs,
+# and both tags build from this file in one CI run, so they cannot drift. RunPod pods pull the
+# lean tag and never carry the ~7 GB of trainer torch or the ollama binary; the 3090 runs
+# :full with SERVICES=ltx-engine,lora-trainer,image-description,face-crop.
+#
+# THE TRAINER. libgl1 and libglib2.0-0 are opencv's: the trainer imports cv2 through
+# musubi_tuner.dataset.image_video_dataset, and without them stage 1 dies with
+# "ImportError: libGL.so.1: cannot open shared object file" -- after the image has been built,
+# pushed, pulled and a job claimed. PYTHON 3.11 SPECIFICALLY, from deadsnakes: the base is
+# 22.04 and ships 3.10; the venv this reproduces is 3.11.9, and "reproduce what works" is
+# worth a PPA. torch cu128 needs driver 550+; 3090.zero is on 580.
+#
+# IMAGE-DESCRIPTION is ollama, PINNED to 0.20.2 -- the version that has been serving
+# joycaption:beta-one; a runtime upgrade moves model format and GPU scheduling and is a
+# separate change. Installed from the release tarball rather than the install script, which
+# detects systemd, creates a user and writes a unit, none of which means anything here, and
+# always installs latest. The 0.20.x assets are .tar.zst, hence zstd.
+#
+# FACE-CROP needs nothing extra: insightface is already in the lean image for identity
+# scoring, and onnxruntime-gpu provides the CPU provider it uses.
+ARG WITH_TRAINER=0
+ARG TRAINER_COMMIT=e194f1f
+ARG OLLAMA_VERSION=0.20.2
+ENV TRAINER_DIR=/opt/ltx-trainer
+RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
+      apt-get update && apt-get install -y --no-install-recommends software-properties-common zstd \
+      && add-apt-repository -y ppa:deadsnakes/ppa \
+      && apt-get update \
+      && apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev \
+           libgl1 libglib2.0-0 \
+      && rm -rf /var/lib/apt/lists/* \
+      && curl -fsSL "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst" \
+           | tar --zstd -x -C /usr/local \
+      && /usr/local/bin/ollama --version || true; \
+      git clone https://github.com/AkaneTendo25/musubi-tuner.git "$TRAINER_DIR" \
+      && git -C "$TRAINER_DIR" checkout "$TRAINER_COMMIT" \
+      && python3.11 -m venv "$TRAINER_DIR/venv" \
+      && "$TRAINER_DIR/venv/bin/pip" install -q --upgrade pip setuptools wheel \
+      && "$TRAINER_DIR/venv/bin/pip" install -q \
+           torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+           --index-url https://download.pytorch.org/whl/cu128 \
+      && "$TRAINER_DIR/venv/bin/pip" install -q -e "$TRAINER_DIR" \
+      && "$TRAINER_DIR/venv/bin/pip" install -q bitsandbytes accelerate \
+      && "$TRAINER_DIR/venv/bin/python" -c "import torch; print('torch', torch.__version__)"; \
+    else \
+      echo "built without the trainer and image-description (WITH_TRAINER=0) — this is the lean :latest tag"; \
+    fi
+
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
@@ -163,11 +214,15 @@ ENV GIT_SHA=$GIT_SHA
 # the render stack alone; the 3090 sets SERVICES=ltx-engine,lora-trainer,... in worker.env.
 ENV SERVICES=ltx-engine \
     CONTROL_PORT=8081 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    OLLAMA_STORE=/root/.ollama \
+    LORA_RUNS_DIR=/loras
 # Same value under the name the daemon reports upstream. Named rather than reusing GIT_SHA
 # directly so the heartbeat field cannot be confused with any other component's sha inside an
 # image that also clones ComfyUI and five node packs.
 ENV WANLY_IMAGE_REF=$GIT_SHA
 
-EXPOSE 8188 8190 8081 22
+# ComfyUI, ltx-engine, the control API, sshd; then image-description (ollama) and face-crop,
+# which wanly-api calls across the network. The trainer binds loopback and is not exposed.
+EXPOSE 8188 8190 8081 22 11434 8084
 CMD ["/app/start.sh"]

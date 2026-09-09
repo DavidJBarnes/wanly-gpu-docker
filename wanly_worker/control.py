@@ -20,7 +20,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from wanly_worker import registry
-from wanly_worker.queue_client import QueueClient
+from wanly_worker.queue_client import QueueClient, export_identity
 from wanly_worker.supervisor import Supervisor, gpu_snapshot
 
 BUILD = os.environ.get("WANLY_IMAGE_REF", "unknown")
@@ -44,6 +44,9 @@ async def lifespan(app: FastAPI):
     try:
         names = registry.parse_services(os.environ.get("SERVICES"))
         print(f"SERVICES={','.join(names)}", flush=True)
+        # Before any child starts: the render daemon reads these from its env and registers
+        # the box with them (one row per box, wanly-gpu-docker#83).
+        os.environ.update(export_identity(names))
         _sup = Supervisor(registry.build(names))
     except Exception as e:
         _fatal(e)
@@ -65,7 +68,7 @@ async def lifespan(app: FastAPI):
         # a joycaption-only box must not poll for training jobs it could never run.
         if "lora-trainer" in names:
             from wanly_worker.services.lora_trainer.poller import Poller
-            _poller = Poller(client, lambda: _queue.worker_id if _queue else None)
+            _poller = Poller(client, _worker_id)
             _poller.start()
         try:
             yield
@@ -74,6 +77,19 @@ async def lifespan(app: FastAPI):
                 await _poller.stop()
             await _queue.stop()
             await _sup.stop()
+
+
+def _worker_id() -> str | None:
+    """This box's worker row, whoever registered it.
+
+    With the render daemon in the container it is the registrar and writes the id to
+    WORKER_ID_FILE after registering (wanly-gpu-daemon#185); the supervisor's own queue
+    client stays out of the way. Without one, the queue client registered and knows the id.
+    A callable rather than a value because the id does not exist until registration and a
+    404 makes either writer re-register with a new one.
+    """
+    from wanly_worker.services.lora_trainer import gpu
+    return gpu.own_worker_id() or (_queue.worker_id if _queue else None)
 
 
 def _fatal(e: Exception) -> None:

@@ -85,24 +85,33 @@ def enabled() -> bool:
     return bool(QUEUE_URL and QUEUE_API_KEY)
 
 
-#: Services whose presence changes what KIND of worker this box is. The API's claim gates key
-#: on kind, not on `provides` -- a gate keyed on names needs an allowlist, and an engine missing
-#: from that allowlist claims nothing, indistinguishable from an empty queue. So the mapping
-#: lives here, in the one place that decides what to register as.
-KIND_BY_SERVICE = {"lora-trainer": "trainer"}
+def worker_kinds(provides: list[str]) -> list[str]:
+    """What to register as, given what is running: every kind, render first.
+
+    Defaults to ["service"], which takes no work of any kind. A container that runs a trainer
+    must say `trainer` or it will never be offered a training job -- and that failure is
+    silent: it registers, heartbeats, shows green on the Workers page, and quietly never
+    claims. The mapping lives in the registry, beside the names.
+    """
+    from wanly_worker.registry import kinds_for
+    return kinds_for(provides)
 
 
 def worker_kind(provides: list[str]) -> str:
-    """What to register as, given what is running.
+    """`kind`, for an API from before `kinds` existed: the first of them."""
+    return worker_kinds(provides)[0]
 
-    Defaults to `service`, which takes no work of any kind. A container that runs a trainer must
-    say `trainer` or it will never be offered a training job -- and that failure is silent: it
-    registers, heartbeats, shows green on the Workers page, and quietly never claims.
+
+def export_identity(names: list[str]) -> dict[str, str]:
+    """WORKER_KINDS / WORKER_PROVIDES for the render daemon's env (wanly-gpu-daemon#185).
+
+    ONE WRITER PER ROW. When the render daemon runs here it is the registrar for the box: it
+    sends these in its register payload, so the one row says ["render", "trainer"] and lists
+    every enabled service. Written into os.environ before the supervisor starts anything,
+    because that is where a child's env comes from.
     """
-    for name in provides:
-        if name in KIND_BY_SERVICE:
-            return KIND_BY_SERVICE[name]
-    return "service"
+    return {"WORKER_KINDS": ",".join(worker_kinds(names)),
+            "WORKER_PROVIDES": ",".join(names)}
 
 
 class QueueClient:
@@ -167,6 +176,7 @@ class QueueClient:
             "ip_address": _ip(),
             "comfyui_running": False,
             "kind": worker_kind(self.provides()),
+            "kinds": worker_kinds(self.provides()),
             "provides": self.provides(),
         }
         try:

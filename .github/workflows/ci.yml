@@ -6,9 +6,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, next]
   push:
-    branches: [main]
+    branches: [main, next]
 
 jobs:
   test:
@@ -24,7 +24,9 @@ jobs:
       # the readiness probes). Nothing here touches torch, ComfyUI or a GPU, and it should
       # stay that way: a test that needs the real stack belongs on a GPU runner, not in CI.
       - name: Install test dependencies
-        run: pip install pytest -r wanly_worker/requirements.txt
+        # numpy: face-crop's gate/crop maths (services/face_crop/detect.py) is tested here;
+        # insightface itself is not, and is not installed.
+        run: pip install pytest "numpy<2" -r wanly_worker/requirements.txt
 
       - name: Shell scripts parse
         run: bash -n start.sh fetch_daemon.sh download_models.sh deploy/*.sh
