@@ -114,10 +114,16 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 # COMFYUI_PATH is EMPTY on purpose — see the note in start.sh. With a path set the daemon
 # takes ownership of ComfyUI's custom nodes, which breaks an LTX worker.
+# CDI, NOT `--gpus all` (#95). With `--gpus all` the toolkit hook grants the GPU device nodes
+# outside the container's OCI spec, so the next `systemctl daemon-reload` re-applies the
+# spec's device rules WITHOUT them: every CUDA allocation then fails with "0 bytes allocated,
+# 23 GiB free" until the container is recreated. Seen 2026-09-10, six minutes after a reboot.
+# CDI (`/var/run/cdi/nvidia.yaml`, kept fresh by nvidia-cdi-refresh) puts the devices in the
+# spec itself, where a reload preserves them. Needs Docker >= 28 and the toolkit's CDI spec.
 docker run -d \
     --name "$NAME" \
     --restart unless-stopped \
-    --gpus all \
+    --device nvidia.com/gpu=all \
     --shm-size "$SHM_SIZE" \
     -p "${COMFY_HOST_PORT:-8191}:8188" \
     -p "${ENGINE_HOST_PORT:-8190}:8190" \

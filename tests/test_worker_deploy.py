@@ -44,8 +44,13 @@ class TestTheContainerSpecIsComplete:
     def test_it_survives_a_reboot(self):
         assert "--restart unless-stopped" in RUN.read_text()
 
-    def test_it_gets_the_gpu(self):
-        assert "--gpus all" in RUN.read_text()
+    def test_it_gets_the_gpu_through_cdi(self):
+        """`--gpus all` grants the device nodes outside the OCI spec, and a systemd reload
+        takes them away again (#95). CDI puts them in the spec, where a reload keeps them."""
+        s = RUN.read_text()
+        assert "--device nvidia.com/gpu=all" in s
+        # As a FLAG. The comment above the run block names the old one to explain why.
+        assert not re.search(r"^\s*--gpus\b", s, re.M)
 
     def test_comfyui_path_is_explicitly_empty(self):
         """Not merely absent. With a path set the daemon takes ownership of ComfyUI's custom
