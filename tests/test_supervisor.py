@@ -144,3 +144,53 @@ def test_snapshot_reports_each_service():
     snap = _run(go())
     assert [s["name"] for s in snap] == ["a", "b"]
     assert all(s["ready"] and s["running"] and s["pid"] for s in snap)
+
+
+class _DyingChild(Service):
+    """A service that answers ready, then dies a few seconds in.
+
+    The #80 shape: ComfyUI was OOM-killed 46 minutes into a healthy-looking pod, and the
+    API kept reading online-idle for another 33 because nothing noticed. Startup checks
+    passed; it is what happens AFTER that this covers.
+    """
+    port = 2
+
+    def __init__(self, log, die_after=2):
+        self.log = log
+        self.name = "comfyui"
+        self.summary = "dies shortly after a healthy start"
+        self._die_after = die_after
+        self.proc = None
+
+    def preflight(self):
+        pass
+
+    def command(self):
+        return ["sleep", str(self._die_after)]
+
+    async def ready(self, client):
+        return True
+
+    async def after_ready(self, client):
+        self.log.append("ready")
+
+
+def test_a_child_that_dies_after_a_healthy_start_stops_the_container():
+    """wanly-gpu-docker#80: the startup check is not the supervision. A child that boots
+    answering and dies later — an OOM-killed ComfyUI — must take the container down so
+    Docker's restart policy rebuilds it, not leave a corpse that reads online-idle."""
+    log = []
+    sup = Supervisor([_DyingChild(log, die_after=1)])
+
+    async def go():
+        await sup.start(client=None)
+        # Wait past the watchdog's 5s tick for the child to die and be noticed.
+        for _ in range(40):
+            await asyncio.sleep(0.5)
+            if sup.failed:
+                break
+        return sup.failed
+
+    failed = _run(go())
+    assert failed == "comfyui", \
+        "a child that died after a healthy start was never noticed — the #80 corpse again"
