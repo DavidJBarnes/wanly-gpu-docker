@@ -41,6 +41,12 @@ class TrainRequest(BaseModel):
     image_urls: list[str] = Field(default_factory=list)
     image_dir: str = ""
     caption: str | None = None
+    #: THE JOINT GROUP (#102). ABSENT means single-identity, which every run before this
+    #: is. One entry: {character, trigger, gender, image_urls, num_repeats} -- the second
+    #: dataset's URLs presigned by the API alongside group 0's, its caption resolved by
+    #: the same rule that made group 0's trigger carry. The claim builds it; a POST body
+    #: may also give it directly.
+    second_identity: dict | None = None
     steps: int = Field(default=1200, ge=100, le=6000)
     config: dict = Field(default_factory=dict)
     remote_id: str = ""
@@ -184,8 +190,37 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
                 raise pipeline.PipelineError("no images to train on")
             job.images = len(images)
 
+            # ONE ENTRY PER IDENTITY GROUP. Group 0 is the job's own character; the joint
+            # group (#102) rides req.second_identity with its own URLs, caption and
+            # repeats. The stage call takes the list so per-group captions and dirs stay
+            # paired -- two separate stage calls would mean two dataset.toml writes, and
+            # the last one would win.
+            groups = [{"images": images, "caption": req.caption,
+                       "num_repeats": (req.config or {}).get("num_repeats")
+                       or recipe.DEFAULTS["num_repeats"]}]
+            if req.second_identity:
+                si = req.second_identity
+                second_urls = si.get("image_urls") or []
+                if not second_urls and si.get("image_dir"):
+                    d = Path(si["image_dir"])
+                    second_images = [(f.name, f.read_bytes()) for f in sorted(d.iterdir())
+                                     if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+                else:
+                    second_images = await _fetch(client, second_urls)
+                if not second_images:
+                    raise pipeline.PipelineError("no second-identity images to train on")
+                groups.append({
+                    "images": second_images,
+                    "caption": si.get("caption"),
+                    "num_repeats": si.get("num_repeats")
+                    or recipe.DEFAULTS["num_repeats"],
+                })
+                job.images += len(second_images)
+                # The disk gate reads repeats x total images; a joint run's both groups
+                # count, and mixed repeats across groups would make the estimate a guess.
+                job.effective_repeats = max(g["num_repeats"] for g in groups)
             pipeline.preflight(job)
-            run = await pipeline.stage(job, images, req.caption)
+            run = await pipeline.stage(job, groups)
             # SAY SO. Nothing reported between the claim and the first training step left the
             # API row at "claimed" with no progress for the whole of staging and the drain
             # wait -- which reads as queued in the console, and which the orphan reclaim

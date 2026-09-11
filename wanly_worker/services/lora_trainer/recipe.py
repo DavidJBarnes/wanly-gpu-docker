@@ -71,18 +71,34 @@ def run_dir(character: str, version: int) -> Path:
     return Path(RUNS_DIR) / character / f"ltx23b-v{version}"
 
 
-def dataset_toml(run: Path) -> str:
+def dataset_toml(run: Path, groups: list[dict] | None = None) -> str:
+    """The dataset config. One `[[datasets]]` entry per identity group.
+
+    `groups` absent (or one entry) is the single-identity shape every run before #102
+    wrote, byte-identical — the toml is the regression trail and a single run must not
+    look different. A joint run (#102) writes one entry per group, each with its OWN
+    data + cache directory and its own num_repeats: the repeats balance the two sets
+    (Payton 55 images vs David 50), and per-dataset dirs keep the caches separate
+    because a cache is latents for specific images + captions — sharing one across
+    groups would pair group 1's latents with group 0's cached text outputs.
+    """
+    if not groups:
+        groups = [{"data": f"{run}/data", "cache": f"{run}/cache",
+                   "num_repeats": DEFAULTS["num_repeats"]}]
+    entries = "\n\n".join(
+        f'[[datasets]]\n'
+        f'image_directory = "{g["data"]}"\n'
+        f'cache_directory = "{g["cache"]}"\n'
+        f'resolution = [{DEFAULTS["resolution"]}, {DEFAULTS["resolution"]}]\n'
+        f'num_repeats = {g["num_repeats"]}'
+        for g in groups)
     return f"""[general]
 caption_extension = ".txt"
 batch_size = 1
 enable_bucket = true
 bucket_no_upscale = true
 
-[[datasets]]
-image_directory = "{run}/data"
-cache_directory = "{run}/cache"
-resolution = [{DEFAULTS['resolution']}, {DEFAULTS['resolution']}]
-num_repeats = {DEFAULTS['num_repeats']}
+{entries}
 """
 
 
@@ -141,8 +157,9 @@ def train_cmd(run: Path, character: str, version: int, config: dict) -> list[str
     ]
 
 
-def estimated_epochs(image_count: int, steps: int) -> int:
+def estimated_epochs(image_count: int, steps: int, repeats: int | None = None) -> int:
     """num_repeats is fixed, so this is not steps/1200 -- it is how many passes over each image
-    the run will actually make."""
-    per_epoch = max(1, image_count * DEFAULTS["num_repeats"])
+    the run will actually make. A joint run's count is BOTH groups' images summed (the
+    caller passes the total), with the repeats that apply to them."""
+    per_epoch = max(1, image_count * (repeats or DEFAULTS["num_repeats"]))
     return max(1, steps // per_epoch)

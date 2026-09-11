@@ -11,8 +11,6 @@ this project real time:
     reader shows nothing for fifty minutes and a healthy run looks hung.
 """
 import asyncio
-import os
-import tempfile
 from pathlib import Path
 
 import re
@@ -764,7 +762,7 @@ class TestTheWaitForTheCardIsReported:
         import inspect
         from wanly_worker.services.lora_trainer import app as mod
         src = inspect.getsource(mod._run)
-        stage = src.index("await pipeline.stage(job, images, req.caption)")
+        stage = src.index("run = await pipeline.stage(job, groups)")
         acquire = src.index("await gpu.acquire(client, HOSTNAME")
         assert "await on_progress(job)" in src[stage:acquire]
 
@@ -1122,3 +1120,59 @@ class TestATickWithNoWorkerIdIsLoud:
             await p.tick()
         _run(go())
         assert said == []
+
+
+class TestTheJointRun:
+    """A joint two-identity run (wanly-gpu-docker#102): ONE LoRA trained on both identity
+    groups at once. Per-group captions and dirs, a two-entry dataset toml, and the
+    single-identity shape byte-unchanged — the toml is the regression trail."""
+
+    def test_single_identity_toml_is_unchanged(self):
+        from wanly_worker.services.lora_trainer.recipe import dataset_toml
+        toml = dataset_toml(Path("/tmp/r"))
+        assert toml.count("[[datasets]]") == 1
+        # The bare dirs, exactly as before #102.
+        assert 'image_directory = "/tmp/r/data"' in toml
+        assert 'cache_directory = "/tmp/r/cache"' in toml
+        # No numbered dirs in the single-identity shape.
+        assert "data0" not in toml and "data1" not in toml
+
+    def test_joint_toml_has_one_entry_per_group(self):
+        from wanly_worker.services.lora_trainer.recipe import dataset_toml
+        toml = dataset_toml(Path("/tmp/r"), groups=[
+            {"data": "/tmp/r/data", "cache": "/tmp/r/cache", "num_repeats": 10},
+            {"data": "/tmp/r/data1", "cache": "/tmp/r/cache1", "num_repeats": 10},
+        ])
+        assert toml.count("[[datasets]]") == 2
+        assert 'image_directory = "/tmp/r/data1"' in toml
+        assert 'cache_directory = "/tmp/r/cache1"' in toml
+
+    def test_stage_writes_per_group_captions(self, monkeypatch, tmp_path):
+        """Group 1's images caption GROUP 1's trigger — group 0's would bind the second
+        face to the wrong person's token, and the interference this run exists to escape
+        would arrive through the captions instead."""
+        import asyncio
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+
+        monkeypatch.setattr(pipeline.recipe, "RUNS_DIR", str(tmp_path))
+        job = Job(id="j1", character="pay", trigger="p@y", version=1, steps=1200)
+        img0 = [(f"a{i}.jpg", b"x") for i in range(2)]
+        img1 = [(f"b{i}.jpg", b"y") for i in range(2)]
+        run = asyncio.run(pipeline.stage(job, [
+            {"images": img0, "caption": "p@y, woman", "num_repeats": 10},
+            {"images": img1, "caption": "d@vid, man", "num_repeats": 10},
+        ]))
+        assert (run / "data" / "sel_000.txt").read_text() == "p@y, woman\n"
+        assert (run / "data1" / "sel_000.txt").read_text() == "d@vid, man\n"
+        toml = (run / "dataset.toml").read_text()
+        assert toml.count("[[datasets]]") == 2
+        assert 'image_directory = "%s/data1"' % run in toml
+
+    def test_joint_poller_map_carries_the_second_group(self):
+        """The claim's second_* land in the TrainRequest; absent stays absent."""
+        import inspect
+        from wanly_worker.services.lora_trainer import poller as mod
+        src = inspect.getsource(mod.Poller.tick)
+        assert "second_download_urls" in src
+        assert "second_identity" in src
