@@ -226,6 +226,82 @@ class TestTheDecision:
         assert "assuming busy" in r.stdout
 
 
+class TestTheLock:
+    """wanly-gpu-docker#97.
+
+    Seen 2026-09-10 while deploying #96: a manual update was mid-pull (13 GiB, ~11 min) when
+    the timer fired twice more. Three copies all saw "image changed" and all ran
+    run-worker.sh; one died on a container-name conflict, and a loser could have removed the
+    winner's container between its rm -f and its run.
+    """
+
+    SAME = "sha256:aaa"
+    NEW = "sha256:bbb"
+
+    def _run_two(self, tmp_path, hold_before_run=None):
+        """Fire two copies concurrently against the same lock and return both results."""
+        import subprocess
+        bin_dir, stage = _stage(tmp_path, running_image=self.SAME, latest_image=self.NEW,
+                                engine_busy=0, worker_status="online-idle")
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
+
+        script = stage / "update-worker.sh"
+        first = subprocess.Popen(["bash", str(script)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, env=env)
+        second = subprocess.Popen(["bash", str(script)], stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, env=env)
+        first.wait(timeout=30)
+        second.wait(timeout=30)
+        return first.stdout.read(), second.stdout.read(), first.returncode, second.returncode
+
+    def test_a_concurrent_run_exits_zero_without_recreating(self, tmp_path):
+        """The loser must not die on a name conflict, and must not recreate: stacked firings
+        are made harmless rather than trying to make them impossible."""
+        out_a, out_b, code_a, code_b = self._run_two(tmp_path)
+        recreated = [o for o in (out_a, out_b) if "RECREATED" in o]
+        refused = [o for o in (out_a, out_b) if "another update is in progress" in o]
+
+        assert len(recreated) == 1, (out_a, out_b)
+        assert len(refused) == 1, (out_a, out_b)
+        loser_code = code_b if "RECREATED" in out_a else code_a
+        assert loser_code == 0, "the loser must exit 0, not a timer-visible failure"
+
+    def test_the_lock_is_held_while_run_worker_spawns(self, tmp_path):
+        """The lock must still be held when run-worker.sh runs — that is the window where a
+        loser could have rm -f'd the winner's container between its rm and its run.
+
+        flock -n 9 inside the child proves nothing: fd 9 is inherited and points at the SAME
+        open file description, so flock trivially "succeeds" against its own lock. The
+        honest check is a FRESH open of the lock file from an unrelated process.
+        """
+        import subprocess
+        bin_dir, stage = _stage(tmp_path, running_image=self.SAME, latest_image=self.NEW,
+                                engine_busy=0, worker_status="online-idle")
+        # A fresh open of the lock file (flock <file> opens its own fd) from INSIDE the
+        # child, so it competes with the parent's held lock like any third party would.
+        (stage / "run-worker.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            'lock="${XDG_RUNTIME_DIR:-/run/lock}/wanly-worker-update.lock"\n'
+            'if flock -n "$lock" true; then echo "LOCK-FREE"; else echo "LOCK-HELD"; fi\n'
+        )
+        (stage / "run-worker.sh").chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
+
+        r = subprocess.run(["bash", str(stage / "update-worker.sh")],
+                           capture_output=True, text=True, env=env)
+        assert "LOCK-HELD" in r.stdout, r.stdout
+        assert "LOCK-FREE" not in r.stdout
+
+    def test_serial_runs_do_not_deadlock(self, tmp_path):
+        """A lock that never released would turn the timer into a no-op forever — the
+        installed-and-dead failure from #72, again."""
+        r1 = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW)
+        assert "RECREATED" in r1.stdout
+        r2 = _run(tmp_path, running_image=self.NEW, latest_image=self.NEW)
+        assert r2.returncode == 0
+        assert "nothing to do" in r2.stdout
+
+
 def test_the_scripts_are_executable():
     for p in (RUN, UPDATE):
         assert os.stat(p).st_mode & stat.S_IXUSR, "%s is not executable" % p.name

@@ -13,9 +13,29 @@
 # WHY IT COMPARES DIGESTS, NOT TAGS
 #     :latest is a moving pointer. "Am I on latest?" is only answerable by comparing the
 #     digest the container was created from against the digest the tag resolves to NOW.
+#
+# WHY IT LOCKS (wanly-gpu-docker#97)
+#     Two copies of this script running at once — a manual run while a timer run is mid-pull,
+#     which is 13 GiB and ~11 minutes on the 3090's link, so the window is wide — both see
+#     "image changed" and both run run-worker.sh. One wins; another dies on a container-name
+#     conflict, or worse removes the winner's container between its rm -f and its run.
+#     flock -n makes the loser exit 0 with a message instead: stacked firings are made
+#     harmless rather than impossible. The FD stays open for the script's whole life,
+#     including the `exec run-worker.sh` paths, so it covers the spawn too.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# /run/user/$UID exists on a normal login ($XDG_RUNTIME_DIR points there); /run/lock as a
+# fallback for cron-style contexts where it does not.
+LOCK_DIR="${XDG_RUNTIME_DIR:-/run/lock}"
+LOCK_FILE="$LOCK_DIR/wanly-worker-update.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) another update is in progress — nothing to do"
+    exit 0
+fi
+
 IMAGE="${IMAGE:-davidjbarnes/wanly-gpu-docker:latest}"
 NAME="${NAME:-wanly-gpu-docker}"
 
