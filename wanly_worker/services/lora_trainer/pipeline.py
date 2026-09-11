@@ -56,7 +56,8 @@ def preflight(job: Job) -> None:
             f"no trainer at {recipe.TRAINER_PYTHON} — this image was built without "
             f"WITH_TRAINER=1")
 
-    epochs = recipe.estimated_epochs(job.images, job.steps)
+    epochs = recipe.estimated_epochs(job.images, job.steps,
+                                     repeats=getattr(job, "effective_repeats", None))
     need = epochs * GB_PER_EPOCH
     free = shutil.disk_usage(recipe.RUNS_DIR).free / 1024 ** 3
     if free < need + 5:
@@ -65,8 +66,13 @@ def preflight(job: Job) -> None:
             f"free under {recipe.RUNS_DIR}")
 
 
-async def stage(job: Job, images: list[tuple[str, bytes]], caption: str | None) -> Path:
-    """Write the dataset and the config. Returns the run directory.
+async def stage(job: Job, groups: list[dict]) -> Path:
+    """Write the dataset(s) and the config. Returns the run directory.
+
+    `groups` is one entry per identity: {images: [(name, bytes)], caption, num_repeats}.
+    ONE entry is the single-identity shape every run before #102 wrote — same directories
+    (`data/`, `cache/`), same toml bytes. A joint run writes `data0/`+`cache0/`,
+    `data1/`+`cache1/`, per-group captions and a two-entry toml.
 
     The run directory is REBUILT, not added to. A version that reuses a directory trains on the
     previous version's leftover images while reporting the new count -- the failure
@@ -78,16 +84,32 @@ async def stage(job: Job, images: list[tuple[str, bytes]], caption: str | None) 
     for sub in ("data", "cache", "output", "logs"):
         (run / sub).mkdir(parents=True, exist_ok=True)
 
-    _log(job, f"staging {len(images)} images")
-    for i, (name, blob) in enumerate(images):
-        ext = Path(name).suffix.lower() or ".jpg"
-        (run / "data" / f"sel_{i:03d}{ext}").write_bytes(blob)
-        # Captions bind whatever they do not name. All 13 of p@y's read "p@y, woman" over
-        # close-ups, so the trigger carried close-up framing as part of its identity.
-        (run / "data" / f"sel_{i:03d}.txt").write_text(
-            (caption or f"{job.trigger}, woman") + "\n")
+    toml_groups = []
+    for gi, g in enumerate(groups):
+        # Group 0 keeps the bare dirs so a single-identity run hashes and stages exactly
+        # as it always has; joint groups get numbered ones, which cannot collide with a
+        # pre-existing bare dir after the rebuild above.
+        data_dir = run / "data" if gi == 0 else run / f"data{gi}"
+        cache_dir = run / "cache" if gi == 0 else run / f"cache{gi}"
+        if gi > 0:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir.mkdir(parents=True, exist_ok=True)
 
-    (run / "dataset.toml").write_text(recipe.dataset_toml(run))
+        _log(job, f"staging group {gi}: {len(g['images'])} images "
+                  f"({g['num_repeats']} repeats)")
+        for i, (name, blob) in enumerate(g["images"]):
+            ext = Path(name).suffix.lower() or ".jpg"
+            (data_dir / f"sel_{i:03d}{ext}").write_bytes(blob)
+            # Captions bind whatever they do not name. All 13 of p@y's read "p@y, woman" over
+            # close-ups, so the trigger carried close-up framing as part of its identity.
+            # PER GROUP: a joint run's group 1 must say its OWN trigger, or its face binds
+            # to whatever the text happens to be.
+            (data_dir / f"sel_{i:03d}.txt").write_text(
+                (g["caption"] or f"{job.trigger}, woman") + "\n")
+        toml_groups.append({"data": str(data_dir), "cache": str(cache_dir),
+                            "num_repeats": g["num_repeats"]})
+
+    (run / "dataset.toml").write_text(recipe.dataset_toml(run, toml_groups))
     return run
 
 

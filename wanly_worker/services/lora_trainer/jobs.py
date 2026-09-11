@@ -30,6 +30,9 @@ class Job:
     version: int
     steps: int
     images: int = 0
+    #: The repeats the disk estimate applies: max across identity groups (#102). None for
+    #: single-identity runs, where recipe.DEFAULTS applies — the same estimate as before.
+    effective_repeats: int | None = None
     #: pending | staging | training | collecting | completed | failed | cancelled
     phase: str = "pending"
     step: int = 0

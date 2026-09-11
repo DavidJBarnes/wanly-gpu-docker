@@ -142,10 +142,22 @@ class Poller:
             return
 
         _log(f"claimed {row['character']} v{row['version']} ({len(row['download_urls'])} images)")
+        # THE JOINT GROUP (#102). second_* ride the claim response only for a joint run;
+        # ABSENT for every single-identity job, so this maps to None and the trainer's
+        # stage() writes the one-group shape it always has.
+        second = None
+        if row.get("second_download_urls"):
+            second = {
+                "character": row.get("config", {}).get("second_character"),
+                "image_urls": row["second_download_urls"],
+                "caption": row.get("second_caption"),
+                "num_repeats": row.get("second_num_repeats"),
+            }
         req = trainer_app.TrainRequest(
             character=row["character"], trigger=row["trigger"], version=row["version"],
             image_urls=row["download_urls"],
             caption=(row.get("config") or {}).get("caption"),
+            second_identity=second,
             steps=(row.get("config") or {}).get("steps") or 1200,
             config=row.get("config") or {},
             remote_id=row["id"],
