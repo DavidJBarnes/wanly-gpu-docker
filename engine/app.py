@@ -54,6 +54,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import comfy
+import failure as failure_mod
 import purge as purge_mod
 import recipe as recipe_mod
 import ltx_grid
@@ -925,14 +926,10 @@ def run_job(job: Job):
         job.status = "Done"
         print(f"[{job.id}] done in {time.time() - job.started:.0f}s -> {out}", flush=True)
     except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
-        if "OOM" in msg or "out of memory" in msg.lower():
-            # The card is 24 GB and shared. Say what to change rather than
-            # returning torch's allocator dump.
-            msg += (f" — {job.req.width}x{job.req.height} at {job.req.num_frames} "
-                    f"frames did not fit. Reduce resolution or frame count; "
-                    f"704x1280 at 241 frames is known to fit alongside the other "
-                    f"resident containers.")
+        # An OOM is rewritten into advice -- but "0 bytes allocated" is not an OOM, it is
+        # the container having lost the GPU, and the advice must say so (#95).
+        msg = failure_mod.explain_failure(f"{type(e).__name__}: {e}", job.req.width,
+                                          job.req.height, job.req.num_frames)
         job.status, job.error = "Failed", msg
         print(f"[{job.id}] FAILED: {job.error}", flush=True)
     finally:

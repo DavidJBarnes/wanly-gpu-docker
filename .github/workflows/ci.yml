@@ -6,9 +6,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, next]
   push:
-    branches: [main]
+    branches: [main, next]
 
 jobs:
   test:
@@ -17,13 +17,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          # The image's python (Ubuntu 22.04). The supervisor is tested on what it runs on.
+          python-version: '3.10'
 
-      # pytest alone. The resolver tests are pure — they load the workflow JSON and compare
-      # the patched graph. Nothing here touches torch, ComfyUI or a GPU, and it should stay
-      # that way: a test that needs the real stack belongs on a GPU runner, not in CI.
+      # pytest plus the supervisor's own requirements (fastapi/httpx: the control API and
+      # the readiness probes). Nothing here touches torch, ComfyUI or a GPU, and it should
+      # stay that way: a test that needs the real stack belongs on a GPU runner, not in CI.
       - name: Install test dependencies
-        run: pip install pytest
+        # numpy: face-crop's gate/crop maths (services/face_crop/detect.py) is tested here;
+        # insightface itself is not, and is not installed.
+        run: pip install pytest "numpy<2" -r wanly_worker/requirements.txt
+
+      - name: Shell scripts parse
+        run: bash -n start.sh fetch_daemon.sh download_models.sh deploy/*.sh
 
       - name: Test
         run: python -m pytest tests/ -q
@@ -34,4 +40,4 @@ jobs:
       - name: No undefined names
         run: |
           pip install "ruff>=0.5"
-          python -m ruff check --select F821 --output-format concise engine/
+          python -m ruff check --select F821 --output-format concise engine/ wanly_worker/

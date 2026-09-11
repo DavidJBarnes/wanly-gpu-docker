@@ -44,8 +44,13 @@ class TestTheContainerSpecIsComplete:
     def test_it_survives_a_reboot(self):
         assert "--restart unless-stopped" in RUN.read_text()
 
-    def test_it_gets_the_gpu(self):
-        assert "--gpus all" in RUN.read_text()
+    def test_it_gets_the_gpu_through_cdi(self):
+        """`--gpus all` grants the device nodes outside the OCI spec, and a systemd reload
+        takes them away again (#95). CDI puts them in the spec, where a reload keeps them."""
+        s = RUN.read_text()
+        assert "--device nvidia.com/gpu=all" in s
+        # As a FLAG. The comment above the run block names the old one to explain why.
+        assert not re.search(r"^\s*--gpus\b", s, re.M)
 
     def test_comfyui_path_is_explicitly_empty(self):
         """Not merely absent. With a path set the daemon takes ownership of ComfyUI's custom
@@ -99,10 +104,18 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
     bin_dir = tmp / "bin"
     bin_dir.mkdir(exist_ok=True)
 
+    # The container's /health (wanly-gpu-docker#83) carries the engine's running/queue_depth
+    # on the ltx-engine-api entry AND, when the trainer is enabled, `training` on the
+    # lora-trainer entry. `trainer` is None (no trainer in this container), "idle", or
+    # "training". `engine_busy` None means the container does not answer at all.
     if engine_busy is None:
         engine_case = "exit 7"
     else:
-        engine_case = "echo '{\"queue_depth\":0,\"running\":%d}'" % engine_busy
+        entries = ['{"name":"ltx-engine-api","ready":true,"queue_depth":0,"running":%d}' % engine_busy]
+        if trainer is not None:
+            entries.append('{"name":"lora-trainer","ready":true,"training":%s}'
+                           % ('"p@y v3"' if trainer == "training" else "null"))
+        engine_case = "echo '{\"status\":\"ok\",\"services\":[%s]}'" % ",".join(entries)
 
     docker = "\n".join([
         "#!/usr/bin/env bash",
@@ -126,21 +139,10 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
         body = "[]"
     else:
         body = '[{"friendly_name":"3090.zero","status":"%s"}]' % worker_status
-    # The host curl answers two things: the API's /workers, and -- since 2026-09-08 -- the
-    # trainer's control API on :8083, which shares the card. `trainer` is None (nothing
-    # answering), "idle", or "training".
-    if trainer is None:
-        trainer_case = "exit 7"
-    else:
-        training = '"p@y v3"' if trainer == "training" else "null"
-        # `exit` after the echo, or the workers body below is appended and the JSON is junk.
-        trainer_case = ("echo '{\"services\":[{\"name\":\"lora-trainer\",\"training\":%s}]}'; exit 0"
-                        % training)
+    # The host curl answers one thing: the API's /workers. The trainer is asked through the
+    # container (docker exec), above.
     (bin_dir / "curl").write_text("\n".join([
         "#!/usr/bin/env bash",
-        'case "$*" in',
-        '  *":8083/health"*) %s ;;' % trainer_case,
-        "esac",
         "cat <<'JSON'",
         body,
         "JSON",
@@ -405,5 +407,51 @@ class TestTheTrainerSharesTheCard:
         r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, trainer=None)
         assert "RECREATED" in r.stdout, r.stdout
 
-    def test_the_check_is_in_the_script(self):
-        assert ':${TRAINER_CONTROL_PORT:-8083}/health' in UPDATE.read_text()
+    def test_the_check_reads_the_containers_own_health(self):
+        """The trainer is IN the container since wanly-gpu-docker#83; the old :8083 sidecar
+        probe would answer nothing and read as idle."""
+        src = UPDATE.read_text()
+        assert ":8083" not in src
+        assert 's.get("name") == "lora-trainer"' in src
+
+    def test_a_degraded_container_that_is_training_still_blocks(self, tmp_path):
+        """`curl -s`, not `-sf`: a 503 body is still the truth about a run in flight."""
+        bin_dir, stage = _stage(tmp_path, running_image=self.SAME, latest_image=self.NEW,
+                                engine_busy=0, worker_status="online-idle", trainer="training")
+        d = (bin_dir / "docker").read_text().replace("echo '{", "echo '{\"status\":\"degraded\",")
+        (bin_dir / "docker").write_text(d)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
+        r = subprocess.run(["bash", str(stage / "update-worker.sh")], capture_output=True,
+                           text=True, env=env)
+        assert "RECREATED" not in r.stdout, r.stdout
+
+    def test_an_unparseable_health_counts_as_training(self, tmp_path):
+        bin_dir, stage = _stage(tmp_path, running_image=self.SAME, latest_image=self.NEW,
+                                engine_busy=0, worker_status="online-idle", trainer="idle")
+        # The engine probe parses first and passes; make the second read garbage by having
+        # docker answer differently the second time is not possible with a static stub, so
+        # this pins the script text instead.
+        src = UPDATE.read_text()
+        assert 'print("unknown"); raise SystemExit' in src
+        assert '[ "$training" != "no" ]' in src
+
+
+class TestTheEngineIsAskedThroughTheSupervisor:
+    """update-worker.sh reads the engine's running/queue_depth from the supervisor's /health
+    (wanly-gpu-docker#83) and falls back to the engine itself for an image from before it."""
+
+    SAME = "sha256:aaa"
+    NEW = "sha256:bbb"
+
+    def test_the_script_asks_the_control_port_first(self):
+        text = UPDATE.read_text()
+        assert '${CONTROL_PORT:-8081}/health' in text
+        assert text.index('${CONTROL_PORT:-8081}/health') < text.index("127.0.0.1:8190/health")
+
+    def test_a_pre_supervisor_image_still_answers_through_the_fallback(self, tmp_path):
+        """The docker stub answers every in-container curl with the engine's own body, which
+        has no `services` list -- the supervisor path exits 4 and the fallback decides."""
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, engine_busy=0)
+        assert "RECREATED" in r.stdout, r.stdout
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, engine_busy=1)
+        assert "RECREATED" not in r.stdout, r.stdout

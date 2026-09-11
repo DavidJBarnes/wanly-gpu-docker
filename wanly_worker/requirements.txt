@@ -1,0 +1,4 @@
+# The supervisor and its control API. Pinned to what wanly-services ran in production.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
