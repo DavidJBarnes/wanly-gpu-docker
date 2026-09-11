@@ -175,10 +175,21 @@ class _DyingChild(Service):
         self.log.append("ready")
 
 
-def test_a_child_that_dies_after_a_healthy_start_stops_the_container():
+def test_a_child_that_dies_after_a_healthy_start_stops_the_container(monkeypatch):
     """wanly-gpu-docker#80: the startup check is not the supervision. A child that boots
     answering and dies later — an OOM-killed ComfyUI — must take the container down so
-    Docker's restart policy rebuilds it, not leave a corpse that reads online-idle."""
+    Docker's restart policy rebuilds it, not leave a corpse that reads online-idle.
+
+    The kill is captured, not performed: the watchdog's os.kill is aimed at its own
+    process, and in a test that process is pytest — the first CI run of this test died
+    with 143 exactly as the mechanism predicts. What is under test is that the watchdog
+    NOTICES and would take the container down; SIGTERM delivery is the OS's part.
+    """
+    import signal
+    import wanly_worker.supervisor as sup_mod
+    killed = []
+    monkeypatch.setattr(sup_mod.os, "kill",
+                        lambda pid, sig: killed.append((pid, sig)))
     log = []
     sup = Supervisor([_DyingChild(log, die_after=1)])
 
@@ -194,3 +205,5 @@ def test_a_child_that_dies_after_a_healthy_start_stops_the_container():
     failed = _run(go())
     assert failed == "comfyui", \
         "a child that died after a healthy start was never noticed — the #80 corpse again"
+    assert any(sig == signal.SIGTERM for _, sig in killed), \
+        "noticed but did not signal itself — the container would never restart"
