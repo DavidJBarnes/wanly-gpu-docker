@@ -48,7 +48,7 @@ class TrainRequest(BaseModel):
     #: caption names the people in its frames, which is what teaches the model they appear
     #: together. The claim builds the list; a POST body may also give it directly.
     identities: list[dict] = Field(default_factory=list)
-    steps: int = Field(default=1200, ge=100, le=6000)
+    steps: int = Field(default=1200, ge=100, le=30000)
     config: dict = Field(default_factory=dict)
     remote_id: str = ""
 
