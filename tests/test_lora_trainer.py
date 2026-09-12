@@ -1169,10 +1169,38 @@ class TestTheJointRun:
         assert toml.count("[[datasets]]") == 2
         assert 'image_directory = "%s/data1"' % run in toml
 
-    def test_joint_poller_map_carries_the_second_group(self):
-        """The claim's second_* land in the TrainRequest; absent stays absent."""
+    def test_joint_poller_map_carries_every_extra_group(self):
+        """The claim's `identities` land in the TrainRequest; absent stays absent."""
         import inspect
         from wanly_worker.services.lora_trainer import poller as mod
         src = inspect.getsource(mod.Poller.tick)
-        assert "second_download_urls" in src
-        assert "second_identity" in src
+        assert 'row.get("identities")' in src
+        assert "identities=identities" in src
+
+
+class TestThreeGroups:
+    """#106: two solo sets AND a composition set -- frames containing both characters.
+    The composition set is the group that teaches the model the identities appear
+    together; solo sets alone produced a LoRA that held one face and dropped the other."""
+
+    def test_stage_writes_a_directory_and_caption_per_group(self, monkeypatch, tmp_path):
+        import asyncio
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+
+        monkeypatch.setattr(pipeline.recipe, "RUNS_DIR", str(tmp_path))
+        job = Job(id="j1", character="payme", trigger="p@yton", version=1, steps=5250)
+        groups = [
+            {"images": [("a.jpg", b"x")], "caption": "p@yton, woman", "num_repeats": 10},
+            {"images": [("b.jpg", b"y")], "caption": "d@vid, man", "num_repeats": 10},
+            {"images": [("c.jpg", b"z")],
+             "caption": "p@yton, woman and d@vid, man", "num_repeats": 10},
+        ]
+        run = asyncio.run(pipeline.stage(job, groups))
+        assert (run / "data" / "sel_000.txt").read_text() == "p@yton, woman\n"
+        assert (run / "data1" / "sel_000.txt").read_text() == "d@vid, man\n"
+        assert (run / "data2" / "sel_000.txt").read_text() == \
+            "p@yton, woman and d@vid, man\n"
+        toml = (run / "dataset.toml").read_text()
+        assert toml.count("[[datasets]]") == 3
+        assert 'image_directory = "%s/data2"' % run in toml
