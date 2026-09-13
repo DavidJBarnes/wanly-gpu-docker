@@ -94,12 +94,16 @@ class TestTheIdleCheck:
 DEFAULT_NAME = re.search(r'^NAME="\$\{NAME:-([^}]+)\}"', UPDATE.read_text(), re.M).group(1)
 
 
-def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trainer=None):
+def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trainer=None,
+           container_running=True):
     """Stage the real update-worker.sh with fakes for every external call it makes.
 
     Two separate fakes, because the script asks two different things:
       * `curl` on the HOST            -> the API's /workers, for the worker's own status
       * `curl` INSIDE the container   -> the engine's /health, via docker exec
+
+    `container_running` models the #105 state: an exited container is not a busy one, and
+    the updater must recreate it before any of the idle checks can walk away from it.
     """
     bin_dir = tmp / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -117,12 +121,18 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
                            % ('"p@y v3"' if trainer == "training" else "null"))
         engine_case = "echo '{\"status\":\"ok\",\"services\":[%s]}'" % ",".join(entries)
 
+    # The #105 dead check is `docker ps -q -f "name=^/$NAME$"`: non-empty means running,
+    # empty means exited. The fake always models the one container under test.
+    ps_case = ('  "ps "*)  echo "fake-container-id"; exit 0 ;;' if container_running
+               else '  "ps "*)  exit 0 ;;')
+
     docker = "\n".join([
         "#!/usr/bin/env bash",
         'case "$*" in',
         # Read from the script rather than hardcoded, so renaming the container does not
         # silently turn this stub into a no-op that answers every inspect with exit 0.
         '  "inspect -f {{.Image}} %s")  echo "%s"; exit 0 ;;' % (DEFAULT_NAME, running_image),
+        ps_case,
         '  "pull -q "*)                        exit 0 ;;',
         '  "image inspect "*)                  echo "%s"; exit 0 ;;' % latest_image,
         '  *"curl"*)                           %s ;;' % engine_case,
@@ -161,10 +171,10 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
 
 
 def _run(tmp_path, *, running_image, latest_image, engine_busy=0, worker_status="online-idle",
-         trainer=None):
+         trainer=None, container_running=True):
     bin_dir, stage = _stage(tmp_path, running_image=running_image, latest_image=latest_image,
                             engine_busy=engine_busy, worker_status=worker_status,
-                            trainer=trainer)
+                            trainer=trainer, container_running=container_running)
     env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
     return subprocess.run(["bash", str(stage / "update-worker.sh")],
                           capture_output=True, text=True, env=env)
@@ -226,6 +236,32 @@ class TestTheDecision:
         r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, engine_busy=None)
         assert "RECREATED" not in r.stdout
         assert "assuming busy" in r.stdout
+
+
+class TestTheDeadContainer:
+    """wanly-gpu-docker#105. An nvidia driver/toolkit event kills the container (exit 255,
+    `CDI device injection failed`) and docker never restarts it — RestartCount stayed 0,
+    twice. A dead container must be recreated by the next timer tick: its processes are
+    gone, so none of the busy checks can apply, and the digest comparison alone would say
+    "nothing to do" forever."""
+
+    SAME = "sha256:aaa"
+
+    def test_a_dead_container_is_recreated_even_when_the_image_is_current(self, tmp_path):
+        """The exact hole: image unchanged + every health check fails, which the old script
+        read as busy. Dead is not busy."""
+        r = _run(tmp_path, running_image=self.SAME, latest_image=self.SAME,
+                 container_running=False)
+        assert "RECREATED" in r.stdout, r.stdout
+        assert "not running" in r.stdout
+
+    def test_a_dead_container_is_recreated_before_any_idle_check(self, tmp_path):
+        """Order matters: the busy checks exist to protect a LIVE worker mid-claim. A dead
+        one must not be able to reach them."""
+        s = UPDATE.read_text()
+        dead = s.index('docker ps -q -f "name=^/${NAME}$"')
+        pull = s.index("docker pull -q")
+        assert dead < pull
 
 
 class TestTheLock:
