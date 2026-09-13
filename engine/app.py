@@ -958,9 +958,11 @@ def submit(req: JobRequest):
                 f"{name}={v} must be divisible by 64. The two-stage distilled "
                 f"graph (spatial upsampler) requires it; only one-stage "
                 f"graphs accept 32. Nearest: {(v // 64) * 64} or {(v // 64 + 1) * 64}.")
-    # On the recipe path every `loras` entry is a person, and the graph has room for two
-    # (console#473). Refused here, in the first second, rather than as a failed job after
-    # the claim -- and named, so the caller knows it is the count and not a missing file.
+    # On the recipe path every `loras` entry is a person, and the graph holds ONE
+    # (post-#102: a two-person shot is a JOINT LoRA, one file with every identity, not a
+    # stack -- the stack was the R2 configuration that loses both faces). Refused here, in
+    # the first second, rather than as a failed job after the claim -- and named, so the
+    # caller knows it is the count and not a missing file.
     if req.recipe and len(req.loras) > len(recipe_mod.CHAR_NODE_IDS):
         raise HTTPException(422,
             f"{len(req.loras)} character LoRAs; a recipe render takes at most "

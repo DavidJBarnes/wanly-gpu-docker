@@ -368,17 +368,12 @@ TWO = [{"name": "pay_v2_e05", "s1": 0.8, "s2": 1.5},
        {"name": "david_v1_final", "s1": 0.7, "s2": 1.2}]
 
 
-def test_a_second_character_chains_after_the_first_on_both_stages(graph):
-    g = recipe_mod.resolve(graph, **BASE, char_loras=TWO)
-    assert g["9621"]["inputs"]["lora_name"] == "pay_v2_e05.safetensors"
-    assert g["9631"]["inputs"]["lora_name"] == "david_v1_final.safetensors"
-    assert g["9631"]["inputs"]["model"] == ["9621", 0]
-    assert g["337"]["inputs"]["model"] == ["9631", 0]
-    assert g["9632"]["inputs"]["model"] == ["9622", 0]
-    assert g["372"]["inputs"]["model"] == ["9632", 0]
-    assert g["9631"]["inputs"]["strength_model"] == 0.7
-    assert g["9632"]["inputs"]["strength_model"] == 1.2
-    assert g["9631"]["_meta"]["title"] == "char 2 stage 1"
+def test_a_second_character_is_refused(graph):
+    """Post-#102: one character per render. A second stacked LoRA is the R2 configuration
+    that loses both faces, and the graph no longer has a node for it -- refuse loudly
+    rather than render something the caller did not ask for."""
+    with pytest.raises(ValueError, match="a render takes one"):
+        recipe_mod.resolve(graph, **BASE, char_loras=TWO)
 
 
 def test_a_single_character_graph_is_unchanged_by_the_list_form(graph):
@@ -389,23 +384,22 @@ def test_a_single_character_graph_is_unchanged_by_the_list_form(graph):
     assert "9631" not in listed and "9632" not in listed
 
 
-def test_the_second_character_never_collides_with_content_ids(graph):
+def test_the_character_never_collides_with_content_ids(graph):
     contents = [{"name": f"c{i}", "s1": 0.6, "s2": 0.6} for i in range(4)]
-    g = recipe_mod.resolve(graph, **BASE, char_loras=TWO, content_loras=contents)
+    g = recipe_mod.resolve(graph, **BASE, char_loras=[TWO[0]], content_loras=contents)
     ids = {"9601", "9602", "9603", "9604", "9605", "9606", "9607", "9608",
-           "9621", "9622", "9631", "9632"}
+           "9621", "9622"}
     assert ids <= set(g)
-    # content 4 -> char 1 -> char 2 -> branch, on stage 1
+    # content 4 -> char -> branch, on stage 1
     assert g["9621"]["inputs"]["model"] == ["9607", 0]
-    assert g["9631"]["inputs"]["model"] == ["9621", 0]
-    assert g["337"]["inputs"]["model"] == ["9631", 0]
+    assert g["337"]["inputs"]["model"] == ["9621", 0]
 
 
-def test_the_note_names_both_characters(graph):
-    g = recipe_mod.resolve(graph, **BASE, char_loras=TWO)
+def test_the_note_names_the_one_character(graph):
+    g = recipe_mod.resolve(graph, **BASE, char_loras=[TWO[0]])
     note = recipe_mod.lora_stack_note(g)
     assert "char pay_v2_e05.safetensors @0.8/1.5" in note
-    assert "char2 david_v1_final.safetensors @0.7/1.2" in note
+    assert "char2" not in note
 
 
 def test_one_person_notes_do_not_grow_a_char2(graph):
@@ -428,13 +422,10 @@ def test_a_none_in_the_first_slot_still_places_the_second_at_its_own_id(graph):
     assert "9631" not in g
 
 
-def test_more_than_two_characters_is_refused(graph):
-    with pytest.raises(ValueError, match="room for 2"):
+def test_more_than_one_character_is_refused(graph):
+    with pytest.raises(ValueError, match="a render takes one"):
         recipe_mod.resolve(graph, **BASE, char_loras=TWO + [{"name": "third"}])
 
 
-def test_the_id_table_is_the_only_cap():
-    import inspect
-    src = inspect.getsource(recipe_mod.resolve)
-    assert "len(CHAR_NODE_IDS)" in src
-    assert recipe_mod.CHAR_NODE_IDS == ("962", "963")
+def test_the_one_id_table_is_the_only_cap():
+    assert recipe_mod.CHAR_NODE_IDS == ("962",)

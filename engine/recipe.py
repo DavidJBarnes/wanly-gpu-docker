@@ -21,7 +21,8 @@ against the sheet's baseline. Validation is a property of the pose row now, whic
 console own.
 """
 from __future__ import annotations
-import json, hashlib
+import json
+import hashlib
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -68,7 +69,7 @@ def _is_none(name: str | None) -> bool:
 #: every existing single-character graph hashes exactly as it did), slot 1 is 9631/9632.
 #: Content ids run 9601..9608 and stop well short of either. A third person is one more
 #: entry here -- and a second `<TRIGGER>` slot everywhere upstream (console#473).
-CHAR_NODE_IDS = ("962", "963")
+CHAR_NODE_IDS = ("962",)
 
 
 def resolve(graph: dict, image_name: str, width: int, height: int, *,
@@ -153,10 +154,15 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
             "s1": float(entry["s1"]) if entry.get("s1") is not None else 0.8,
             "s2": float(entry["s2"]) if entry.get("s2") is not None else 1.5,
         })
-    if len(chars) > len(CHAR_NODE_IDS):
+    # ONE character LoRA per render (post-#102): a joint LoRA carries every identity. The
+    # second slot -- a second stacked LoRA -- was the R2 configuration that loses both
+    # faces, and its machinery is gone from the console and the API. A legacy two-entry
+    # list would render only the first, silently, so refuse it loudly instead: the graph
+    # the caller asked for is not the graph this builds.
+    if len(chars) > 1:
         raise ValueError(
-            f"{len(chars)} character LoRAs; the recipe graph has room for "
-            f"{len(CHAR_NODE_IDS)} (console#473)")
+            f"{len(chars)} character LoRAs; a render takes one -- a two-person shot is a "
+            f"JOINT LoRA (one file, both identities), not a stack")
     # Per stage, like the character strengths beside them. This was 0.6 hardcoded for BOTH
     # stages, which is a configuration rather than a default -- stage 1 generates at half
     # size from noise and stage 2 refines the 2x-upscaled latent, so one number for both is
@@ -184,17 +190,16 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
                       "_meta": {"title": f"content {i + 1} stage {tag}" if len(contents) > 1
                                 else f"content stage {tag}"}}
             prev = [cid, 0]
-        # Character LoRAs LAST, closest to the sampler, one pair per person. Slot 0 keeps
-        # its id and its unnumbered title so a one-person graph hashes as it always has --
-        # the hash is the regression trail. Slot 1 is `char 2`, and reads off slot 0.
-        for i, c in enumerate(chars):
-            kid = f"{CHAR_NODE_IDS[i]}{tag}"
+        # The ONE character LoRA, closest to the sampler. Its id and unnumbered title are
+        # unchanged, so a one-person graph hashes exactly as it always has -- the hash is
+        # the regression trail.
+        for c in chars:
+            kid = f"{CHAR_NODE_IDS[0]}{tag}"
             g[kid] = {"class_type": "LoraLoaderModelOnly",
                       "inputs": {"lora_name": c["name"],
                                  "strength_model": c["s1"] if tag == "1" else c["s2"],
                                  "model": prev},
-                      "_meta": {"title": f"char stage {tag}" if i == 0
-                                else f"char {i + 1} stage {tag}"}}
+                      "_meta": {"title": f"char stage {tag}"}}
             prev = [kid, 0]
         g[branch]["inputs"]["model"] = prev
     return g
@@ -261,10 +266,6 @@ def lora_stack_note(graph: dict) -> str:
     # Every content LoRA, in the order applied — the order is part of the configuration and
     # a result cannot be tied to a chain that is only half reported.
     parts = [pair("9621", "9622", "char")]
-    # A second person, only when there is one -- the common line must not grow a
-    # "char2 none" nobody asked about.
-    if "9631" in graph or "9632" in graph:
-        parts.append(pair("9631", "9632", "char2"))
     found = []
     for i in range(4):
         n1, n2 = f"96{1 + i * 2:02d}", f"96{2 + i * 2:02d}"
