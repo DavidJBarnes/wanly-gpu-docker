@@ -68,6 +68,28 @@ if ! docker inspect "$NAME" >/dev/null 2>&1; then
     exec "$HERE/run-worker.sh"
 fi
 
+# A CONTAINER THAT EXISTS BUT IS NOT RUNNING IS DEAD, NOT BUSY (wanly-gpu-docker#105).
+#
+# The failure that made this check necessary, twice: an nvidia driver/toolkit event
+# regenerates /var/run/cdi/nvidia.yaml, the container's GPU dies with it, and its restart
+# fails with `CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=all` --
+# docker never retries (RestartCount stayed 0), so the box sits with no worker for hours.
+#
+# A dead container is otherwise INVISIBLE to this script: `docker inspect` succeeds, the
+# digest comparison below says "nothing to do", and every health check fails -- which every
+# later check reads as BUSY and walks away. A dead container cannot be busy; its processes
+# are gone. Recreate it here, BEFORE the pull and the idle checks, so recovery is one timer
+# tick (~35 minutes with the randomized delay), not one human.
+#
+# run-worker.sh is the recreate path rather than `docker start`: it is the documented
+# converge (safe to re-run, mounts/env from worker.env), and if the CDI spec is momentarily
+# invalid -- the recreate lands inside the same driver-event window -- its `docker run`
+# fails the same way `docker start` would, and the next timer tick retries.
+if [ -z "$(docker ps -q -f "name=^/${NAME}$")" ]; then
+    log "$NAME exists but is not running (state: $(docker inspect -f '{{.State.Status}}' "$NAME")) — recreating it"
+    exec "$HERE/run-worker.sh"
+fi
+
 running_image=$(docker inspect -f '{{.Image}}' "$NAME")
 
 log "pulling $IMAGE"
