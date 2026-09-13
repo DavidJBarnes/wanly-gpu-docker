@@ -29,6 +29,11 @@ class LoraTrainer(Service):
     name = "lora-trainer"
     port = PORT
     summary = f"character-LoRA training on :{PORT}"
+    # NON-ESSENTIAL (wanly-gpu-docker#111): this box's first job is rendering. A trainer
+    # preflight failure -- the disk gate above all, which fired with 23 GB free and took the
+    # whole worker offline -- must degrade the TRAINER, not kill the render queue. The
+    # supervisor starts the other services and reports this one down through /health.
+    essential = False
 
     def preflight(self) -> None:
         """Refuse now rather than fifty minutes in. Each of these has actually happened."""

@@ -76,16 +76,34 @@ class Supervisor:
         ALL preflights run before ANY process starts. Half-started is the worst outcome: the
         container looks alive, serves one of two services, and the missing one only surfaces
         from another host.
+
+        THE EXCEPTION, wanly-gpu-docker#105/#111: a service may be marked NON-ESSENTIAL, and
+        its preflight failure then does NOT abort the boot -- the service is left down,
+        reported through /health with its error, and everything else starts. The trainer is
+        the case that proved the rule: its disk gate (25 GB free under /loras) failed, and
+        the whole BOX -- including the render worker it exists to feed -- crash-looped for
+        hours (RestartCount 235) because a training-disk problem was treated as fatal. A
+        degraded trainer leaves training jobs unclaimed, which the console shows; a dead
+        render worker hides an entire queue.
         """
         for st in self.states:
             try:
                 st.service.preflight()
             except PreflightError as e:
+                if not getattr(st.service, "essential", True):
+                    st.error = str(e)
+                    print(f"preflight: {st.service.name} FAILED ({e}) — "
+                          f"starting the other services without it; /health reports it "
+                          f"as down", flush=True)
+                    continue
                 raise PreflightError(f"{st.service.name}: {e}") from e
-        print(f"preflight OK for {', '.join(s.service.name for s in self.states)}",
+        print(f"preflight OK for "
+              f"{', '.join(s.service.name for s in self.states if not s.error)}",
               flush=True)
 
         for st in self.states:
+            if st.error:
+                continue
             await self._start_one(st, client)
 
         self._watchdog = asyncio.create_task(self._watch())
