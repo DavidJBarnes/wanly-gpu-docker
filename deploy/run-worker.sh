@@ -148,3 +148,14 @@ docker run -d \
 
 echo "started: $(docker inspect -f '{{.Id}}' "$NAME" | cut -c1-12) on $(docker inspect -f '{{.Image}}' "$NAME" | cut -c8-19)"
 echo "follow the boot with: docker logs -f $NAME"
+
+# PRUNE WHAT THE CONVERGE LEFT BEHIND (wanly-gpu-docker#111). Every image build adds a
+# fresh ~25 GB image, and nothing ever removed the old one: the box accumulated 222 GB of
+# images and filled its root disk to 99%, where the trainer's boot disk gate refused to
+# start and took the WHOLE worker (render included) down for hours. The container just
+# started pins its image; everything unreferenced is dead weight.
+#
+# Deliberately after the run, and non-fatal: a prune failure must never turn a successful
+# recreate into a failed one. Rollback to an older image stays possible -- the tag is
+# re-pulled when IMAGE names it.
+docker image prune -af >/dev/null 2>&1 || true

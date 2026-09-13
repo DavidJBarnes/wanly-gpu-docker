@@ -72,6 +72,35 @@ def test_a_failing_preflight_starts_nothing():
     assert not any(x.startswith("start:") for x in log)
 
 
+class _NonEssentialRecorder(_Recorder):
+    """The lora-trainer shape: its preflight failure must not take the box down (#111)."""
+    essential = False
+
+
+def test_a_nonessential_preflight_failure_degrades_not_aborts():
+    """wanly-gpu-docker#111: the trainer's disk gate (25 GB free under /loras) fired and
+    the whole worker -- render included -- crash-looped for hours. A non-essential service
+    that cannot work must be left down and reported, while everything else starts."""
+    log = []
+    sup = Supervisor([_NonEssentialRecorder(log, "trainer", preflight_raises=True),
+                      _Recorder(log, "render")])
+
+    async def go():
+        await sup.start(client=None)
+        snap = sup.snapshot()
+        await sup.stop()
+        return snap
+
+    snap = _run(go())
+    assert "start:render" in log, "the render service never started"
+    assert "start:trainer" not in log, "the failed service was started anyway"
+    trainer = next(s for s in snap if s["name"] == "trainer")
+    render = next(s for s in snap if s["name"] == "render")
+    assert trainer["running"] is False and "cannot work here" in trainer["error"], \
+        "the degraded service must be reported down with its reason"
+    assert render["ready"] and render["running"]
+
+
 def test_a_service_that_never_answers_fails_the_boot(monkeypatch):
     """Not 'the process spawned'. ollama's process is up long before it binds, and a probe
     that watches the process reports ready while every request connection-refuses."""
