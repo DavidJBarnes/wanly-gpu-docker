@@ -499,3 +499,89 @@ class TestTheEngineIsAskedThroughTheSupervisor:
         assert "RECREATED" in r.stdout, r.stdout
         r = _run(tmp_path, running_image=self.SAME, latest_image=self.NEW, engine_busy=1)
         assert "RECREATED" not in r.stdout, r.stdout
+
+
+class TestTheDevMount:
+    """run-worker.sh's DEV_CODE_DIR block (#117). Staged like the updater tests: the real
+    script against a fake docker that RECORDS the args of `docker run`, so what is asserted
+    is what the container would actually be created with — not a substring of the source.
+
+    The invariant under test is that a dev mount is never silent: it must pass a read-only
+    mount and DEV_CODE=1 into the container (so fetch_engine.sh swaps the mount in and the
+    banner/health shout), it must refuse the real queue without a second explicit flag, and a
+    path that isn't a checkout must be refused outright.
+    """
+
+    def _stage(self, tmp_path, *, dev_code_dir=None, dev_allow_queue=None):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = run ]; then printf \'%s\\n\' "$@" > "%s"; echo fakecid; exit 0; fi\n'
+            'if [ "$1" = inspect ]; then echo fakecid; exit 0; fi\n'
+            "exit 0\n" % ("%s", bin_dir / "runargs.txt"))
+        (bin_dir / "docker").chmod(0o755)
+        # `ss` on the test box may genuinely have something on 8081; the script's port
+        # pre-flight must see an empty answer or every test dies on a false conflict.
+        (bin_dir / "ss").write_text("#!/usr/bin/env bash\nexit 0\n")
+        (bin_dir / "ss").chmod(0o755)
+        stage = tmp_path / "deploy"
+        stage.mkdir()
+        shutil.copy(RUN, stage / "run-worker.sh")
+        jobs = tmp_path / "jobs"; jobs.mkdir()
+        models = tmp_path / "models"; (models / "loras").mkdir(parents=True)
+        env_text = ("QUEUE_URL=http://api.test:8001\nQUEUE_API_KEY=k\nFRIENDLY_NAME=3090.zero\n"
+                    "JOBS_DIR=%s\nMODELS_DIR=%s\n" % (jobs, models))
+        if dev_code_dir is not None:
+            env_text += "DEV_CODE_DIR=%s\n" % dev_code_dir
+        if dev_allow_queue is not None:
+            env_text += "DEV_ALLOW_QUEUE=%s\n" % dev_allow_queue
+        (stage / "worker.env").write_text(env_text)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]),
+                   WORKER_ENV=str(stage / "worker.env"))
+        r = subprocess.run(["bash", str(stage / "run-worker.sh")],
+                           capture_output=True, text=True, env=env)
+        args = (bin_dir / "runargs.txt").read_text() if (bin_dir / "runargs.txt").exists() else ""
+        return r, args
+
+    def _checkout(self, tmp_path):
+        co = tmp_path / "checkout"
+        (co / "engine").mkdir(parents=True)
+        (co / "wanly_worker").mkdir()
+        (co / "engine" / "app.py").write_text("")
+        (co / "wanly_worker" / "control.py").write_text("")
+        return co
+
+    def test_a_dev_mount_needs_the_explicit_queue_flag(self, tmp_path):
+        """Half-edited code claiming real segments is the #72 failure mode with a new
+        mechanism. DEV_CODE_DIR alone must be refused, before anything is removed."""
+        co = self._checkout(tmp_path)
+        r, args = self._stage(tmp_path, dev_code_dir=co)
+        assert r.returncode != 0
+        assert "DEV_ALLOW_QUEUE" in r.stdout
+        assert args == "", "must not have run docker at all"
+
+    def test_with_both_flags_the_mount_and_the_marker_reach_the_container(self, tmp_path):
+        co = self._checkout(tmp_path)
+        r, args = self._stage(tmp_path, dev_code_dir=co, dev_allow_queue="1")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "DEV MOUNT" in r.stdout and "NOT DEPLOYED CODE" in r.stdout
+        # The fake records one docker argument per line; the mount is its own argument.
+        assert "%s:/opt/dev-code:ro" % co in args.splitlines()
+        assert "DEV_CODE=1" in args.splitlines()
+
+    def test_a_path_that_is_not_the_repo_is_refused(self, tmp_path):
+        not_repo = tmp_path / "random"
+        not_repo.mkdir()
+        r, args = self._stage(tmp_path, dev_code_dir=not_repo, dev_allow_queue="1")
+        assert r.returncode != 0
+        assert "not a wanly-gpu-docker checkout" in r.stdout
+        assert args == ""
+
+    def test_no_dev_code_dir_changes_nothing(self, tmp_path):
+        """The default path must stay byte-for-byte the converge of #72: no /opt/dev-code,
+        no DEV_CODE env. A stale env line is the risk this guards."""
+        r, args = self._stage(tmp_path)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "dev-code" not in args and "DEV_CODE=1" not in args
+        assert args != "", "the container should still have been created"

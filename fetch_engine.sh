@@ -27,6 +27,78 @@ ENGINE_DEST="${ENGINE_DEST:-/opt/engine}"
 WORKER_DEST="${WORKER_DEST:-/app/wanly_worker}"
 CODE_REF="${CODE_REF_FILE:-/run/wanly/code_ref}"
 
+# Swap a package tree over its current one: stage to a temp name, then two guarded mv's.
+#
+# EVERY mv IS CHECKED, and this is not decoration (#121): on the 3090 the container had a
+# bind mount INSIDE /opt/engine, and a directory containing a mount point cannot be renamed —
+# mv fails EBUSY. Unguarded, the second mv then "succeeds" by nesting the new tree INSIDE the
+# old one (mv dst.new dst -> dst/dst.new), exits 0, and the boot banner claims the incoming
+# sha while the old code runs. A silent no-op dressed as an upgrade is exactly the #72
+# failure; the mount is gone now, but any future mount in these paths must degrade loudly.
+_swap_pkg() {
+    local src="$1" dst="$2" name
+    name="$(basename "$dst")"
+    [ -d "$src" ] || { echo "!! source tree has no $src — keeping current $name"; return 1; }
+    rm -rf "$dst.new"
+    if ! cp -a "$src" "$dst.new"; then
+        echo "!! could not stage $name — keeping current code"
+        rm -rf "$dst.new"
+        return 1
+    fi
+    rm -rf "$dst.old"
+    if ! mv "$dst" "$dst.old"; then
+        echo "!! cannot move $dst aside — keeping current $name"
+        echo "!!   (a mount point INSIDE $dst is the usual cause: docker inspect -f '{{json .Mounts}}')"
+        rm -rf "$dst.new"
+        return 1
+    fi
+    if ! mv "$dst.new" "$dst"; then
+        echo "!! staged $name would not land — restoring previous code"
+        mv "$dst.old" "$dst" || echo "!! !! ROLLBACK FAILED: $name is missing at $dst"
+        rm -rf "$dst.new"
+        return 1
+    fi
+    rm -rf "$dst.old"
+}
+
+# THE DEV MOUNT (#117): iterate on engine/supervisor code in a checkout on the host box
+# without a build, a pull, or even a push. run-worker.sh bind-mounts DEV_CODE_DIR read-only
+# at /opt/dev-code and sets DEV_CODE=1; the mounted tree is swapped in with the same guarded
+# mechanism as a fetched tree, so every consumer downstream (engine cwd, the supervisor's
+# import path) is unchanged. Fetching main over the top of it would silently revert whatever
+# is being developed, so the mount REPLACES the fetch.
+#
+# Deps are deliberately NOT installed here: a dev mount is for code iteration; a change that
+# needs a new dependency is an environment change, and environment changes are the image's
+# job (or a pip install in a shell, with the dev looking at it).
+#
+# Without the DEV_CODE=1 marker, DEV_CODE_DIR on the host changes nothing — a stale env line
+# must not silently redirect a real worker.
+if [ "${DEV_CODE:-0}" = "1" ]; then
+    MOUNT="${DEV_MOUNT_PATH:-/opt/dev-code}"
+    if [ ! -f "$MOUNT/engine/app.py" ] || [ ! -f "$MOUNT/wanly_worker/control.py" ]; then
+        echo "!! DEV_CODE=1 but $MOUNT does not look like the repo (no engine/app.py or"
+        echo "!! wanly_worker/control.py). Refusing to boot on it — this is the whole point:"
+        echo "!! a half-mounted tree serving real claims is worse than waiting."
+        exit 1
+    fi
+    mkdir -p "$(dirname "$CODE_REF")"
+    SHA="$(git -C "$MOUNT" rev-parse --short HEAD 2>/dev/null || echo uncommitted)"
+    if _swap_pkg "$MOUNT/engine" "$ENGINE_DEST" \
+        && _swap_pkg "$MOUNT/wanly_worker" "$WORKER_DEST"; then
+        echo "DEV MOUNT $MOUNT @ $SHA — NOT DEPLOYED CODE"
+        echo "dev-mount $MOUNT @ $SHA" > "$CODE_REF"
+    else
+        # Same rule as #121: if the swap failed, the mounted code is NOT running, and the
+        # identity must not claim it is. A dev who sees this checks the mount before
+        # believing anything their edit appears to do.
+        echo "!! DEV MOUNT SWAP FAILED — the mounted code is NOT running. Booting on what"
+        echo "!! is in the image instead; fix the mount before trusting any behaviour."
+        echo "dev-mount-swap-FAILED $MOUNT @ $SHA — running image code" > "$CODE_REF"
+    fi
+    exit 0
+fi
+
 fetch_ok=1
 if [ -d "$SRC_DIR/.git" ]; then
     echo "engine: updating code ($BRANCH)..."
@@ -77,40 +149,6 @@ for REQ in "$SRC_DIR/engine/requirements.txt" "$SRC_DIR/wanly_worker/requirement
         pip install --no-cache-dir -q $MISSING || { echo "!! DEP INSTALL FAILED:$MISSING"; exit 1; }
     fi
 done
-
-# Swap each fetched package over its baked copy: stage to a temp name, then two guarded mv's.
-#
-# EVERY mv IS CHECKED, and this is not decoration (#121): on the 3090 the container had a
-# bind mount INSIDE /opt/engine, and a directory containing a mount point cannot be renamed —
-# mv fails EBUSY. Unguarded, the second mv then "succeeds" by nesting the new tree INSIDE the
-# old one (mv dst.new dst -> dst/dst.new), exits 0, and the boot banner claims the fetched
-# sha while the baked code runs. A silent no-op dressed as an upgrade is exactly the #72
-# failure; the mount is gone now, but any future mount in these paths must degrade loudly.
-_swap_pkg() {
-    local src="$1" dst="$2" name
-    name="$(basename "$dst")"
-    [ -d "$src" ] || { echo "!! fetched tree has no $src — keeping current $name"; return 1; }
-    rm -rf "$dst.new"
-    if ! cp -a "$src" "$dst.new"; then
-        echo "!! could not stage $name — keeping current code"
-        rm -rf "$dst.new"
-        return 1
-    fi
-    rm -rf "$dst.old"
-    if ! mv "$dst" "$dst.old"; then
-        echo "!! cannot move $dst aside — keeping current $name"
-        echo "!!   (a mount point INSIDE $dst is the usual cause: docker inspect -f '{{json .Mounts}}')"
-        rm -rf "$dst.new"
-        return 1
-    fi
-    if ! mv "$dst.new" "$dst"; then
-        echo "!! staged $name would not land — restoring previous code"
-        mv "$dst.old" "$dst" || echo "!! !! ROLLBACK FAILED: $name is missing at $dst"
-        rm -rf "$dst.new"
-        return 1
-    fi
-    rm -rf "$dst.old"
-}
 
 # The running code's identity, for /health and the boot banner (control.py reads this file).
 # mkdir here, not in start.sh: this script runs before start.sh's own mkdir line.

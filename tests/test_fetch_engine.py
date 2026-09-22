@@ -41,7 +41,8 @@ def _make_dests(tmp_path):
     return engine, worker
 
 
-def _run(tmp_path, bare, branch="main", engine_dest=None, worker_dest=None):
+def _run(tmp_path, bare, branch="main", engine_dest=None, worker_dest=None,
+         env_extra=None):
     engine_dest = engine_dest or tmp_path / "opt/engine"
     worker_dest = worker_dest or tmp_path / "app/wanly_worker"
     bin_dir = tmp_path / "bin"
@@ -49,15 +50,17 @@ def _run(tmp_path, bare, branch="main", engine_dest=None, worker_dest=None):
     link = bin_dir / "python3"
     if not link.exists():
         link.symlink_to(sys.executable)
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path),
+           "ENGINE_REPO": str(bare), "ENGINE_BRANCH": branch,
+           "WANLY_IMAGE_REF": "deadbeefdeadbeefdeadbeef",
+           "ENGINE_SRC_DIR": str(tmp_path / "engine-src"),
+           "ENGINE_DEST": str(engine_dest),
+           "WORKER_DEST": str(worker_dest),
+           "CODE_REF_FILE": str(tmp_path / "run/code_ref")}
+    env.update(env_extra or {})
     return subprocess.run(
         ["bash", str(SCRIPT)],
-        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path),
-             "ENGINE_REPO": str(bare), "ENGINE_BRANCH": branch,
-             "WANLY_IMAGE_REF": "deadbeefdeadbeefdeadbeef",
-             "ENGINE_SRC_DIR": str(tmp_path / "engine-src"),
-             "ENGINE_DEST": str(engine_dest),
-             "WORKER_DEST": str(worker_dest),
-             "CODE_REF_FILE": str(tmp_path / "run/code_ref")},
+        env=env,
         capture_output=True, text=True, timeout=120)
 
 
@@ -135,6 +138,38 @@ def test_a_failed_swap_keeps_baked_code_and_says_so(tmp_path):
     ref = (tmp_path / "run/code_ref").read_text()
     assert ref.startswith("baked-fallback")
     assert "main @" not in ref  # the honest part: never claim a sha that is not running
+
+
+def test_a_dev_mount_replaces_the_fetch(tmp_path):
+    """#117: with DEV_CODE=1 the mounted tree is swapped in and NOTHING is fetched — a
+    fetch would silently revert the code being developed. The code_ref must name the mount,
+    not main."""
+    work, bare = _make_remote(tmp_path)
+    engine, worker = _make_dests(tmp_path)
+    mount = tmp_path / "mount"
+    (mount / "engine").mkdir(parents=True)
+    (mount / "wanly_worker").mkdir()
+    (mount / "engine" / "app.py").write_text("MARKER = 'dev-edit'\n")
+    (mount / "wanly_worker" / "control.py").write_text("MARKER = 'dev-edit'\n")
+    r = _run(tmp_path, bare, env_extra={"DEV_CODE": "1",
+                                        "DEV_MOUNT_PATH": str(mount)})
+    assert r.returncode == 0, r.stderr
+    assert "DEV MOUNT" in r.stdout and "NOT DEPLOYED CODE" in r.stdout
+    assert "dev-edit" in (engine / "app.py").read_text()
+    assert "dev-edit" in (worker / "control.py").read_text()
+    assert not (tmp_path / "engine-src").exists()  # the fetch never ran
+    ref = (tmp_path / "run/code_ref").read_text()
+    assert ref.startswith("dev-mount") and "main @" not in ref
+
+
+def test_an_unmounted_dev_code_aborts(tmp_path):
+    """DEV_CODE=1 with no tree at the mount path means a half-set-up container — refusing
+    beats booting on baked code that looks like the dev's edits did nothing."""
+    _make_dests(tmp_path)
+    r = _run(tmp_path, tmp_path / "no-such.git",
+             env_extra={"DEV_CODE": "1", "DEV_MOUNT_PATH": str(tmp_path / "nothing-here")})
+    assert r.returncode == 1
+    assert "does not look like the repo" in r.stdout
 
 
 def test_a_failed_dep_install_aborts_the_boot(tmp_path):

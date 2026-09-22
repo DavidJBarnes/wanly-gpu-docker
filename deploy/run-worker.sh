@@ -90,6 +90,7 @@ if [ "$WANT_FACE_CROP" = "1" ]; then
     MOUNTS+=(-v "$INSIGHTFACE_HOST_DIR:/root/.insightface")
     PORTS+=(-p "${FACE_CROP_PORT:-8084}:8084")
 fi
+
 # SHM_SIZE, and it is not optional for the trainer. Docker gives a container 64 MB of
 # /dev/shm, and PyTorch's DataLoader workers pass tensors through shared memory -- so a
 # training run dies partway through stage 3 with
@@ -99,6 +100,36 @@ fi
 #
 # which reads like a full disk. The first real run lost forty minutes to it.
 SHM_SIZE="${SHM_SIZE:-$([ "$WANT_TRAINER" = "1" ] && echo 8g || echo 64m)}"
+
+# THE DEV MOUNT (wanly-gpu-docker#117): iterate on engine/supervisor code in a checkout on
+# this box without a build or a pull. DEV_CODE_DIR is bind-mounted at /opt/dev-code and
+# fetch_engine.sh swaps it in at boot INSTEAD of fetching main — edit on the host,
+# `docker restart`, done, in seconds.
+#
+# TWO FLAGS ON PURPOSE. DEV_CODE_DIR alone does not arm anything: a stale env line must not
+# silently redirect a real worker onto a half-edit. DEV_ALLOW_QUEUE=1 is the explicit
+# statement that this box, running this code, may claim real segments. The container shouts
+# DEV MOUNT in the boot log and /health reports `code: dev-mount ...` for as long as it
+# lasts, because a mount that quietly outlives its session is #72 with extra steps.
+DEV_MOUNT_ARGS=()
+DEV_ENV_ARGS=()
+if [ -n "${DEV_CODE_DIR:-}" ]; then
+    if [ "${DEV_ALLOW_QUEUE:-0}" != "1" ]; then
+        echo "!! DEV_CODE_DIR is set but DEV_ALLOW_QUEUE is not 1."
+        echo "!! Half-edited code against the real queue is how #72 happened. If you mean it:"
+        echo "!!   DEV_ALLOW_QUEUE=1   in $ENV_FILE"
+        echo "!! If you don't: remove the DEV_CODE_DIR line."
+        exit 1
+    fi
+    [ -d "$DEV_CODE_DIR" ] || { echo "!! DEV_CODE_DIR=$DEV_CODE_DIR does not exist"; exit 1; }
+    DEV_CODE_DIR="$(cd "$DEV_CODE_DIR" && pwd)"   # docker wants an absolute path
+    [ -f "$DEV_CODE_DIR/engine/app.py" ] && [ -f "$DEV_CODE_DIR/wanly_worker/control.py" ] || {
+        echo "!! DEV_CODE_DIR=$DEV_CODE_DIR is not a wanly-gpu-docker checkout (no engine/app.py";
+        echo "!! or wanly_worker/control.py) — refusing to start on it."; exit 1; }
+    DEV_MOUNT_ARGS+=(-v "$DEV_CODE_DIR:/opt/dev-code:ro")
+    DEV_ENV_ARGS+=(-e DEV_CODE=1)
+    echo "!! DEV MOUNT: $DEV_CODE_DIR @ $(git -C "$DEV_CODE_DIR" rev-parse --short HEAD 2>/dev/null || echo uncommitted) — NOT DEPLOYED CODE"
+fi
 
 # The supervisor answers /health on CONTROL_PORT (wanly-gpu-docker#83); the update timer
 # reads it. Refuse before removing anything if something else already listens there.
@@ -133,6 +164,7 @@ docker run -d \
     -v "$MODELS_DIR:/workspace/models:ro" \
     -v "$MODELS_DIR/loras:/workspace/models/loras" \
     "${MOUNTS[@]}" \
+    "${DEV_MOUNT_ARGS[@]}" \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
     -e "SERVICES=$SERVICES" \
     -e "IMAGE_DESCRIPTION_MODEL=${IMAGE_DESCRIPTION_MODEL:-joycaption:beta-one}" \
@@ -143,6 +175,7 @@ docker run -d \
     -e "COMFYUI_URL=http://127.0.0.1:8188" \
     -e "COMFYUI_PATH=" \
     -e "LORA_CACHE_DIR=/workspace/models/loras" \
+    "${DEV_ENV_ARGS[@]}" \
     "$IMAGE"
 
 echo "started: $(docker inspect -f '{{.Id}}' "$NAME" | cut -c1-12) on $(docker inspect -f '{{.Image}}' "$NAME" | cut -c8-19)"
