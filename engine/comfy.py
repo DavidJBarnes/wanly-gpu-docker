@@ -751,8 +751,11 @@ def describe_stages(graph: dict) -> list[dict]:
 # Guidance parameters from RuneXX's LTX-2.3 Dev Full-Steps and DEV 3-Pass, read
 # off their GuiderParameters widgets. Order is
 # [modality, cfg, stg, perturb_attn, rescale, modality_scale, skip_step, cross_attn].
+# The exception is audio cfg: RuneXX ships 7.0, which with the 10eros checkpoint
+# often rendered harsh, over-cooked sound; 5.0 tests the overcooking hypothesis
+# (wanly-gpu-docker#114). The paired old-vs-new review decides whether it stays.
 DEV_VIDEO_GUIDANCE = dict(cfg=3.0, stg=1.0, rescale=0.9, modality_scale=3.0)
-DEV_AUDIO_GUIDANCE = dict(cfg=7.0, stg=1.0, rescale=0.7, modality_scale=3.0)
+DEV_AUDIO_GUIDANCE = dict(cfg=5.0, stg=1.0, rescale=0.7, modality_scale=3.0)
 DEV_SKIP_BLOCKS = "28"
 
 
@@ -766,7 +769,7 @@ def set_multimodal_guidance(graph: dict, video: dict | None = None,
     something else on the BASE pass: a `MultimodalGuider` fed by two
     `GuiderParameters`, carrying three things a CFGGuider has no way to express —
     spatiotemporal guidance, CFG rescale, and a separate guidance scale for
-    audio (cfg 7 against video's 3).
+    audio (cfg 5 against video's 3).
 
     Stage 2 is deliberately untouched. Those same workflows leave the refine pass
     on `CFGGuider` at cfg 1, and Z6 confirmed it here by going wild at cfg 2.
