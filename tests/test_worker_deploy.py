@@ -28,9 +28,17 @@ class TestTheContainerSpecIsComplete:
 
     def test_every_captured_mount_is_present(self):
         s = RUN.read_text()
-        for mount in ("/jobs", "/opt/engine/recipes:ro", "/workspace/models:ro",
-                      "/workspace/models/loras"):
+        for mount in ("/jobs", "/workspace/models:ro", "/workspace/models/loras"):
             assert mount in s, f"run-worker.sh no longer mounts {mount}"
+
+    def test_nothing_mounts_inside_the_engine_dir(self):
+        """#121: the fetch's package swap mv's /opt/engine aside, and a directory containing
+        a mount point cannot be renamed — the old /opt/engine/recipes:ro mount (dead since
+        the recipes moved to DB rows, wanly-api#212) made the swap fail EBUSY on the 3090.
+        Any mount in /opt/engine or /app re-breaks the boot path the same silent way."""
+        s = RUN.read_text()
+        assert ":/opt/engine" not in s, "a mount inside the engine swap target"
+        assert ":/app" not in s, "a mount inside the supervisor swap target"
 
     def test_the_models_tree_stays_read_only(self):
         """This box is the source of truth for 217 GB of weights. Nothing in the container
