@@ -24,6 +24,19 @@ from wanly_worker.queue_client import QueueClient, export_identity
 from wanly_worker.supervisor import Supervisor, gpu_snapshot
 
 BUILD = os.environ.get("WANLY_IMAGE_REF", "unknown")
+# The engine/supervisor code actually running, which since #116 is fetched from main at boot
+# and is therefore NOT necessarily what the image was built with. "build" is the environment
+# (the image), "code" is the software answering the queue — the #72 lesson is that one ref
+# for both is how two boxes ran different code for fourteen hours.
+CODE_REF_FILE = os.environ.get("CODE_REF_FILE", "/run/wanly/code_ref")
+
+
+def _code_ref() -> str:
+    try:
+        with open(CODE_REF_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return f"baked ({BUILD[:12]})"
 
 _sup: Supervisor | None = None
 _queue: QueueClient | None = None
@@ -40,7 +53,7 @@ async def lifespan(app: FastAPI):
     happily serve a healthy-looking /health beside a service that never came up.
     """
     global _sup
-    print(f"=== wanly-gpu-docker === build: {BUILD}", flush=True)
+    print(f"=== wanly-gpu-docker === image build: {BUILD} | code: {_code_ref()}", flush=True)
     try:
         names = registry.parse_services(os.environ.get("SERVICES"))
         print(f"SERVICES={','.join(names)}", flush=True)
@@ -127,6 +140,7 @@ async def health():
     body = {
         "status": "ok" if ok else "degraded",
         "build": BUILD,
+        "code": _code_ref(),
         "services": services,
         "gpu": gpu_snapshot(),
     }
