@@ -110,6 +110,33 @@ def test_a_non_main_branch_shouts(tmp_path):
     assert "NOT running engine main" in r.stdout
 
 
+def test_a_failed_swap_keeps_baked_code_and_says_so(tmp_path):
+    """#121, the guard rather than the mount: the real 3090 failure was EBUSY moving
+    /opt/engine aside because a bind mount lived inside it (proven at the docker level; CI
+    cannot mount). A read-only parent makes the first filesystem step fail with EACCES,
+    which drives the same guarded path: the current code must survive, the log must shout,
+    and the code_ref must say baked-fallback — never the fetched sha."""
+    import os
+    if os.geteuid() == 0:
+        import pytest
+        pytest.skip("root ignores directory permissions; the EACCES lever needs a real user")
+    work, bare = _make_remote(tmp_path)
+    engine, worker = _make_dests(tmp_path)
+    engine_parent = engine.parent
+    engine_parent.chmod(0o555)
+    try:
+        r = _run(tmp_path, bare)
+    finally:
+        engine_parent.chmod(0o755)
+    assert r.returncode == 0, "a failed swap must fall back, not crash-loop"
+    assert "SWAP FAILED" in r.stdout
+    assert "keeping current" in r.stdout or "could not stage" in r.stdout
+    assert "baked" in (engine / "app.py").read_text()
+    ref = (tmp_path / "run/code_ref").read_text()
+    assert ref.startswith("baked-fallback")
+    assert "main @" not in ref  # the honest part: never claim a sha that is not running
+
+
 def test_a_failed_dep_install_aborts_the_boot(tmp_path):
     """'-zzz-not-a-pkg' fails pip's option parser without needing the network."""
     work, bare = _make_remote(tmp_path)

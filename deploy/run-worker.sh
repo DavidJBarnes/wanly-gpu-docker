@@ -130,7 +130,6 @@ docker run -d \
     -p "${CONTROL_PORT}:8081" \
     "${PORTS[@]}" \
     -v "$JOBS_DIR:/jobs" \
-    -v "$RECIPES_DIR:/opt/engine/recipes:ro" \
     -v "$MODELS_DIR:/workspace/models:ro" \
     -v "$MODELS_DIR/loras:/workspace/models/loras" \
     "${MOUNTS[@]}" \
