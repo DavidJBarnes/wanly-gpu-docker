@@ -194,6 +194,7 @@ COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
 COPY fetch_daemon.sh /app/fetch_daemon.sh
+COPY fetch_engine.sh /app/fetch_engine.sh
 COPY start.sh /app/start.sh
 # The supervisor (wanly-gpu-docker#83): starts the enabled SERVICES in order, proves each one
 # answers, stops the container when one dies, and answers /health on CONTROL_PORT.

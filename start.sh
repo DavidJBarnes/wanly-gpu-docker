@@ -64,6 +64,13 @@ fi
 # ---------- The supervisor ----------
 # Models, daemon code, ComfyUI, the engine and the daemon are its services; see
 # wanly_worker/services/ltx_engine.py. It answers /health on CONTROL_PORT.
+#
+# The engine/supervisor code is fetched from main BEFORE the supervisor starts (#116), so
+# uvicorn imports the code it will actually run. A non-zero exit is fatal here — unlike the
+# offline fallback inside fetch_engine.sh (which exits 0 on a failed FETCH), this exit means
+# a broken environment (a dep install failed), and booting the render stack on a half-stack
+# is the drift failure this plan exists to kill.
+/app/fetch_engine.sh
 mkdir -p /run/wanly
 cd /app
 exec python3 -m uvicorn wanly_worker.control:app --host 0.0.0.0 --port "${CONTROL_PORT:-8081}"

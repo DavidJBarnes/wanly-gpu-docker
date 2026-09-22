@@ -70,6 +70,29 @@ def test_it_reports_which_build_it_is(monkeypatch):
     assert "build" in body
 
 
+def test_health_reports_running_code_separately_from_the_image(tmp_path, monkeypatch):
+    """#116: engine/ and wanly_worker/ are fetched at boot, so the image's sha no longer
+    answers 'which code'. Both refs, or #72 is back with a new mechanism."""
+    ref = tmp_path / "code_ref"
+    ref.write_text("main @ abc1234\n")
+    monkeypatch.setattr(control, "CODE_REF_FILE", str(ref))
+    monkeypatch.setattr(control, "_sup", _FakeSup([
+        {"name": "ltx-engine-api", "ready": True, "running": True}]))
+    code, body = _get()
+    assert code == 200
+    assert body["code"] == "main @ abc1234"
+
+
+def test_no_code_ref_file_means_baked_code(tmp_path, monkeypatch):
+    """The fetch failed before writing the ref (or this image predates #116) — say baked,
+    don't omit the field."""
+    monkeypatch.setattr(control, "CODE_REF_FILE", str(tmp_path / "absent"))
+    monkeypatch.setattr(control, "_sup", _FakeSup([
+        {"name": "ltx-engine-api", "ready": True, "running": True}]))
+    _, body = _get()
+    assert body["code"].startswith("baked")
+
+
 def test_gpu_snapshot_never_raises(monkeypatch):
     """It is diagnostic. A missing or broken nvidia-smi must not take /health down with it."""
     import wanly_worker.supervisor as sup_mod
