@@ -26,7 +26,9 @@ jobs:
       - name: Install test dependencies
         # numpy: face-crop's gate/crop maths (services/face_crop/detect.py) is tested here;
         # insightface itself is not, and is not installed.
-        run: pip install pytest "numpy<2" -r wanly_worker/requirements.txt
+        # requests: engine/comfy.py imports it at module level (the ComfyUI HTTP client);
+        # the guidance tests import the module but never open a socket.
+        run: pip install pytest "numpy<2" requests -r wanly_worker/requirements.txt
 
       - name: Shell scripts parse
         run: bash -n start.sh fetch_daemon.sh download_models.sh deploy/*.sh
