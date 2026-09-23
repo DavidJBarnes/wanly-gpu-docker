@@ -26,15 +26,32 @@ SRC_DIR="${ENGINE_SRC_DIR:-/opt/engine-src}"
 ENGINE_DEST="${ENGINE_DEST:-/opt/engine}"
 WORKER_DEST="${WORKER_DEST:-/app/wanly_worker}"
 CODE_REF="${CODE_REF_FILE:-/run/wanly/code_ref}"
+# Default resolves NEXT TO THIS SCRIPT: /app/swap_sync.py in the image (start.sh runs
+# /app/fetch_engine.sh by absolute path), the repo checkout off-box (the tests run this
+# file from its real location). An explicit SWAP_SYNC overrides both.
+SWAP_SYNC="${SWAP_SYNC:-$(dirname "$0")/swap_sync.py}"
 
-# Swap a package tree over its current one: stage to a temp name, then two guarded mv's.
+# Swap a package tree over its current one: stage to a temp dir, then sync IN PLACE with
+# swap_sync.py. Three incidents, one primitive:
 #
-# EVERY mv IS CHECKED, and this is not decoration (#121): on the 3090 the container had a
-# bind mount INSIDE /opt/engine, and a directory containing a mount point cannot be renamed —
-# mv fails EBUSY. Unguarded, the second mv then "succeeds" by nesting the new tree INSIDE the
-# old one (mv dst.new dst -> dst/dst.new), exits 0, and the boot banner claims the incoming
-# sha while the old code runs. A silent no-op dressed as an upgrade is exactly the #72
-# failure; the mount is gone now, but any future mount in these paths must degrade loudly.
+#   #121 — a bind mount INSIDE /opt/engine makes the directory unrenamable (EBUSY).
+#          Unguarded, the second move "succeeded" by nesting the new tree inside the old
+#          one, exit 0, banner claiming the incoming sha while the old code ran.
+#
+#   #125 — guarding the mv was not enough: GNU mv treats EBUSY like EXDEV and falls back
+#          to copy-then-unlink, reaching the mount only after emptying the source. The
+#          "keeping current code" branch ran over a directory it had just hollowed, and
+#          restart=always turned that into a crash loop saying the reassuring line.
+#
+#   #125b — os.rename refuses atomically (safe) but can NEVER succeed in production:
+#           directories COPY'd by the image live on the overlay lower layer, and a
+#           lower-layer directory cannot be renamed at all (measured: EXDEV on a plain,
+#           unmounted /opt/worker). The mv copy-fallback is the only reason renaming ever
+#           "worked" here — and it is the mechanism #125 destroys.
+#
+# In-place is the only mechanism that works against a lower layer: replace the files,
+# never move the directory. swap_sync.py refuses a mount at or inside the destination
+# BEFORE changing anything, so a failed swap leaves the current code exactly as it was.
 _swap_pkg() {
     local src="$1" dst="$2" name
     name="$(basename "$dst")"
@@ -45,20 +62,20 @@ _swap_pkg() {
         rm -rf "$dst.new"
         return 1
     fi
-    rm -rf "$dst.old"
-    if ! mv "$dst" "$dst.old"; then
-        echo "!! cannot move $dst aside — keeping current $name"
-        echo "!!   (a mount point INSIDE $dst is the usual cause: docker inspect -f '{{json .Mounts}}')"
+    if [ ! -f "$SWAP_SYNC" ]; then
+        # Same class of failure as #125: silently proceeding without the safe swap
+        # primitive is how /opt/engine got emptied. Loud, per package, current code intact.
+        echo "!! no swap primitive at $SWAP_SYNC — keeping current $name"
         rm -rf "$dst.new"
         return 1
     fi
-    if ! mv "$dst.new" "$dst"; then
-        echo "!! staged $name would not land — restoring previous code"
-        mv "$dst.old" "$dst" || echo "!! !! ROLLBACK FAILED: $name is missing at $dst"
+    if ! python3 "$SWAP_SYNC" "$dst.new" "$dst"; then
+        echo "!! swap refused for $name — keeping current code"
+        echo "!!   (a mount point inside $dst is the usual cause: docker inspect -f '{{json .Mounts}}')"
         rm -rf "$dst.new"
         return 1
     fi
-    rm -rf "$dst.old"
+    rm -rf "$dst.new"
 }
 
 # THE DEV MOUNT (#117): iterate on engine/supervisor code in a checkout on the host box

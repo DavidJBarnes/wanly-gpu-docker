@@ -195,6 +195,10 @@ COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
 COPY fetch_daemon.sh /app/fetch_daemon.sh
 COPY fetch_engine.sh /app/fetch_engine.sh
+# The in-place package swap (#125): fetch_engine.sh resolves it next to itself, so it must
+# ship beside fetch_engine.sh in /app. Without it every boot swap refuses and the image
+# code is pinned forever — loudly, but pinned.
+COPY swap_sync.py /app/swap_sync.py
 COPY start.sh /app/start.sh
 # The supervisor (wanly-gpu-docker#83): starts the enabled SERVICES in order, proves each one
 # answers, stops the container when one dies, and answers /health on CONTROL_PORT.
