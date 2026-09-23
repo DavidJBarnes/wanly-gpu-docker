@@ -10,7 +10,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parents[1] / "fetch_engine.sh"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "fetch_engine.sh"
+
+
+def test_the_dockerfile_ships_the_swap_primitive():
+    """#125: fetch_engine.sh resolves swap_sync.py next to itself (/app in the image). A
+    Dockerfile that forgets the COPY makes EVERY boot swap fail — loudly in the log, but
+    the worker is silently pinned to baked code forever, the #72 class. Cheapest guard:
+    assert the COPY exists."""
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "COPY swap_sync.py /app/swap_sync.py" in dockerfile
 
 
 def _make_remote(tmp_path):
@@ -114,11 +124,11 @@ def test_a_non_main_branch_shouts(tmp_path):
 
 
 def test_a_failed_swap_keeps_baked_code_and_says_so(tmp_path):
-    """#121, the guard rather than the mount: the real 3090 failure was EBUSY moving
-    /opt/engine aside because a bind mount lived inside it (proven at the docker level; CI
-    cannot mount). A read-only parent makes the first filesystem step fail with EACCES,
-    which drives the same guarded path: the current code must survive, the log must shout,
-    and the code_ref must say baked-fallback — never the fetched sha."""
+    """#121's guard, restated for #125's mechanism: the real 3090 failure was a bind mount
+    inside /opt/engine (proven at the docker level in test_swap_atomicity; CI cannot mount).
+    A read-only parent makes staging fail with EACCES, which drives the same fallback path:
+    the current code must survive, the log must shout, and the code_ref must say
+    baked-fallback — never the fetched sha."""
     import os
     if os.geteuid() == 0:
         import pytest

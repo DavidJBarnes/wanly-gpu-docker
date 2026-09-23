@@ -32,10 +32,10 @@ class TestTheContainerSpecIsComplete:
             assert mount in s, f"run-worker.sh no longer mounts {mount}"
 
     def test_nothing_mounts_inside_the_engine_dir(self):
-        """#121: the fetch's package swap mv's /opt/engine aside, and a directory containing
-        a mount point cannot be renamed — the old /opt/engine/recipes:ro mount (dead since
-        the recipes moved to DB rows, wanly-api#212) made the swap fail EBUSY on the 3090.
-        Any mount in /opt/engine or /app re-breaks the boot path the same silent way."""
+        """#121: the old /opt/engine/recipes:ro mount (dead since the recipes moved to DB
+        rows, wanly-api#212) made the boot swap fail on the 3090. #125 hardened the swap
+        itself (swap_sync refuses mounted trees), but a mount in these paths still pins the
+        box to baked code forever — run-worker.sh must not create one."""
         s = RUN.read_text()
         assert ":/opt/engine" not in s, "a mount inside the engine swap target"
         assert ":/app" not in s, "a mount inside the supervisor swap target"
