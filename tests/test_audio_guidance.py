@@ -2,9 +2,10 @@
 
 Audio quality with the 10eros checkpoint was often bad, and the audio branch was running
 cfg 7.0 — RuneXX's dev-workflow value — against video's 3.0. Cfg 7 is a plausible
-overcooking regime for audio, so the shipped default dropped to 5.0. These tests pin the
-value on the node that actually gets sent: the AUDIO GuiderParameters, which is the FIRST
-of the two chained under the MultimodalGuider (VIDEO chains on top of it).
+overcooking regime for audio; the shipped default dropped to 5.0, and when recent renders
+still sounded poor, to 3.0 (matching video's). These tests pin the value on the node that
+actually gets sent: the AUDIO GuiderParameters, which is the FIRST of the two chained
+under the MultimodalGuider (VIDEO chains on top of it).
 
 The paired old-vs-new review happens by ear on real segments; a unit test can only stop
 the constant from drifting back by accident.
@@ -37,8 +38,8 @@ def _guider_params(graph, modality):
             and n["inputs"]["modality"] == modality]
 
 
-def test_the_shipped_audio_cfg_is_5():
-    assert comfy.DEV_AUDIO_GUIDANCE["cfg"] == 5.0
+def test_the_shipped_audio_cfg_is_3():
+    assert comfy.DEV_AUDIO_GUIDANCE["cfg"] == 3.0
 
 
 def test_the_audio_node_carries_the_shipped_cfg():
@@ -55,7 +56,7 @@ def test_video_and_audio_scales_stay_separate():
     comfy.set_multimodal_guidance(graph, video={"cfg": 4.0})
     (audio,) = _guider_params(graph, "AUDIO")
     (video,) = _guider_params(graph, "VIDEO")
-    assert audio["inputs"]["cfg"] == 5.0
+    assert audio["inputs"]["cfg"] == 3.0
     assert video["inputs"]["cfg"] == 4.0
 
 
