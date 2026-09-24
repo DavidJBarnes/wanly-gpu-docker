@@ -151,6 +151,13 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 # 23 GiB free" until the container is recreated. Seen 2026-09-10, six minutes after a reboot.
 # CDI (`/var/run/cdi/nvidia.yaml`, kept fresh by nvidia-cdi-refresh) puts the devices in the
 # spec itself, where a reload preserves them. Needs Docker >= 28 and the toolkit's CDI spec.
+#
+# IMAGE_DESCRIPTION_MODEL DEFAULTS TO joycaption HERE even though the image's own default is a
+# Qwen tag (wanly-gpu-docker#129): joycaption:beta-one runs on every GPU we own, whereas a
+# Qwen-class captioner needs a 24 GB card — and a default that triggered a silent 6-21 GB
+# boot-time pull on a box that never chose it is the class of drift this repo keeps ticketing.
+# The 3090 gets joycaption from this default today (its worker.env does not set the var); a
+# box that wants the Qwen captioner sets IMAGE_DESCRIPTION_MODEL explicitly.
 docker run -d \
     --name "$NAME" \
     --restart unless-stopped \
