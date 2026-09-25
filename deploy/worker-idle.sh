@@ -66,7 +66,7 @@ print(me[0].get("status") or "unknown" if me else "not-registered")
     # Accepting it is not a hole: with no ltx-engine nothing can claim a segment, and a
     # training claim is covered by the trainer signal below. What IS lost is an in-flight
     # CAPTION, which is seconds long and fails one API call rather than a ten-minute render.
-    if [ "$worker_status" = "online" ] && ! _services_include "$name" ltx-engine; then
+    if [ "$worker_status" = "online" ] && _service_absent "$name" ltx-engine; then
         worker_status=online-idle
     fi
     if [ "$worker_status" != "online-idle" ]; then
@@ -82,7 +82,8 @@ print(me[0].get("status") or "unknown" if me else "not-registered")
     # Asked with `docker exec`, NOT through the published port: the engine binds 127.0.0.1
     # INSIDE the container, so -p 8190:8190 resolves to nothing and a host curl returns
     # empty -- which parsed naively reads as "idle".
-    busy=$(docker exec "$name" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
+    busy=$(
+        docker exec "$name" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
            | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -92,14 +93,15 @@ if e is None: raise SystemExit(4)
 print((e.get("running") or 0) + (e.get("queue_depth") or 0))
 ' 2>/dev/null \
            || docker exec "$name" curl -sf --max-time 10 http://127.0.0.1:8190/health 2>/dev/null \
-           | python3 -c 'import json,sys;d=json.load(sys.stdin);print((d.get("running") or 0)+(d.get("queue_depth") or 0))' 2>/dev/null \
-           || echo unknown)
+           | python3 -c 'import json,sys;d=json.load(sys.stdin);print((d.get("running") or 0)+(d.get("queue_depth") or 0))' 2>/dev/null
+) || busy=unknown
+    [ -n "$busy" ] || busy=unknown
 
     # An engine that is not enabled at all has no health to read. That is not evidence of
     # busyness -- it is a box in caption mode, where "is the engine rendering?" has no
-    # meaning. The worker-status check above still covers a claim, and a container with no
-    # ltx-engine holds none.
-    if [ "$busy" = "unknown" ] && ! _services_include "$name" ltx-engine; then
+    # meaning, whatever the probe happened to return. The worker-status check above still
+    # covers a claim, and a container with no ltx-engine holds none.
+    if _service_absent "$name" ltx-engine; then
         busy=0
     fi
     if [ "$busy" = "unknown" ]; then
@@ -117,7 +119,8 @@ print((e.get("running") or 0) + (e.get("queue_depth") or 0))
 
     # `training` is non-null on the lora-trainer entry while a run is on. Unparseable counts
     # as training. A container without the trainer has no such entry and nothing to wait for.
-    training=$(docker exec "$name" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
+    training=$(
+        docker exec "$name" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
                | python3 -c '
 import json, sys
 try:
@@ -131,10 +134,12 @@ trainer = [s for s in services if isinstance(s, dict) and s.get("name") == "lora
 if not trainer:
     print("no"); raise SystemExit
 print("yes" if any(s.get("training") for s in trainer) else "no")
-' 2>/dev/null || echo unknown)
+' 2>/dev/null
+) || training=unknown
+    [ -n "$training" ] || training=unknown
 
     # Same exemption as the engine: no trainer enabled, nothing to read, nothing to wait for.
-    if [ "$training" = "unknown" ] && ! _services_include "$name" lora-trainer; then
+    if _service_absent "$name" lora-trainer; then
         training=no
     fi
     if [ "$training" != "no" ]; then
@@ -148,9 +153,24 @@ print("yes" if any(s.get("training") for s in trainer) else "no")
     return 0
 }
 
-# What the RUNNING container was actually given, read off the container rather than off
-# worker.env -- the file may already have been rewritten by the time we ask.
-_services_include() {
-    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null \
-        | sed -n 's/^SERVICES=//p' | head -1 | grep -q "\(^\|,\)$2\(,\|$\)"
+# Is this service DEFINITELY absent from the running container?
+#
+# Read off the container, not off worker.env -- the file may already have been rewritten by
+# the time we ask. Three-valued on purpose, collapsed to "definitely absent or not":
+#
+#   SERVICES read, service listed        -> false. It is there; no exemption.
+#   SERVICES read, service not listed    -> TRUE. Exempt: there is nothing to ask.
+#   SERVICES unreadable (no such
+#   container, docker down, empty)       -> false. FAIL SAFE.
+#
+# The last line is the whole reason this is not a one-liner. An unreadable inspect means we
+# do not know what is running, and answering "absent, therefore exempt" there would turn
+# every unreadable-engine case -- the ones that exist precisely to count as BUSY -- into a
+# green light to recreate.
+_service_absent() {
+    local services
+    services="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null \
+                | sed -n 's/^SERVICES=//p' | head -1)"
+    [ -n "$services" ] || return 1
+    ! printf '%s' ",$services," | grep -q ",$2,"
 }
