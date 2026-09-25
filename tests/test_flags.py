@@ -188,3 +188,87 @@ class TestTheTrainerDrainsItsOwnRow:
         from wanly_worker import control
         src = inspect.getsource(control._worker_id)
         assert "gpu.own_worker_id()" in src
+
+
+# ---------------------------------------------------------------------------------------
+# MODE (#131): which of SERVICES actually runs right now.
+#
+# SERVICES is a property of the BOX; MODE is a property of RIGHT NOW. Keeping them separate
+# is what makes the switch a plain `docker run -e MODE=caption` with the capability line
+# untouched -- there is no full list to remember and put back.
+# ---------------------------------------------------------------------------------------
+
+from wanly_worker.registry import select_mode
+
+FULL = ["ltx-engine", "lora-trainer", "image-description", "face-crop"]
+
+
+def test_no_mode_runs_everything():
+    assert select_mode(FULL, None) == FULL
+    assert select_mode(FULL, "") == FULL
+    assert select_mode(FULL, "   ") == FULL
+
+
+def test_ltx_engine_runs_everything():
+    """It is the normal state, not a narrowing: the box does what it is equipped to do."""
+    assert select_mode(FULL, "ltx-engine") == FULL
+
+
+def test_caption_keeps_only_what_claims_no_work():
+    """DERIVED, not a hardcoded pair of names. "Claims no work" is the property that
+    matters: with nothing on the box that can claim, queued jobs simply wait."""
+    assert select_mode(FULL, "caption") == ["image-description", "face-crop"]
+
+
+def test_caption_is_derived_from_KIND_BY_SERVICE_not_a_list():
+    """A service that starts taking work is excluded automatically -- the right default,
+    since anything that claims does not belong in caption mode."""
+    patched = dict(registry.KIND_BY_SERVICE, **{"face-crop": "cropper"})
+    original, registry.KIND_BY_SERVICE = registry.KIND_BY_SERVICE, patched
+    try:
+        assert select_mode(FULL, "caption") == ["image-description"]
+    finally:
+        registry.KIND_BY_SERVICE = original
+
+
+def test_order_is_preserved():
+    assert select_mode(["face-crop", "ltx-engine", "image-description"], "caption") == \
+        ["face-crop", "image-description"]
+
+
+def test_case_and_whitespace_are_forgiven():
+    assert select_mode(FULL, "  CAPTION ") == ["image-description", "face-crop"]
+
+
+@pytest.mark.parametrize("alias", ["render", "engine"])
+def test_render_aliases_mean_ltx_engine(alias):
+    assert select_mode(FULL, alias) == FULL
+
+
+@pytest.mark.parametrize("alias", ["image-caption", "image-description"])
+def test_caption_aliases(alias):
+    """`mode=image-caption` is what the ticket asked for in those words."""
+    assert select_mode(FULL, alias) == ["image-description", "face-crop"]
+
+
+def test_an_unknown_mode_is_fatal_and_says_what_exists():
+    """Same rule as an unknown service name: a typo that is quietly ignored gives a
+    container that boots clean and does the wrong thing."""
+    with pytest.raises(ConfigError) as e:
+        select_mode(FULL, "captions")
+    assert "captions" in str(e.value)
+    assert "caption" in str(e.value) and "ltx-engine" in str(e.value)
+
+
+def test_caption_on_a_box_with_nothing_to_caption_with_is_fatal():
+    """Not silently empty. A container running no services boots clean, reports healthy and
+    serves nothing -- diagnosed from another machine as "captioner unreachable"."""
+    with pytest.raises(ConfigError) as e:
+        select_mode(["ltx-engine", "lora-trainer"], "caption")
+    assert "nothing to run" in str(e.value)
+
+
+def test_it_does_not_mutate_what_it_was_given():
+    names = list(FULL)
+    select_mode(names, "caption")
+    assert names == FULL

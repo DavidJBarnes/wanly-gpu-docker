@@ -48,11 +48,6 @@ if [ -f "$ENV_FILE" ]; then
     set -a; . "$ENV_FILE"; set +a
 fi
 
-# The idle gate, shared with wanly-mode.sh. Sourced AFTER worker.env: it reads QUEUE_URL,
-# QUEUE_API_KEY, FRIENDLY_NAME and CONTROL_PORT from the environment.
-# shellcheck source=deploy/worker-idle.sh
-. "$HERE/worker-idle.sh"
-
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
 # The container was called wanly-ltx before #77 renamed it. ADOPT it rather than walking past
@@ -108,16 +103,106 @@ fi
 
 log "image changed: $(echo "$running_image" | cut -c8-19) -> $(echo "$latest_image" | cut -c8-19)"
 
-# IS IT SAFE TO RECREATE? Three signals, all of which must say idle, and all of which live
-# in worker-idle.sh -- one definition, shared with wanly-mode.sh (#131), because a second
-# hand-maintained copy of these rules is how one of the two quietly stops knowing about the
-# third. The reasons each exist, and what each one cost, are in that file's header.
-reason="$(worker_idle_reason "$NAME")"
-if [ -n "$reason" ]; then
-    log "$reason — leaving it alone, will retry next run"
+# TWO independent signals, and BOTH must say idle. Each covers the other's blind spot.
+#
+#   1. THE WORKER'S OWN STATUS, from the API. The daemon sets online-busy the instant it
+#      receives a claim, BEFORE [1/6], and online-idle only once the segment finishes. That
+#      is the only signal covering the WHOLE claim.
+#
+#      This is the check that was missing, and its absence cost a segment. The first version
+#      asked only the engine -- which knows nothing until [3/6] Submitting. A container was
+#      recreated 50% through a 673 MB LoRA download in [2/6]; the engine truthfully said
+#      running=0, the segment was abandoned mid-claim, and because registration reuses the
+#      worker row it was pinned to a live busy worker where no reclaim rule could reach it.
+#      It sat in PROCESSING for seven hours.
+#
+#      The gap widened the same day: console#423 lets a worker fetch a 46 GB checkpoint on
+#      demand, which is ~20 minutes inside [2/6] with the engine reporting idle throughout.
+#
+#   2. THE ENGINE. Kept, because the daemon's status push can fail -- the API's own reclaim
+#      logic says so. If the daemon claims idle while the engine is rendering, believe the
+#      engine.
+#
+# Asked with `docker exec`, NOT through the published port: the engine binds 127.0.0.1 INSIDE
+# the container, so -p 8190:8190 resolves to nothing and a host curl returns empty -- which
+# parsed naively reads as "idle".
+worker_status=$(curl -sf --max-time 15 -H "X-API-Key: ${QUEUE_API_KEY:-}" \
+                  "${QUEUE_URL:-}/workers" 2>/dev/null \
+                | FRIENDLY_NAME="${FRIENDLY_NAME:-}" python3 -c '
+import json, os, sys
+name = os.environ.get("FRIENDLY_NAME", "")
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    print("unreadable"); raise SystemExit
+me = [w for w in rows if w.get("friendly_name") == name]
+# Not finding ourselves is NOT idleness. A worker mid-boot has not registered yet, and
+# recreating then interrupts model staging.
+print(me[0].get("status") or "unknown" if me else "not-registered")
+' 2>/dev/null || echo unreadable)
+
+if [ "$worker_status" != "online-idle" ]; then
+    log "worker status is '$worker_status' (want online-idle) — leaving it alone, will retry next run"
     exit 0
 fi
 
+# Through the supervisor's /health (wanly-gpu-docker#83): the ltx-engine-api entry carries the
+# engine's own running/queue_depth. `curl -s`, not `-sf`: a degraded container answers 503
+# and its body is still the truth. An image from before the supervisor answers nothing on
+# 8081; fall back to asking the engine directly so the timer can still update it.
+busy=$(docker exec "$NAME" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
+       | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+svc = {s.get("name"): s for s in d.get("services", []) if isinstance(s, dict)}
+e = svc.get("ltx-engine-api")
+if e is None: raise SystemExit(4)
+print((e.get("running") or 0) + (e.get("queue_depth") or 0))
+' 2>/dev/null \
+       || docker exec "$NAME" curl -sf --max-time 10 http://127.0.0.1:8190/health 2>/dev/null \
+       | python3 -c 'import json,sys;d=json.load(sys.stdin);print((d.get("running") or 0)+(d.get("queue_depth") or 0))' 2>/dev/null \
+       || echo unknown)
+
+if [ "$busy" = "unknown" ]; then
+    # Fail SAFE: an unreachable engine is not evidence of idleness. It may be mid-boot, and
+    # recreating then would interrupt model staging.
+    log "could not read the engine's health — assuming busy, will retry next run"
+    exit 0
+fi
+if [ "$busy" != "0" ]; then
+    # The daemon said idle and the engine disagrees. Believe the engine: a failed status push
+    # is a known mode, and being wrong here costs a render.
+    log "engine reports $busy job(s) in flight despite status '$worker_status' — leaving it alone"
+    exit 0
+fi
+
+# THE TRAINER SHARES THIS CARD -- and since wanly-gpu-docker#83 it shares this CONTAINER. A
+# training run drains the render worker, and a drained worker is exactly what looks idle.
+# Recreating it mid-run brought it back with no drain on 2026-09-08; it claimed a render
+# beside the training and the box hard-reset. The container's own /health carries the
+# lora-trainer entry when the trainer is enabled: `training` is non-null while a run is on.
+# `curl -s`, not `-sf`: a degraded container answers 503 and its body is still the truth.
+# Unparseable counts as training. A container without the trainer has no such entry and
+# nothing to wait for.
+training=$(docker exec "$NAME" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
+           | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("unknown"); raise SystemExit
+services = d.get("services") if isinstance(d, dict) else None
+if not isinstance(services, list):
+    print("unknown"); raise SystemExit
+trainer = [s for s in services if isinstance(s, dict) and s.get("name") == "lora-trainer"]
+if not trainer:
+    print("no"); raise SystemExit
+print("yes" if any(s.get("training") for s in trainer) else "no")
+' 2>/dev/null || echo unknown)
+if [ "$training" != "no" ]; then
+    log "the trainer in this container reports training=$training — leaving the worker alone, will retry next run"
+    exit 0
+fi
 log "worker is idle — recreating on the new image"
 "$HERE/run-worker.sh"
 log "done"

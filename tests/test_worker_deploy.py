@@ -19,8 +19,6 @@ import subprocess
 DEPLOY = pathlib.Path(__file__).parent.parent / "deploy"
 RUN = DEPLOY / "run-worker.sh"
 UPDATE = DEPLOY / "update-worker.sh"
-MODE = DEPLOY / "wanly-mode.sh"
-IDLE = DEPLOY / "worker-idle.sh"
 
 
 class TestTheContainerSpecIsComplete:
@@ -96,8 +94,8 @@ class TestTheIdleCheck:
         resolves to nothing. Verified on the 3090: a host-side curl returns empty, which
         parsed naively reads as "idle" and would recreate the container mid-render. This
         very nearly shipped."""
-        s = IDLE.read_text()
-        assert 'docker exec "$name" curl' in s, \
+        s = UPDATE.read_text()
+        assert 'docker exec "$NAME" curl' in s, \
             "the idle check must run inside the container, not against the published port"
 
 
@@ -105,7 +103,7 @@ DEFAULT_NAME = re.search(r'^NAME="\$\{NAME:-([^}]+)\}"', UPDATE.read_text(), re.
 
 
 def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trainer=None,
-           container_running=True, services="ltx-engine,lora-trainer"):
+           container_running=True):
     """Stage the real update-worker.sh with fakes for every external call it makes.
 
     Two separate fakes, because the script asks two different things:
@@ -142,12 +140,6 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
         # Read from the script rather than hardcoded, so renaming the container does not
         # silently turn this stub into a no-op that answers every inspect with exit 0.
         '  "inspect -f {{.Image}} %s")  echo "%s"; exit 0 ;;' % (DEFAULT_NAME, running_image),
-        # What the container was GIVEN. The gate reads this to tell "the engine is not
-        # answering" from "there is no engine on this box to answer" (#131). `services`
-        # None models an inspect that cannot be read at all, which must NOT be mistaken for
-        # a box without the service.
-        ('  "inspect -f {{range .Config.Env}}"*)  exit 1 ;;' if services is None
-         else '  "inspect -f {{range .Config.Env}}"*)  echo "SERVICES=%s"; exit 0 ;;' % services),
         ps_case,
         '  "pull -q "*)                        exit 0 ;;',
         '  "image inspect "*)                  echo "%s"; exit 0 ;;' % latest_image,
@@ -179,9 +171,6 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
     stage = tmp / "deploy"
     stage.mkdir(exist_ok=True)
     shutil.copy(UPDATE, stage / "update-worker.sh")
-    # The idle gate lives beside it and is SOURCED, so a stage without it silently tests
-    # nothing -- every run dies on "worker-idle.sh: No such file or directory".
-    shutil.copy(IDLE, stage / "worker-idle.sh")
     (stage / "run-worker.sh").write_text("#!/usr/bin/env bash\necho RECREATED\n")
     (stage / "run-worker.sh").chmod(0o755)
     (stage / "worker.env").write_text(
@@ -190,11 +179,10 @@ def _stage(tmp, *, running_image, latest_image, engine_busy, worker_status, trai
 
 
 def _run(tmp_path, *, running_image, latest_image, engine_busy=0, worker_status="online-idle",
-         trainer=None, container_running=True, services="ltx-engine,lora-trainer"):
+         trainer=None, container_running=True):
     bin_dir, stage = _stage(tmp_path, running_image=running_image, latest_image=latest_image,
                             engine_busy=engine_busy, worker_status=worker_status,
-                            trainer=trainer, container_running=container_running,
-                            services=services)
+                            trainer=trainer, container_running=container_running)
     env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
     return subprocess.run(["bash", str(stage / "update-worker.sh")],
                           capture_output=True, text=True, env=env)
@@ -466,7 +454,7 @@ class TestTheTrainerSharesTheCard:
     def test_the_check_reads_the_containers_own_health(self):
         """The trainer is IN the container since wanly-gpu-docker#83; the old :8083 sidecar
         probe would answer nothing and read as idle."""
-        src = IDLE.read_text()
+        src = UPDATE.read_text()
         assert ":8083" not in src
         assert 's.get("name") == "lora-trainer"' in src
 
@@ -487,7 +475,7 @@ class TestTheTrainerSharesTheCard:
         # The engine probe parses first and passes; make the second read garbage by having
         # docker answer differently the second time is not possible with a static stub, so
         # this pins the script text instead.
-        src = IDLE.read_text()
+        src = UPDATE.read_text()
         assert 'print("unknown"); raise SystemExit' in src
         assert '[ "$training" != "no" ]' in src
 
@@ -500,7 +488,7 @@ class TestTheEngineIsAskedThroughTheSupervisor:
     NEW = "sha256:bbb"
 
     def test_the_script_asks_the_control_port_first(self):
-        text = IDLE.read_text()
+        text = UPDATE.read_text()
         assert '${CONTROL_PORT:-8081}/health' in text
         assert text.index('${CONTROL_PORT:-8081}/health') < text.index("127.0.0.1:8190/health")
 
@@ -599,287 +587,10 @@ class TestTheDevMount:
         assert args != "", "the container should still have been created"
 
 
-# ---------------------------------------------------------------------------------------
-# wanly-mode.sh (#131)
-#
-# A switch means run-worker.sh, and run-worker.sh recreates with `docker rm -f`. Every wrong
-# decision here costs the same thing the updater's wrong decisions cost -- an in-flight
-# segment, a model stage, a training run -- which is why both ask the same gate.
-# ---------------------------------------------------------------------------------------
-
-RENDER_LINE = "ltx-engine,lora-trainer,image-description,face-crop"
-# "the container runs whatever worker.env says", as distinct from running=None, which models
-# an inspect that cannot be read at all.
-SAME_AS_FILE = object()
-
-
-def _stage_mode(tmp, *, services=RENDER_LINE, running=SAME_AS_FILE, worker_status="online-idle",
-                engine_busy=0, trainer=None, extra_env=""):
-    """Stage wanly-mode.sh with the same fakes the updater gets.
-
-    `services` is what worker.env says; `running` is what the CONTAINER was given, which is
-    not the same question -- after a switch the file leads the container, and the gate reads
-    the container.
-    """
-    running = services if running is SAME_AS_FILE else running
-    bin_dir, stage = _stage(tmp, running_image="sha256:a", latest_image="sha256:a",
-                            engine_busy=engine_busy, worker_status=worker_status,
-                            trainer=trainer, services=running)
-    shutil.copy(MODE, stage / "wanly-mode.sh")
-    (stage / "wanly-mode.sh").chmod(0o755)
-    # Records the line it was given, so a test can assert what would actually be created.
-    (stage / "run-worker.sh").write_text(
-        "#!/usr/bin/env bash\n"
-        'set -a; . "$(dirname "$0")/worker.env"; set +a\n'
-        'case "${MODE:-}" in\n'
-        '  ltx-engine|render) SERVICES="${SERVICES_RENDER:-ltx-engine}" ;;\n'
-        '  caption) SERVICES="${SERVICES_CAPTION:-image-description,face-crop}" ;;\n'
-        'esac\n'
-        'echo "RECREATED $SERVICES"\n')
-    (stage / "run-worker.sh").chmod(0o755)
-    (stage / "worker.env").write_text(
-        "QUEUE_URL=http://api.test:8001\nQUEUE_API_KEY=k\nFRIENDLY_NAME=3090.zero\n"
-        "SERVICES=%s\n#SERVICES=ltx-engine\n%s" % (services, extra_env))
-    return bin_dir, stage
-
-
-def _mode(tmp, *args, **kw):
-    bin_dir, stage = _stage_mode(tmp, **kw)
-    env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
-    r = subprocess.run(["bash", str(stage / "wanly-mode.sh"), *args],
-                       capture_output=True, text=True, env=env)
-    r.env_file = (stage / "worker.env").read_text()   # type: ignore[attr-defined]
-    return r
-
-
-class TestTheModeSwitch:
-    def test_caption_drops_the_render_stack(self, tmp_path):
-        r = _mode(tmp_path, "caption")
-        assert "RECREATED image-description,face-crop" in r.stdout, r.stdout
-        # MODE is the lever that gets written, not its expansion: worker.env then reads as
-        # the choice that was made, and `MODE=caption ./run-worker.sh` does the same thing.
-        assert "\nMODE=caption\n" in r.env_file
-
-    def test_caption_records_the_render_line_before_leaving_it(self, tmp_path):
-        """SERVICES no longer holds it afterwards. Recorded rather than hardcoded because the
-        full set differs per box -- a restore that guessed would silently drop a service."""
-        r = _mode(tmp_path, "caption")
-        assert "SERVICES_RENDER=%s" % RENDER_LINE in r.env_file
-
-    def test_render_restores_the_recorded_line(self, tmp_path):
-        r = _mode(tmp_path, "render", services="image-description,face-crop",
-                  extra_env="SERVICES_RENDER=%s\n" % RENDER_LINE)
-        assert "RECREATED %s" % RENDER_LINE in r.stdout, r.stdout
-
-    def test_render_refuses_rather_than_guessing_when_nothing_was_recorded(self, tmp_path):
-        """Guessing here means recreating the box with a service missing, which looks like
-        the feature is broken rather than like the restore was wrong."""
-        r = _mode(tmp_path, "render", services="image-description,face-crop")
-        assert r.returncode == 1
-        assert "SERVICES_RENDER" in r.stdout
-        assert "RECREATED" not in r.stdout
-
-    def test_a_commented_example_line_is_not_rewritten(self, tmp_path):
-        """worker.env.example ships `#SERVICES=` lines. Rewriting one would uncomment it on
-        the next source and silently win over the real one."""
-        r = _mode(tmp_path, "caption")
-        assert "#SERVICES=ltx-engine\n" in r.env_file
-
-    def test_switching_to_the_mode_it_is_already_in_does_nothing(self, tmp_path):
-        r = _mode(tmp_path, "render")
-        assert "nothing to do" in r.stdout
-        assert "RECREATED" not in r.stdout
-
-    def test_status_never_recreates_anything(self, tmp_path):
-        r = _mode(tmp_path, "status")
-        assert r.returncode == 0
-        assert "RECREATED" not in r.stdout
-        assert "mode render" in r.stdout
-
-    def test_an_unknown_argument_exits_nonzero(self, tmp_path):
-        """`wanly-mode.sh caprion || echo failed` must say failed rather than report a switch
-        that never happened."""
-        r = _mode(tmp_path, "caprion")
-        assert r.returncode == 1
-        assert "RECREATED" not in r.stdout
-
-
-class TestTheModeSwitchRefusesWhileBusy:
-    """run-worker.sh recreates with `docker rm -f`. Every one of these is a segment, a model
-    stage or a training run that a switch would have destroyed."""
-
-    def test_a_busy_worker_blocks_the_switch(self, tmp_path):
-        r = _mode(tmp_path, "caption", worker_status="online-busy")
-        assert r.returncode == 1
-        assert "RECREATED" not in r.stdout
-
-    def test_it_says_how_to_caption_without_interrupting(self, tmp_path):
-        """The refusal has to name the drain, or the next move is --force."""
-        r = _mode(tmp_path, "caption", worker_status="online-busy")
-        assert "drain" in r.stdout
-
-    def test_a_refusal_leaves_worker_env_untouched(self, tmp_path):
-        """The gate runs BEFORE anything is written. A file left mid-switch would be applied
-        by the next recreate -- the update timer's, minutes later, with nobody watching."""
-        r = _mode(tmp_path, "caption", worker_status="online-busy")
-        assert "\nSERVICES=%s\n" % RENDER_LINE in r.env_file
-        assert "SERVICES_RENDER" not in r.env_file
-
-    def test_a_rendering_engine_blocks_the_switch(self, tmp_path):
-        r = _mode(tmp_path, "caption", engine_busy=1)
-        assert r.returncode == 1
-        assert "RECREATED" not in r.stdout
-
-    def test_a_training_run_blocks_the_switch(self, tmp_path):
-        r = _mode(tmp_path, "caption", trainer="training")
-        assert r.returncode == 1
-        assert "RECREATED" not in r.stdout
-
-    def test_force_switches_anyway(self, tmp_path):
-        r = _mode(tmp_path, "caption", "--force", worker_status="online-busy")
-        assert "RECREATED image-description,face-crop" in r.stdout, r.stdout
-
-
-class TestTheGateDoesNotStrandABoxInCaptionMode:
-    """Found live on the 3090, 2026-09-25: `render` refused to switch back, forever.
-
-    `online-idle` is published by the RENDER DAEMON and only by it. A container with no
-    ltx-engine has no daemon and sits at a plain `online`, so requiring online-idle refused
-    every switch OUT of caption mode on the absence of the very service being restored.
-    """
-
-    CAPTION = "image-description,face-crop"
-
-    def test_plain_online_is_idle_when_there_is_no_engine_to_be_busy(self, tmp_path):
-        r = _mode(tmp_path, "render", services=self.CAPTION, worker_status="online",
-                  engine_busy=None, trainer=None,
-                  extra_env="SERVICES_RENDER=%s\n" % RENDER_LINE)
-        assert "RECREATED %s" % RENDER_LINE in r.stdout, r.stdout
-
-    def test_plain_online_is_NOT_idle_when_the_engine_is_there(self, tmp_path):
-        """With a render daemon on the box, `online` is a status that has not reached
-        online-idle -- mid-boot, or a failed push. Not evidence of idleness."""
-        r = _mode(tmp_path, "caption", worker_status="online")
-        assert r.returncode == 1
-        assert "RECREATED" not in r.stdout
-
-    def test_a_missing_engine_is_not_an_unreadable_one(self, tmp_path):
-        """`unknown` engine health means two different things and only one is safe: there is
-        no engine on this box (nothing to ask) vs. the engine is not answering (mid-boot,
-        staging 58 GB). The container's own SERVICES is what tells them apart."""
-        r = _mode(tmp_path, "render", services=self.CAPTION, engine_busy=None,
-                  extra_env="SERVICES_RENDER=%s\n" % RENDER_LINE)
-        assert "RECREATED" in r.stdout, r.stdout
-
-    def test_an_unreadable_container_is_never_exempt(self, tmp_path):
-        """THE FAIL-SAFE. If the inspect cannot be read we do not know what is running, and
-        answering "absent, therefore exempt" would turn every unreadable-engine case -- the
-        ones that exist precisely to count as busy -- into a green light to recreate.
-
-        `running=None` is an inspect that fails outright, beside an engine that answers
-        nothing: the exact shape of a box mid-boot, staging 58 GB."""
-        r = _mode(tmp_path, "caption", running=None, engine_busy=None)
-        assert r.returncode == 1, r.stdout
-        assert "RECREATED" not in r.stdout
-
-
-class TestPauseAndResume:
-    """The no-recreate path (#131 follow-up): stop claiming, let the segment finish, park.
-
-    This is the one that answers "let me caption while jobs are queued", so the thing worth
-    pinning is the WAIT -- without it `pause` returns while the render is still running, and
-    wanly-api has already stopped refusing captions (it refuses only on `online-busy`, and
-    `POST /drain` sets `draining` immediately). A caption then lands on a card that is ~23 of
-    24 GB into a render.
-    """
-
-    @staticmethod
-    def _curl(stage_bin, *, status="online-busy", engine_calls_before_idle=1):
-        """A curl that answers /workers, and logs the drain calls it is asked to make."""
-        (stage_bin / "curl").write_text(
-            "#!/usr/bin/env bash\n"
-            'for a in "$@"; do case "$a" in *"/drain")'
-            ' echo "$*" >> "%s"; echo "{}"; exit 0 ;; esac; done\n' % (stage_bin / "drain.log")
-            + "echo '[{\"id\":\"w-1\",\"friendly_name\":\"3090.zero\",\"status\":\"%s\"}]'\n" % status)
-        (stage_bin / "curl").chmod(0o755)
-
-    def _run(self, tmp_path, *args, status="online-busy", engine_busy=0, services=None):
-        bin_dir, stage = _stage_mode(
-            tmp_path, worker_status=status, engine_busy=engine_busy,
-            **({"running": services} if services is not None else {}))
-        self._curl(bin_dir, status=status)
-        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
-        r = subprocess.run(["bash", str(stage / "wanly-mode.sh"), *args],
-                           capture_output=True, text=True, env=env)
-        log = bin_dir / "drain.log"
-        r.drain = log.read_text() if log.exists() else ""   # type: ignore[attr-defined]
-        return r
-
-    def test_pause_drains_the_worker_by_its_own_id(self, tmp_path):
-        """The id is looked up from FRIENDLY_NAME. Hand-assembling a UUID into a curl is why
-        this path went unused."""
-        r = self._run(tmp_path, "pause")
-        assert "POST" in r.drain and "/workers/w-1/drain" in r.drain, r.drain
-
-    def test_pause_reports_parked_once_the_engine_is_clear(self, tmp_path):
-        r = self._run(tmp_path, "pause", engine_busy=0)
-        assert r.returncode == 0
-        assert "parked" in r.stdout
-
-    def test_pause_does_NOT_claim_parked_while_the_engine_is_unreadable(self, tmp_path):
-        """THE SAFETY. An unreadable engine is not a finished one, and saying "caption away"
-        there is the whole hazard this command exists to close."""
-        r = self._run(tmp_path, "pause", engine_busy=None)
-        assert r.returncode == 1
-        assert "parked" not in r.stdout
-        assert "NOT safe to caption" in r.stdout
-
-    def test_pause_still_drains_even_when_it_cannot_confirm(self, tmp_path):
-        """Refusing to drain would leave the box claiming MORE work, which is worse than a
-        drain it could not confirm. The drain stands; only the all-clear is withheld."""
-        r = self._run(tmp_path, "pause", engine_busy=None)
-        assert "/workers/w-1/drain" in r.drain
-
-    def test_a_caption_mode_box_has_no_engine_to_wait_for(self, tmp_path):
-        r = self._run(tmp_path, "pause", engine_busy=None, services="image-description")
-        assert r.returncode == 0
-        assert "parked" in r.stdout
-
-    def test_resume_cancels_the_drain(self, tmp_path):
-        r = self._run(tmp_path, "resume", status="draining")
-        assert r.returncode == 0
-        assert "DELETE" in r.drain and "/workers/w-1/drain" in r.drain, r.drain
-
-
-class TestAPausedBoxIsStillSwitchable:
-    """`draining` means NOT CLAIMING ANY MORE WORK -- stronger than online-idle, not weaker.
-
-    Without this a box paused for captioning could never be switched or updated: refused
-    forever on a status it was deliberately put into.
-    """
-
-    def test_a_parked_box_may_be_switched(self, tmp_path):
-        r = _mode(tmp_path, "caption", worker_status="draining", engine_busy=0)
-        assert "RECREATED" in r.stdout, r.stdout
-
-    def test_but_not_while_its_last_segment_is_still_rendering(self, tmp_path):
-        """What `draining` does NOT say is whether the segment already in flight has
-        finished. That is the engine's signal, and it still has to pass."""
-        r = _mode(tmp_path, "caption", worker_status="draining", engine_busy=1)
-        assert r.returncode == 1
-        assert "RECREATED" not in r.stdout
-
-    def test_the_refusal_names_the_status_the_api_actually_reported(self, tmp_path):
-        """Not the one the gate synthesised -- "despite status 'online-idle'" on a box the
-        API called `draining` sends you looking for the wrong thing."""
-        r = _mode(tmp_path, "caption", worker_status="draining", engine_busy=1)
-        assert "draining" in r.stdout
-
-
 class TestTheModeFlag:
-    """MODE is the lever David asked for in #131, in those words: mode=ltx-engine |
-    mode=caption. It is read by run-worker.sh, so it works with no wrapper at all --
-    `MODE=caption ./run-worker.sh`."""
+    """MODE is a DOCKER ENV FLAG. run-worker.sh does not interpret it -- it hands it to the
+    container, which decides (wanly_worker/registry.py select_mode). That is what makes
+    `docker run -e MODE=caption ...` the whole switch, with no wrapper in the path."""
 
     def _run_worker(self, tmp_path, env_lines, **env):
         stage = tmp_path / "deploy"
@@ -888,7 +599,6 @@ class TestTheModeFlag:
         (stage / "worker.env").write_text(env_lines)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir(exist_ok=True)
-        # Echo the run so the resolved SERVICES is observable; refuse to actually start one.
         (bin_dir / "docker").write_text('#!/usr/bin/env bash\necho "docker $*"\n')
         (bin_dir / "docker").chmod(0o755)
         for stub in ("ss", "nvidia-smi"):
@@ -900,50 +610,39 @@ class TestTheModeFlag:
         return subprocess.run(["bash", str(stage / "run-worker.sh")],
                               capture_output=True, text=True, env=e)
 
-    BASE = ("QUEUE_API_KEY=k\nFRIENDLY_NAME=3090.zero\n"
-            "JOBS_DIR=%s/jobs\nMODELS_DIR=%s/models\nIMAGE=x:full\n"
-            "SERVICES_RENDER=ltx-engine,lora-trainer\nSERVICES_CAPTION=image-description\n")
+    def _env(self, tmp_path, extra=""):
+        return ("QUEUE_API_KEY=k\nQUEUE_URL=http://api.test:8001\n"
+                "FRIENDLY_NAME=3090.zero\nIMAGE=x:full\n"
+                "JOBS_DIR=%s/jobs\nMODELS_DIR=%s/models\n"
+                "OLLAMA_HOST_STORE=%s/ollama\nLORA_RUNS_DIR=%s/runs\n"
+                "SERVICES=ltx-engine,lora-trainer,image-description\n%s"
+                % (tmp_path, tmp_path, tmp_path, tmp_path, extra))
 
-    def test_mode_caption_picks_the_caption_line(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path) + "MODE=caption\n"
-                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path)
-        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
-
-    def test_mode_ltx_engine_picks_the_render_line(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path) + "MODE=ltx-engine\n"
-                             "LORA_RUNS_DIR=%s/runs\n" % tmp_path)
-        assert "SERVICES=ltx-engine,lora-trainer)" in r.stdout, r.stdout + r.stderr
-
-    def test_MODE_WINS_over_an_explicit_SERVICES_line(self, tmp_path):
-        """The coarse choice beats the fine one. A box that sets both means the coarse one --
-        otherwise `MODE=caption` silently renders."""
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path)
-                             + "SERVICES=ltx-engine,lora-trainer\nMODE=caption\n"
-                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path)
-        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
+    def test_MODE_reaches_the_container_as_an_env_flag(self, tmp_path):
+        r = self._run_worker(tmp_path, self._env(tmp_path, "MODE=caption\n"))
+        assert '-e MODE=caption' in r.stdout, r.stdout + r.stderr
 
     def test_it_works_as_a_one_off_env_override_with_no_file_edit(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path)
-                             + "SERVICES=ltx-engine,lora-trainer\n"
-                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path,
-                             MODE="caption")
-        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
+        r = self._run_worker(tmp_path, self._env(tmp_path), MODE="caption")
+        assert '-e MODE=caption' in r.stdout, r.stdout + r.stderr
 
-    def test_no_MODE_leaves_SERVICES_alone(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path)
-                             + "SERVICES=ltx-engine\n")
-        assert "SERVICES=ltx-engine)" in r.stdout, r.stdout + r.stderr
+    def test_SERVICES_IS_NOT_REWRITTEN(self, tmp_path):
+        """The capability line goes to the container untouched. This is the whole design:
+        nothing has to remember the full list in order to put it back."""
+        r = self._run_worker(tmp_path, self._env(tmp_path, "MODE=caption\n"))
+        assert '-e SERVICES=ltx-engine,lora-trainer,image-description' in r.stdout, r.stdout
 
-    def test_an_unrecognised_MODE_is_refused_not_defaulted(self, tmp_path):
-        """Silently rendering on a box you meant to put on captions is the mistake worth
-        being loud about."""
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path) + "MODE=captions\n")
+    def test_no_MODE_passes_an_empty_flag_not_a_missing_one(self, tmp_path):
+        """An unset MODE still has to be passed, or a recreate would inherit whatever the
+        previous container had in an image default."""
+        r = self._run_worker(tmp_path, self._env(tmp_path))
+        assert '-e MODE=' in r.stdout, r.stdout + r.stderr
+
+    def test_an_unrecognised_MODE_is_refused_BEFORE_docker_run(self, tmp_path):
+        """This script's rule: refuse before `docker rm -f`, never after. A typo must not
+        cost the running worker, even though the container would also reject it."""
+        r = self._run_worker(tmp_path, self._env(tmp_path, "MODE=captions\n"))
         assert r.returncode != 0
-        assert "not one of" in r.stdout
+        assert "not a mode" in r.stdout
         assert "docker run" not in r.stdout
+        assert "rm -f" not in r.stdout
