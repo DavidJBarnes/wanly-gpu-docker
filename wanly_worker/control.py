@@ -54,6 +54,16 @@ _client: httpx.AsyncClient | None = None
 #: leave the box with the render stack half up beside the captioner -- the exact collision
 #: the stop-before-start ordering exists to prevent.
 _mode_lock = asyncio.Lock()
+#: The mode being switched TO, while the switch is still running, and why the last one
+#: failed. A switch is not instant: stopping the render daemon lets the segment in flight
+#: FINISH first, which is up to ~27 minutes. Blocking the request for that long is what
+#: makes a working switch look like a failed one -- the caller times out and reports an
+#: error while the box is quietly doing exactly what was asked.
+_pending: str | None = None
+_mode_error: str | None = None
+#: Held so the task is not garbage collected mid-switch. asyncio keeps only a weak
+#: reference, and a collected task stops the box half-flipped.
+_mode_task: asyncio.Task | None = None
 
 
 @contextlib.asynccontextmanager
@@ -154,6 +164,21 @@ class ModeRequest(BaseModel):
     mode: str
 
 
+async def _switch(target: str, names: list[str]) -> None:
+    """Do the switch, off the request. Never raises: it has no caller left to raise to."""
+    global _mode, _pending, _mode_error
+    try:
+        async with _mode_lock:
+            await _sup.apply(names, _client)
+            _mode = target
+        print(f"mode: now {target} ({','.join(names)})", flush=True)
+    except Exception as e:                      # noqa: BLE001 -- reported, not swallowed
+        _mode_error = str(e)
+        print(f"!! mode switch to {target} failed: {e}", flush=True)
+    finally:
+        _pending = None
+
+
 @app.post("/mode")
 async def set_mode(body: ModeRequest):
     """Change what this box is doing, WITHOUT recreating the container.
@@ -177,17 +202,28 @@ async def set_mode(body: ModeRequest):
         # a mode that would leave this box running nothing.
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    global _mode
-    # Serialised: see _mode_lock. Held across the whole apply, so a second caller waits for
-    # a coherent box rather than racing into the middle of one.
-    async with _mode_lock:
-        if registry.canonical_mode(body.mode) == _mode:
-            return {"mode": _mode, "services": names, "changed": False}
-        print(f"mode: {_mode or 'ltx-engine'} -> {registry.canonical_mode(body.mode)} "
-              f"({','.join(names)})", flush=True)
-        await _sup.apply(names, _client)
-        _mode = registry.canonical_mode(body.mode)
-    return {"mode": _mode, "services": names, "changed": True}
+    global _pending, _mode_error, _mode_task
+    target = registry.canonical_mode(body.mode)
+
+    # ACCEPTED AND RETURNED IMMEDIATELY. Stopping the render daemon waits for the segment in
+    # flight to finish -- by design, so nothing is destroyed -- and that is up to ~27
+    # minutes. Waiting for it here means the client times out and reports a failure while
+    # the switch is going perfectly well. The state is readable from /health instead.
+    if _pending is not None:
+        if _pending == target:
+            return {"mode": _mode, "pending": _pending, "services": names, "changed": False}
+        raise HTTPException(
+            status_code=409,
+            detail=f"already switching to {_pending}; wait for it to land")
+    if target == _mode:
+        return {"mode": _mode, "pending": None, "services": names, "changed": False}
+
+    _mode_error = None
+    _pending = target
+    print(f"mode: {_mode} -> {target} ({','.join(names)}) — "
+          f"a segment in flight will finish first", flush=True)
+    _mode_task = asyncio.create_task(_switch(target, names))
+    return {"mode": _mode, "pending": target, "services": names, "changed": True}
 
 
 @app.get("/health")
@@ -210,6 +246,11 @@ async def health():
         # without knowing anything about this container.
         "equipped": _equipped,
         "mode": _mode,
+        # Set while a switch is running. The caller shows it as in-progress rather than as
+        # the mode it is not in yet -- and `mode_error` is how a switch that failed says so,
+        # since by then there is no request left to answer.
+        "pending_mode": _pending,
+        "mode_error": _mode_error,
         "build": BUILD,
         "code": _code_ref(),
         "services": services,
