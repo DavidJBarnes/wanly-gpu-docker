@@ -103,6 +103,43 @@ PULL_MIN_FREE_GB = float(os.environ.get("IMAGE_DESCRIPTION_PULL_MIN_FREE_GB", "2
 PULL_TIMEOUT_S = float(os.environ.get("IMAGE_DESCRIPTION_PULL_TIMEOUT_S", "4800"))
 
 
+#: Ollama unloads a model once its keep_alive expires, and every caption request carries its
+#: own (wanly-api sends 15m). -1 means "hold it until told otherwise"; 0 means "drop it now".
+PIN = -1
+DROP = 0
+#: Re-assert the pin on a timer, because a caption request RESETS the model's keep_alive to
+#: whatever that request asked for. Without this a box left in caption mode would unload 15
+#: minutes after its last caption -- the one thing "keep it loaded until I flip back" rules
+#: out. Comfortably inside wanly-api's 15m.
+PIN_INTERVAL_S = 300.0
+
+
+async def warm(client, model: str = MODEL, keep_alive: int = PIN) -> bool:
+    """Load `model` onto the card and hold it there.
+
+    An EMPTY prompt is the documented way to ask ollama to load a model without generating:
+    it returns as soon as the model is resident. That matters here -- the point is to pay
+    the cold load (88s measured for qwen3-vl:32b on the 3090) during the mode switch, where
+    it is expected, instead of inside the first caption, where it reads as a hung request.
+    """
+    try:
+        r = await client.post(f"http://127.0.0.1:{PORT}/api/generate",
+                              json={"model": model, "prompt": "", "keep_alive": keep_alive},
+                              timeout=600)
+        return r.status_code == 200
+    except Exception as e:                      # noqa: BLE001
+        # Never fatal. A captioner that would not preload still answers requests; the first
+        # one just pays the load, which is exactly the old behaviour.
+        print(f"image-description: could not warm {model} ({e})", flush=True)
+        return False
+
+
+async def release(client, model: str = MODEL) -> bool:
+    """Drop `model` from the card. Called BEFORE the render stack comes back up, because a
+    20 GB captioner still resident is 20 GB the renderer does not have."""
+    return await warm(client, model, keep_alive=DROP)
+
+
 class ImageDescription(Service):
     name = "image-description"
     port = PORT
