@@ -164,6 +164,63 @@ class ModeRequest(BaseModel):
     mode: str
 
 
+#: How long to let captions finish before starting a render anyway. A caption is ~25s and
+#: two make an image, so a handful is a couple of minutes; past this something is wedged and
+#: holding the box hostage is worse than the overlap.
+CAPTION_DRAIN_TIMEOUT_S = float(os.environ.get("CAPTION_DRAIN_TIMEOUT_S") or "600")
+
+
+async def _caption_queue_depth() -> int | None:
+    """How much the API still has queued for this captioner. None when it will not say.
+
+    Asked of wanly-api, not of ollama: the queue lives in the API (its caption_queue), and
+    ollama only ever knows about the one request it is serving.
+    """
+    from wanly_worker.queue_client import QUEUE_API_KEY, QUEUE_URL
+
+    if not (QUEUE_URL and QUEUE_API_KEY and _client):
+        return None
+    try:
+        r = await _client.get(f"{QUEUE_URL}/images/caption-queue",
+                              headers={"X-API-Key": QUEUE_API_KEY}, timeout=10)
+        if r.status_code != 200:
+            return None
+        return int((r.json() or {}).get("depth") or 0)
+    except Exception:
+        return None
+
+
+async def _drain_captions() -> None:
+    """Wait for outstanding captions before the render stack takes the card.
+
+    THE SYMMETRIC HALF. Switching TO captions already waits for the segment in flight --
+    the render daemon is allowed to finish what it started. Switching to render did not wait
+    for anything, so a caption mid-flight raced ComfyUI loading its models on the same card.
+    One GPU doing one job at a time has to mean both directions or it means neither.
+
+    A queue that cannot be read is not a reason to wait: an older API has no such endpoint,
+    and blocking every switch on a question nothing answers would make the mode unusable.
+    """
+    depth = await _caption_queue_depth()
+    if depth is None:
+        return
+    if depth:
+        print(f"mode: waiting for {depth} caption(s) to finish before rendering", flush=True)
+    waited = 0.0
+    while depth:
+        await asyncio.sleep(5)
+        waited += 5
+        if waited >= CAPTION_DRAIN_TIMEOUT_S:
+            # Loud, and then proceed: a wedged captioner must not hold the box forever.
+            print(f"!! mode: captions still queued after {waited:.0f}s — starting the "
+                  f"render stack anyway", flush=True)
+            return
+        depth = await _caption_queue_depth()
+        if depth is None:
+            return
+    print("mode: captions drained", flush=True)
+
+
 async def _switch(target: str, names: list[str]) -> None:
     """Do the switch, off the request. Never raises: it has no caller left to raise to."""
     global _mode, _pending, _mode_error
@@ -174,6 +231,10 @@ async def _switch(target: str, names: list[str]) -> None:
             # ComfyUI starts against a card a 20 GB captioner is still holding. That is the
             # collision in the other direction, and it is the one that costs a render.
             if target != "caption" and _mode == "caption":
+                # Order matters: let the captions FINISH, then drop the model, then start
+                # the render stack. Dropping first would pull the card out from under a
+                # caption that is still running.
+                await _drain_captions()
                 await imgdesc.service.release(_client)
 
             await _sup.apply(names, _client)
