@@ -55,8 +55,14 @@ async def lifespan(app: FastAPI):
     global _sup
     print(f"=== wanly-gpu-docker === image build: {BUILD} | code: {_code_ref()}", flush=True)
     try:
-        names = registry.parse_services(os.environ.get("SERVICES"))
-        print(f"SERVICES={','.join(names)}", flush=True)
+        equipped = registry.parse_services(os.environ.get("SERVICES"))
+        # MODE narrows what actually runs; SERVICES stays the box's own capability line, so
+        # the switch is `docker run -e MODE=caption` and nothing has to remember the full
+        # list to put back afterwards.
+        names = registry.select_mode(equipped, os.environ.get("MODE"))
+        mode = (os.environ.get("MODE") or "").strip()
+        print(f"SERVICES={','.join(names)}"
+              + (f"  (MODE={mode} of {','.join(equipped)})" if mode else ""), flush=True)
         # Before any child starts: the render daemon reads these from its env and registers
         # the box with them (one row per box, wanly-gpu-docker#83). WORKER_ID_FILE too, and
         # for THIS process as much as for the daemon: the trainer's poller and its drain read

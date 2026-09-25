@@ -53,7 +53,53 @@ def kinds_for(names: list[str]) -> list[str]:
 
 
 class ConfigError(RuntimeError):
-    """SERVICES named something this image cannot run."""
+    """SERVICES named something this image cannot run, or MODE is not a mode."""
+
+
+#: MODE selects WHICH OF `SERVICES` ACTUALLY RUNS, without changing what the box is for.
+#:
+#: SERVICES is a property of the BOX -- everything this machine is equipped to do, set once
+#: and left alone. MODE is a property of RIGHT NOW. Keeping them separate is what makes the
+#: switch a plain `docker run -e MODE=caption` with the box's own SERVICES line untouched,
+#: instead of an edit that has to remember the full list to put back.
+#:
+#: `caption` is DERIVED, not a hardcoded pair of names: it is every enabled service that
+#: claims no work. That is exactly the property that matters -- with nothing on the box that
+#: can claim, queued jobs simply wait and the GPU belongs to the captioner. A service added
+#: to KIND_BY_SERVICE later is excluded automatically, which is the right default: anything
+#: that takes work does not belong in caption mode.
+MODES = ("ltx-engine", "caption")
+_MODE_ALIASES = {"render": "ltx-engine", "engine": "ltx-engine",
+                 "image-caption": "caption", "image-description": "caption"}
+
+
+def select_mode(names: list[str], raw: str | None) -> list[str]:
+    """Narrow `names` to the services MODE asks for. Unset means all of them.
+
+    Order is preserved -- see parse_services; services start in the order given.
+    """
+    mode = (raw or "").strip().lower()
+    if not mode:
+        return names
+    mode = _MODE_ALIASES.get(mode, mode)
+    if mode not in MODES:
+        raise ConfigError(
+            f"MODE={raw!r} is not a mode. Known modes: {', '.join(MODES)} "
+            f"(aliases: {', '.join(sorted(_MODE_ALIASES))})"
+        )
+    if mode == "ltx-engine":
+        return names
+    kept = [n for n in names if n not in KIND_BY_SERVICE]
+    if not kept:
+        # Refused rather than silently started empty, for the reason parse_services refuses
+        # an empty list: a container running nothing boots clean, reports healthy and serves
+        # nothing, and is diagnosed from another machine as "captioner unreachable".
+        raise ConfigError(
+            f"MODE=caption leaves nothing to run: SERVICES={','.join(names)} contains only "
+            f"services that claim work ({', '.join(sorted(KIND_BY_SERVICE))}). Add "
+            f"image-description (and/or face-crop) to SERVICES, or drop MODE."
+        )
+    return kept
 
 
 def parse_services(raw: str | None, known: dict | None = None) -> list[str]:

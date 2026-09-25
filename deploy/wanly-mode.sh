@@ -16,7 +16,7 @@
 #         caption   SERVICES=image-description,face-crop
 #                   No render daemon exists, so queued jobs simply WAIT -- nothing is lost,
 #                   nothing is claimed, and the card is ollama's alone.
-#         render    the full line back, from SERVICES_RENDER in worker.env.
+#         ltx-engine  everything in SERVICES again.
 #
 # PAUSE/RESUME IS USUALLY THE BETTER ANSWER, and always is while a segment is in flight:
 #
@@ -63,7 +63,7 @@ usage: wanly-mode.sh pause|resume|caption|render|status [--force]
   status    what the container is running now, and whether it could be switched
   caption   image-description + face-crop only, via a recreate; for a long
             captioning stretch where the render stack need not be resident
-  render    the full service line back (SERVICES_RENDER in worker.env)
+  render    everything in SERVICES again (MODE=ltx-engine)
   --force   switch even though the worker is busy. This DESTROYS an in-flight
             segment or training run.
 USAGE
@@ -92,34 +92,30 @@ set -a; . "$ENV_FILE"; set +a
 . "$HERE/worker-idle.sh"
 
 NAME="${NAME:-wanly-gpu-docker}"
-SERVICES_CAPTION="${SERVICES_CAPTION:-image-description,face-crop}"
 
 # The render line is whatever the box was running the first time it left render mode. Taken
 # from SERVICES rather than hardcoded, and WRITTEN BACK, because the full set differs per box
 # (a trainer box has lora-trainer; a lean render box has neither) and a restore that guessed
 # would silently drop a service. Once recorded it is the durable answer to "what is this box
 # for", surviving any number of switches.
-render_line() {
-    if [ -n "${SERVICES_RENDER:-}" ]; then
-        echo "$SERVICES_RENDER"
-    elif [ -n "${SERVICES:-}" ] && [ "$SERVICES" != "$SERVICES_CAPTION" ]; then
-        echo "$SERVICES"
-    else
-        echo ""
-    fi
+# Caption mode runs the services that CLAIM NO WORK -- the same rule the container applies
+# (registry.select_mode), derived rather than listed so the two cannot drift.
+_CLAIMING="ltx-engine lora-trainer"
+caption_subset() {
+    out=""
+    for n in $(echo "$1" | tr ',' ' '); do
+        case " $_CLAIMING " in *" $n "*) continue ;; esac
+        out="${out:+$out,}$n"
+    done
+    echo "$out"
 }
 
-# Mode is decided by WHETHER THE RENDER DAEMON EXISTS, not by matching a service list: that
-# is the only thing the question turns on. Anything else is an honest "custom".
 mode_of() {
-    case ",${1}," in
-        *,ltx-engine,*) echo render; return ;;
-    esac
-    if [ "$1" = "$SERVICES_CAPTION" ]; then echo caption; else echo custom; fi
+    case ",${1}," in *,ltx-engine,*) echo render ;; *) echo caption ;; esac
 }
 
 # Rewrite one KEY=value line in place, or append it if it is not there. Anchored on `KEY=`,
-# so `#SERVICES=` examples and `SERVICES_RENDER=` are left alone. The file carries the queue
+# so `#SERVICES=` and `#MODE=` examples are left alone. The file carries the queue
 # key, so its permissions are preserved rather than recreated.
 set_env_line() {
     local key="$1" value="$2" tmp
@@ -223,8 +219,7 @@ fi
 # resolved the same way run-worker.sh resolves it.
 env_services() {
     case "${MODE:-}" in
-        ltx-engine|render) echo "${SERVICES_RENDER:-ltx-engine}" ;;
-        caption|image-caption|image-description) echo "$SERVICES_CAPTION" ;;
+        caption|image-caption|image-description) caption_subset "${SERVICES:-}" ;;
         *) echo "${SERVICES:-}" ;;
     esac
 }
@@ -240,8 +235,8 @@ if [ "$ACTION" = "status" ]; then
     fi
     echo "worker.env: MODE=${MODE:-<unset>} -> mode $(mode_of "$(env_services)")"
     echo "  SERVICES: $(env_services)"
-    echo "  render:   $(render_line)"
-    echo "  caption:  $SERVICES_CAPTION"
+    echo "  equipped: ${SERVICES:-<unset>}"
+    echo "  caption:  $(caption_subset "${SERVICES:-}")"
     wstatus="$(worker_field status 2>/dev/null || echo unknown)"
     echo "worker:     ${wstatus:-unknown}$([ "$wstatus" = draining ] && echo "  (paused -- $0 resume)")"
     reason="$(worker_idle_reason "$NAME")"
@@ -250,14 +245,14 @@ if [ "$ACTION" = "status" ]; then
 fi
 
 if [ "$ACTION" = "render" ]; then
-    WANT="$(render_line)"
+    WANT="${SERVICES:-}"
+else
+    WANT="$(caption_subset "${SERVICES:-}")"
     [ -n "$WANT" ] || {
-        echo "!! nothing to restore: SERVICES_RENDER is unset and SERVICES is already the"
-        echo "!! caption line. Put the full service line in $ENV_FILE as SERVICES_RENDER="
+        echo "!! MODE=caption leaves nothing to run: SERVICES=${SERVICES:-} has no service"
+        echo "!! that claims no work. Add image-description (and/or face-crop) to SERVICES."
         exit 1
     }
-else
-    WANT="$SERVICES_CAPTION"
 fi
 
 if [ "$RUNNING" = "$WANT" ] && [ "$(env_services)" = "$WANT" ]; then
@@ -281,15 +276,9 @@ if [ "$FORCE" != "1" ]; then
     fi
 fi
 
-# Record the render line BEFORE leaving render mode -- afterwards nothing else holds it.
-if [ "$ACTION" = "caption" ] && [ -z "${SERVICES_RENDER:-}" ] && [ -n "$(render_line)" ]; then
-    set_env_line SERVICES_RENDER "$(render_line)"
-    echo "recorded SERVICES_RENDER=$(render_line) in $ENV_FILE"
-fi
-
-# MODE is the lever run-worker.sh reads; SERVICES stays as the box's own fine-grained line.
-# Writing MODE rather than expanding it means worker.env reads as the choice that was made,
-# and `MODE=caption ./run-worker.sh` by hand does exactly the same thing.
+# MODE is the only thing written. SERVICES is never touched -- it is the box's capability
+# line -- so there is no full list to record and restore, and `docker run -e MODE=caption`
+# by hand does exactly what this does.
 MODE_VALUE="$([ "$ACTION" = "caption" ] && echo caption || echo ltx-engine)"
 set_env_line MODE "$MODE_VALUE"
 echo "worker.env: MODE=$MODE_VALUE (SERVICES=$WANT) -- recreating $NAME"

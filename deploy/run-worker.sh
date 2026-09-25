@@ -40,23 +40,23 @@ done
 # fails with `port is already allocated` on 11434.
 SERVICES="${SERVICES:-ltx-engine}"
 
-# MODE, the one-word lever (#131). MODE WINS OVER SERVICES when it is set -- it is the
-# coarse choice ("what is this box doing right now"), SERVICES is the fine one ("exactly
-# which services"), and a box that sets both means the coarse one.
+# MODE is passed STRAIGHT THROUGH to the container, which is what decides (registry.py
+# select_mode). SERVICES stays this box's capability line -- everything it is equipped to
+# do -- and MODE says which of that runs right now.
 #
-#     MODE=ltx-engine   the full render line, from SERVICES_RENDER
-#     MODE=caption      image-description (+face-crop), from SERVICES_CAPTION
+#     docker run -e MODE=caption ...     is the whole switch
+#     MODE=caption ./run-worker.sh       same thing through here
 #
-# Works as an env override too, so a one-off is `MODE=caption ./run-worker.sh` with nothing
-# edited. An unrecognised value is refused rather than defaulted: silently rendering on a box
-# you meant to put on captions is the mistake worth being loud about.
+# Nothing is rewritten host-side: there is no full list to remember and put back, which is
+# the failure mode of a switch that edits SERVICES in place.
+#
+# Validated HERE as well as in the container because this script's rule is to refuse before
+# `docker rm -f`, not after: a typo must not cost the running worker.
 case "${MODE:-}" in
-    "")         ;;
-    ltx-engine|render)  SERVICES="${SERVICES_RENDER:-ltx-engine}" ;;
-    caption|image-caption|image-description)
-                SERVICES="${SERVICES_CAPTION:-image-description,face-crop}" ;;
-    *) echo "!! MODE=$MODE is not one of: ltx-engine, caption"; exit 1 ;;
+    ""|ltx-engine|render|engine|caption|image-caption|image-description) ;;
+    *) echo "!! MODE=$MODE is not a mode. Known: ltx-engine, caption"; exit 1 ;;
 esac
+
 case ",$SERVICES," in *,lora-trainer,*)       WANT_TRAINER=1 ;; *) WANT_TRAINER=0 ;; esac
 case ",$SERVICES," in *,image-description,*)  WANT_OLLAMA=1 ;;  *) WANT_OLLAMA=0 ;;  esac
 case ",$SERVICES," in *,face-crop,*)          WANT_FACE_CROP=1 ;; *) WANT_FACE_CROP=0 ;; esac
@@ -158,7 +158,7 @@ if ss -tlnp 2>/dev/null | grep -q ":${CONTROL_PORT} " \
     exit 1
 fi
 
-echo "recreating $NAME from $IMAGE (SERVICES=$SERVICES)"
+echo "recreating $NAME from $IMAGE (SERVICES=$SERVICES${MODE:+, MODE=$MODE})"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 # COMFYUI_PATH is EMPTY on purpose — see the note in start.sh. With a path set the daemon
@@ -192,6 +192,7 @@ docker run -d \
     "${DEV_MOUNT_ARGS[@]}" \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
     -e "SERVICES=$SERVICES" \
+    -e "MODE=${MODE:-}" \
     -e "IMAGE_DESCRIPTION_MODEL=${IMAGE_DESCRIPTION_MODEL:-joycaption:beta-one}" \
     -e "ENGINE=ltx" \
     -e "QUEUE_URL=$QUEUE_URL" \

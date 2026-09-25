@@ -631,15 +631,18 @@ def _stage_mode(tmp, *, services=RENDER_LINE, running=SAME_AS_FILE, worker_statu
     (stage / "run-worker.sh").write_text(
         "#!/usr/bin/env bash\n"
         'set -a; . "$(dirname "$0")/worker.env"; set +a\n'
-        'case "${MODE:-}" in\n'
-        '  ltx-engine|render) SERVICES="${SERVICES_RENDER:-ltx-engine}" ;;\n'
-        '  caption) SERVICES="${SERVICES_CAPTION:-image-description,face-crop}" ;;\n'
+        'case "${MODE:-}" in caption)\n'
+        '  out=""; for n in $(echo "$SERVICES" | tr "," " "); do\n'
+        '    case "$n" in ltx-engine|lora-trainer) continue ;; esac\n'
+        '    out="${out:+$out,}$n"; done; SERVICES="$out" ;;\n'
         'esac\n'
         'echo "RECREATED $SERVICES"\n')
     (stage / "run-worker.sh").chmod(0o755)
     (stage / "worker.env").write_text(
         "QUEUE_URL=http://api.test:8001\nQUEUE_API_KEY=k\nFRIENDLY_NAME=3090.zero\n"
         "SERVICES=%s\n#SERVICES=ltx-engine\n%s" % (services, extra_env))
+    # The capability line is what a mode narrows; a caption-only box has no render stack in
+    # it at all, which is a different thing from being in caption mode.
     return bin_dir, stage
 
 
@@ -660,23 +663,25 @@ class TestTheModeSwitch:
         # the choice that was made, and `MODE=caption ./run-worker.sh` does the same thing.
         assert "\nMODE=caption\n" in r.env_file
 
-    def test_caption_records_the_render_line_before_leaving_it(self, tmp_path):
-        """SERVICES no longer holds it afterwards. Recorded rather than hardcoded because the
-        full set differs per box -- a restore that guessed would silently drop a service."""
+    def test_caption_NEVER_rewrites_the_capability_line(self, tmp_path):
+        """SERVICES is what the box is equipped to do and is not a mode. Leaving it alone is
+        what removes the "remember the full list to put back" failure entirely."""
         r = _mode(tmp_path, "caption")
-        assert "SERVICES_RENDER=%s" % RENDER_LINE in r.env_file
+        assert "\nSERVICES=%s\n" % RENDER_LINE in r.env_file
+        assert "SERVICES_RENDER" not in r.env_file
 
-    def test_render_restores_the_recorded_line(self, tmp_path):
-        r = _mode(tmp_path, "render", services="image-description,face-crop",
-                  extra_env="SERVICES_RENDER=%s\n" % RENDER_LINE)
+    def test_render_is_just_MODE_ltx_engine(self, tmp_path):
+        """Nothing to restore: SERVICES never moved, so going back is one word."""
+        r = _mode(tmp_path, "render", services=RENDER_LINE,
+                  extra_env="MODE=caption\n", running="image-description,face-crop")
+        assert "\nMODE=ltx-engine\n" in r.env_file
         assert "RECREATED %s" % RENDER_LINE in r.stdout, r.stdout
 
-    def test_render_refuses_rather_than_guessing_when_nothing_was_recorded(self, tmp_path):
-        """Guessing here means recreating the box with a service missing, which looks like
-        the feature is broken rather than like the restore was wrong."""
-        r = _mode(tmp_path, "render", services="image-description,face-crop")
+    def test_caption_on_a_box_with_nothing_to_caption_with_is_refused(self, tmp_path):
+        """Better than starting a container that runs nothing, boots clean and reports
+        healthy -- diagnosed from another machine as "captioner unreachable"."""
+        r = _mode(tmp_path, "caption", services="ltx-engine,lora-trainer")
         assert r.returncode == 1
-        assert "SERVICES_RENDER" in r.stdout
         assert "RECREATED" not in r.stdout
 
     def test_a_commented_example_line_is_not_rewritten(self, tmp_path):
@@ -751,9 +756,9 @@ class TestTheGateDoesNotStrandABoxInCaptionMode:
     CAPTION = "image-description,face-crop"
 
     def test_plain_online_is_idle_when_there_is_no_engine_to_be_busy(self, tmp_path):
-        r = _mode(tmp_path, "render", services=self.CAPTION, worker_status="online",
-                  engine_busy=None, trainer=None,
-                  extra_env="SERVICES_RENDER=%s\n" % RENDER_LINE)
+        r = _mode(tmp_path, "render", services=RENDER_LINE, running=self.CAPTION,
+                  worker_status="online", engine_busy=None, trainer=None,
+                  extra_env="MODE=caption\n")
         assert "RECREATED %s" % RENDER_LINE in r.stdout, r.stdout
 
     def test_plain_online_is_NOT_idle_when_the_engine_is_there(self, tmp_path):
@@ -767,8 +772,8 @@ class TestTheGateDoesNotStrandABoxInCaptionMode:
         """`unknown` engine health means two different things and only one is safe: there is
         no engine on this box (nothing to ask) vs. the engine is not answering (mid-boot,
         staging 58 GB). The container's own SERVICES is what tells them apart."""
-        r = _mode(tmp_path, "render", services=self.CAPTION, engine_busy=None,
-                  extra_env="SERVICES_RENDER=%s\n" % RENDER_LINE)
+        r = _mode(tmp_path, "render", services=RENDER_LINE, running=self.CAPTION,
+                  engine_busy=None, extra_env="MODE=caption\n")
         assert "RECREATED" in r.stdout, r.stdout
 
     def test_an_unreadable_container_is_never_exempt(self, tmp_path):
@@ -877,9 +882,9 @@ class TestAPausedBoxIsStillSwitchable:
 
 
 class TestTheModeFlag:
-    """MODE is the lever David asked for in #131, in those words: mode=ltx-engine |
-    mode=caption. It is read by run-worker.sh, so it works with no wrapper at all --
-    `MODE=caption ./run-worker.sh`."""
+    """MODE is a DOCKER ENV FLAG. run-worker.sh does not interpret it -- it hands it to the
+    container, which decides (wanly_worker/registry.py select_mode). That is what makes
+    `docker run -e MODE=caption ...` the whole switch, with no wrapper in the path."""
 
     def _run_worker(self, tmp_path, env_lines, **env):
         stage = tmp_path / "deploy"
@@ -888,7 +893,6 @@ class TestTheModeFlag:
         (stage / "worker.env").write_text(env_lines)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir(exist_ok=True)
-        # Echo the run so the resolved SERVICES is observable; refuse to actually start one.
         (bin_dir / "docker").write_text('#!/usr/bin/env bash\necho "docker $*"\n')
         (bin_dir / "docker").chmod(0o755)
         for stub in ("ss", "nvidia-smi"):
@@ -900,50 +904,39 @@ class TestTheModeFlag:
         return subprocess.run(["bash", str(stage / "run-worker.sh")],
                               capture_output=True, text=True, env=e)
 
-    BASE = ("QUEUE_API_KEY=k\nFRIENDLY_NAME=3090.zero\n"
-            "JOBS_DIR=%s/jobs\nMODELS_DIR=%s/models\nIMAGE=x:full\n"
-            "SERVICES_RENDER=ltx-engine,lora-trainer\nSERVICES_CAPTION=image-description\n")
+    def _env(self, tmp_path, extra=""):
+        return ("QUEUE_API_KEY=k\nQUEUE_URL=http://api.test:8001\n"
+                "FRIENDLY_NAME=3090.zero\nIMAGE=x:full\n"
+                "JOBS_DIR=%s/jobs\nMODELS_DIR=%s/models\n"
+                "OLLAMA_HOST_STORE=%s/ollama\nLORA_RUNS_DIR=%s/runs\n"
+                "SERVICES=ltx-engine,lora-trainer,image-description\n%s"
+                % (tmp_path, tmp_path, tmp_path, tmp_path, extra))
 
-    def test_mode_caption_picks_the_caption_line(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path) + "MODE=caption\n"
-                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path)
-        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
-
-    def test_mode_ltx_engine_picks_the_render_line(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path) + "MODE=ltx-engine\n"
-                             "LORA_RUNS_DIR=%s/runs\n" % tmp_path)
-        assert "SERVICES=ltx-engine,lora-trainer)" in r.stdout, r.stdout + r.stderr
-
-    def test_MODE_WINS_over_an_explicit_SERVICES_line(self, tmp_path):
-        """The coarse choice beats the fine one. A box that sets both means the coarse one --
-        otherwise `MODE=caption` silently renders."""
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path)
-                             + "SERVICES=ltx-engine,lora-trainer\nMODE=caption\n"
-                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path)
-        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
+    def test_MODE_reaches_the_container_as_an_env_flag(self, tmp_path):
+        r = self._run_worker(tmp_path, self._env(tmp_path, "MODE=caption\n"))
+        assert '-e MODE=caption' in r.stdout, r.stdout + r.stderr
 
     def test_it_works_as_a_one_off_env_override_with_no_file_edit(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path)
-                             + "SERVICES=ltx-engine,lora-trainer\n"
-                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path,
-                             MODE="caption")
-        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
+        r = self._run_worker(tmp_path, self._env(tmp_path), MODE="caption")
+        assert '-e MODE=caption' in r.stdout, r.stdout + r.stderr
 
-    def test_no_MODE_leaves_SERVICES_alone(self, tmp_path):
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path)
-                             + "SERVICES=ltx-engine\n")
-        assert "SERVICES=ltx-engine)" in r.stdout, r.stdout + r.stderr
+    def test_SERVICES_IS_NOT_REWRITTEN(self, tmp_path):
+        """The capability line goes to the container untouched. This is the whole design:
+        nothing has to remember the full list in order to put it back."""
+        r = self._run_worker(tmp_path, self._env(tmp_path, "MODE=caption\n"))
+        assert '-e SERVICES=ltx-engine,lora-trainer,image-description' in r.stdout, r.stdout
 
-    def test_an_unrecognised_MODE_is_refused_not_defaulted(self, tmp_path):
-        """Silently rendering on a box you meant to put on captions is the mistake worth
-        being loud about."""
-        r = self._run_worker(tmp_path,
-                             self.BASE % (tmp_path, tmp_path) + "MODE=captions\n")
+    def test_no_MODE_passes_an_empty_flag_not_a_missing_one(self, tmp_path):
+        """An unset MODE still has to be passed, or a recreate would inherit whatever the
+        previous container had in an image default."""
+        r = self._run_worker(tmp_path, self._env(tmp_path))
+        assert '-e MODE=' in r.stdout, r.stdout + r.stderr
+
+    def test_an_unrecognised_MODE_is_refused_BEFORE_docker_run(self, tmp_path):
+        """This script's rule: refuse before `docker rm -f`, never after. A typo must not
+        cost the running worker, even though the container would also reject it."""
+        r = self._run_worker(tmp_path, self._env(tmp_path, "MODE=captions\n"))
         assert r.returncode != 0
-        assert "not one of" in r.stdout
+        assert "not a mode" in r.stdout
         assert "docker run" not in r.stdout
+        assert "rm -f" not in r.stdout
