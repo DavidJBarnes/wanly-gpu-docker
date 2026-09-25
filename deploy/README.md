@@ -68,8 +68,47 @@ OLLAMA_HOST_STORE=/usr/share/ollama/.ollama
 the lean tag with them enabled, before it removes anything. The box registers ONCE, as
 `render` + `trainer`, and the Workers page shows one row listing every service. A training run
 drains that row: the render daemon parks, the card frees, training runs, the drain is
-released. The update timer reads `training` off the container's own `/health` and leaves it
+released. The idle gate reads `training` off the container's own `/health` and leaves it
 alone throughout.
+
+## Render or caption, one command (#131)
+
+The 3090 runs every service in one container, which is right — one box, one row, one GPU. But
+with a job queued the box is continuously `online-busy`, and the captioner's busy guard
+(`wanly-api` `app/joycaption.py`) then refuses captions rather than fighting the render for
+VRAM. So after starting a job you could not batch-caption the rest of the repo until the queue
+drained. The one-image-many-modes design already supported the answer; it had no lever.
+
+```bash
+~/wanly-gpu-docker/deploy/wanly-mode.sh status
+~/wanly-gpu-docker/deploy/wanly-mode.sh caption    # image-description,face-crop
+~/wanly-gpu-docker/deploy/wanly-mode.sh render     # the full line back
+```
+
+In `caption` mode **no render daemon exists**, so queued jobs simply wait — nothing is lost,
+nothing is claimed, and the card is ollama's alone. `render` restores `SERVICES_RENDER`, which
+the script records from whatever this box was running the first time it left render mode: the
+full set differs per box, and a restore that guessed would silently drop a service.
+
+A switch means `run-worker.sh`, which recreates with `docker rm -f`, so **it refuses while the
+worker is busy** — the same three-signal gate the update timer uses, below. `--force` says you
+mean it anyway, and destroys the in-flight segment or training run.
+
+### The lighter middle path — prefer it when a segment is minutes from done
+
+Draining costs no recreate and no model reload. The queue pauses, the **in-flight segment
+finishes**, ComfyUI releases its cache, and the captioner has the card:
+
+```bash
+curl -XPOST  -H "X-API-Key: $QUEUE_API_KEY" "$QUEUE_URL/workers/<id>/drain"
+docker exec wanly-gpu-docker curl -s -XPOST http://127.0.0.1:8188/free \
+       -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
+# ...caption...
+curl -XDELETE -H "X-API-Key: $QUEUE_API_KEY" "$QUEUE_URL/workers/<id>/drain"
+```
+
+A switch is for when you want the box captioning for a while; a drain is for when you want it
+captioning *now*.
 
 ## Rollback
 
@@ -85,13 +124,17 @@ Re-enable the timer afterwards or it will pull `:latest` back over the pin at th
 
 Recreate while the worker holds a claim.
 
-**Two signals, both must say idle.** The worker's own status from the API, and the engine's
-health. They cover different spans and each catches the other's blind spot:
+**Three signals, all must say idle**, and they live in `worker-idle.sh` — one definition,
+shared by `update-worker.sh` and `wanly-mode.sh`. Both recreate with `docker rm -f`, so both
+destroy an in-flight segment if they get this wrong, and a second hand-maintained copy of
+these rules is how one of them quietly stops knowing about the third. Each covers the others'
+blind spot:
 
 | signal | covers | blind to |
 |---|---|---|
 | worker status (`online-idle`) | the whole claim — set the instant work is received, before `[1/6]` | a failed status push from the daemon |
 | engine `running`/`queue_depth` | the render itself, from `[3/6]` | `[1/6]`–`[2/6]`: image and LoRA/checkpoint fetch |
+| trainer `training` | a training run, which *drains* the render worker and therefore looks idle | nothing else — it is the drain's blind spot, not its own |
 
 The engine-only version of this cost a segment on 2026-09-06: a container was recreated 50%
 through a 673 MB LoRA download in `[2/6]`, where the engine truthfully reports `running: 0`.
@@ -104,3 +147,11 @@ on demand, which is roughly twenty minutes inside `[2/6]`.
 Anything unreadable — the API, the engine, a worker that has not registered yet — counts as
 **busy**. A box mid-boot must not be interrupted either; on a cold pod that is ~58 GB of
 staging thrown away.
+
+The one exception, and it is about which question is being asked rather than about risk: a
+service that is **not enabled on this container** has no health to read, and "is the engine
+rendering?" has no meaning on a box in caption mode. The gate checks the container's own
+`SERVICES` before treating an unreadable engine or trainer as busy — otherwise `wanly-mode.sh
+render` could never switch back, refusing forever on the absence of the very service it is
+there to restore. The worker-status signal still covers a claim, and a container with no
+`ltx-engine` holds none.
