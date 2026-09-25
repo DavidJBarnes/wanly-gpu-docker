@@ -138,8 +138,15 @@ class QueueClient:
     def render_daemon_registers(self) -> bool:
         """When the render daemon is one of the processes it is the single registrar for
         this box (wanly-gpu-docker#83): it heartbeats the rich payload and owns the status
-        vocabulary, and a second writer on the same row would fight it."""
-        return any(row["name"] == "render-daemon" for row in self._sup.snapshot())
+        vocabulary, and a second writer on the same row would fight it.
+
+        RUNNING, not merely present. A mode change stops the daemon and leaves it in the
+        snapshot with stopped=True (#131); reading presence alone kept the supervisor stood
+        down while the only registrar on the box was gone -- the daemon deregisters as it
+        exits, so the worker row was deleted and the box vanished from the Workers page,
+        taking the control that would have switched it back with it."""
+        return any(row["name"] == "render-daemon" and row.get("running")
+                   for row in self._sup.snapshot())
 
     def status(self) -> str:
         """`online` when everything asked for answers, `degraded` when some of it does not.
@@ -245,6 +252,27 @@ class QueueClient:
             _log("the render daemon registers this box; the supervisor will not")
             return
         self._task = asyncio.create_task(self.run())
+
+    def rebalance(self) -> None:
+        """Take registration over, or hand it back, after the running set changes (#131).
+
+        Which process owns the worker row depends on WHAT IS RUNNING, and a mode change
+        moves that. Deciding once at boot left the box with no registrar at all the first
+        time it was flipped to captions.
+
+        Handing back does NOT deregister: the daemon is about to register the same box, and
+        deleting the row from under it would be a gap for nothing. Taking over does register,
+        because by then the daemon has already deleted it on its way out.
+        """
+        if self.render_daemon_registers():
+            if self._task and not self._task.done():
+                _log("the render daemon is back; standing down as registrar")
+                self._task.cancel()
+                self._task = None
+            return
+        if self._task is None or self._task.done():
+            _log("no render daemon on this box; the supervisor registers it")
+            self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
         if self._task:
