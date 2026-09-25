@@ -23,7 +23,11 @@ class _Sup:
     def snapshot(self): return self._rows
 
 
-def _ready(*names): return [{"name": n, "ready": True} for n in names]
+# `running` as well as `ready`: ServiceState.snapshot() always emits both, and who registers
+# the box turns on running (#131) -- a helper that omitted it modelled a state the supervisor
+# cannot actually produce.
+def _ready(*names):
+    return [{"name": n, "ready": True, "running": True, "stopped": False} for n in names]
 
 
 class _Resp:
@@ -273,3 +277,81 @@ class TestTheRenderDaemonIsTheRegistrar:
                 for n in ("comfyui", "ltx-engine-api", "render-daemon")]
         c = qc.QueueClient(_Sup(rows), _Client())
         assert c.provides() == ["ltx-engine"]
+
+
+# ---------------------------------------------------------------------------------------
+# WHO REGISTERS THE BOX, after a mode change (#131).
+#
+# The first flip to captions left no registrar at all: the render daemon deregisters as it
+# exits, so the row was deleted, the box vanished from the Workers page, and the control
+# that would have switched it back went with it.
+# ---------------------------------------------------------------------------------------
+
+class _Snap:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def snapshot(self):
+        return self._rows
+
+
+def _qc(rows):
+    from wanly_worker.queue_client import QueueClient
+    return QueueClient(_Snap(rows), client=None)
+
+
+def test_a_running_render_daemon_owns_the_row():
+    qc = _qc([{"name": "render-daemon", "running": True, "stopped": False}])
+    assert qc.render_daemon_registers() is True
+
+
+def test_a_STOPPED_render_daemon_does_not():
+    """RUNNING, not merely present. A mode change leaves it in the snapshot with
+    stopped=True, and reading presence alone kept the supervisor stood down while the only
+    registrar on the box was gone."""
+    qc = _qc([{"name": "render-daemon", "running": False, "stopped": True},
+              {"name": "image-description", "running": True, "stopped": False}])
+    assert qc.render_daemon_registers() is False
+
+
+def test_a_box_with_no_render_daemon_at_all_registers_itself():
+    qc = _qc([{"name": "image-description", "running": True, "stopped": False}])
+    assert qc.render_daemon_registers() is False
+
+
+def test_rebalance_takes_over_when_the_daemon_stops():
+    import asyncio
+
+    rows = [{"name": "render-daemon", "running": True, "stopped": False}]
+    qc = _qc(rows)
+
+    async def go():
+        qc.start()
+        assert qc._task is None, "it registered while the daemon was running"
+        rows[0].update(running=False, stopped=True)      # the mode change
+        qc.rebalance()
+        assert qc._task is not None, "nothing registers this box"
+        qc._task.cancel()
+
+    asyncio.run(go())
+
+
+def test_rebalance_hands_back_without_deregistering():
+    """The daemon is about to register the same box; deleting the row from under it would
+    be a gap for nothing."""
+    import asyncio
+
+    rows = [{"name": "render-daemon", "running": False, "stopped": True}]
+    qc = _qc(rows)
+    deregistered = []
+    qc.deregister = lambda: deregistered.append(1)
+
+    async def go():
+        qc.rebalance()
+        assert qc._task is not None
+        rows[0].update(running=True, stopped=False)      # switched back
+        qc.rebalance()
+        assert qc._task is None
+        assert deregistered == [], "it deleted the row the daemon is about to claim"
+
+    asyncio.run(go())

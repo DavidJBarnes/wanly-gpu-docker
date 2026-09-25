@@ -171,6 +171,12 @@ async def _switch(target: str, names: list[str]) -> None:
         async with _mode_lock:
             await _sup.apply(names, _client)
             _mode = target
+            # WHO REGISTERS THIS BOX depends on what is running, and the switch just changed
+            # that. Without this the first flip to captions left no registrar at all: the
+            # daemon deregisters as it exits, so the row was deleted and the box disappeared
+            # from the Workers page -- taking the control that would switch it back with it.
+            if _queue is not None:
+                _queue.rebalance()
         print(f"mode: now {target} ({','.join(names)})", flush=True)
     except Exception as e:                      # noqa: BLE001 -- reported, not swallowed
         _mode_error = str(e)
