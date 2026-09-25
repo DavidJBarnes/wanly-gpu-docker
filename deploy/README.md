@@ -81,7 +81,9 @@ drained. The one-image-many-modes design already supported the answer; it had no
 
 ```bash
 ~/wanly-gpu-docker/deploy/wanly-mode.sh status
-~/wanly-gpu-docker/deploy/wanly-mode.sh caption    # image-description,face-crop
+~/wanly-gpu-docker/deploy/wanly-mode.sh pause      # stop claiming, finish, park  <- usually this
+~/wanly-gpu-docker/deploy/wanly-mode.sh resume
+~/wanly-gpu-docker/deploy/wanly-mode.sh caption    # image-description,face-crop, via a recreate
 ~/wanly-gpu-docker/deploy/wanly-mode.sh render     # the full line back
 ```
 
@@ -94,21 +96,34 @@ A switch means `run-worker.sh`, which recreates with `docker rm -f`, so **it ref
 worker is busy** — the same three-signal gate the update timer uses, below. `--force` says you
 mean it anyway, and destroys the in-flight segment or training run.
 
-### The lighter middle path — prefer it when a segment is minutes from done
+### Pause / resume — usually the better answer
 
-Draining costs no recreate and no model reload. The queue pauses, the **in-flight segment
-finishes**, ComfyUI releases its cache, and the captioner has the card:
+**This is the one for "let me caption while jobs are queued".** No recreate, no boot, no model
+re-stage, and the segment in flight **finishes** instead of being destroyed:
 
 ```bash
-curl -XPOST  -H "X-API-Key: $QUEUE_API_KEY" "$QUEUE_URL/workers/<id>/drain"
-docker exec wanly-gpu-docker curl -s -XPOST http://127.0.0.1:8188/free \
-       -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
-# ...caption...
-curl -XDELETE -H "X-API-Key: $QUEUE_API_KEY" "$QUEUE_URL/workers/<id>/drain"
+wanly-mode.sh pause     # finish the current segment, park, free the card
+# ...queue as many jobs as you like, caption as much as you like...
+wanly-mode.sh resume    # everything queued starts processing
 ```
 
-A switch is for when you want the box captioning for a while; a drain is for when you want it
-captioning *now*.
+While paused the worker claims nothing, so jobs pile up in the queue untouched and the card is
+the captioner's. `resume` releases the drain and the backlog goes.
+
+The daemon does the parking itself — on a live drain it finishes the segment, calls ComfyUI
+`/free` and stops claiming (`wanly-gpu-daemon` `main.py:283`, #182) — so there is no separate
+`/free` to remember.
+
+**`pause` waits, and the wait is the point.** `POST /drain` sets the worker to `draining`
+*immediately*, and `wanly-api` refuses an interactive caption only on `online-busy`
+(`app/joycaption.py` `busy_render_beside_the_captioner`). So the instant you drain, the
+captioner is un-gated — while the render is still going, on a card that sits at ~23 of 24 GB
+mid-render. Captioning in that window is exactly the VRAM fight the guard exists to prevent.
+`pause` blocks until the engine reports nothing in flight, and **fails loudly rather than
+claiming "parked"** if it cannot read the engine.
+
+`caption` mode is for a long captioning stretch where you would rather not have the render
+stack resident at all; `pause` is for everything else.
 
 ## Rollback
 
@@ -132,7 +147,7 @@ blind spot:
 
 | signal | covers | blind to |
 |---|---|---|
-| worker status (`online-idle`) | the whole claim — set the instant work is received, before `[1/6]` | a failed status push from the daemon |
+| worker status (`online-idle`, or `draining` — a paused box claims nothing) | the whole claim — set the instant work is received, before `[1/6]` | a failed status push from the daemon; and `draining` says nothing about the segment already in flight, which is row 2's job |
 | engine `running`/`queue_depth` | the render itself, from `[3/6]` | `[1/6]`–`[2/6]`: image and LoRA/checkpoint fetch |
 | trainer `training` | a training run, which *drains* the render worker and therefore looks idle | nothing else — it is the drain's blind spot, not its own |
 

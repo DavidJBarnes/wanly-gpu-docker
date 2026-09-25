@@ -18,18 +18,27 @@
 #                   nothing is claimed, and the card is ollama's alone.
 #         render    the full line back, from SERVICES_RENDER in worker.env.
 #
-# THE LIGHTER MIDDLE PATH, and prefer it when a segment is ten minutes from done: drain
-# instead of switching. It costs no recreate and no model reload.
+# PAUSE/RESUME IS USUALLY THE BETTER ANSWER, and always is while a segment is in flight:
 #
-#     curl -XPOST  -H "X-API-Key: $QUEUE_API_KEY" "$QUEUE_URL/workers/<id>/drain"
-#     docker exec wanly-gpu-docker curl -s -XPOST http://127.0.0.1:8188/free \
-#            -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
-#     ...caption...
-#     curl -XDELETE -H "X-API-Key: $QUEUE_API_KEY" "$QUEUE_URL/workers/<id>/drain"
+#     wanly-mode.sh pause     # finish the current segment, park, free the card
+#     ...queue jobs, caption as much as you like...
+#     wanly-mode.sh resume    # everything queued starts processing
 #
-# The queue pauses, the IN-FLIGHT SEGMENT FINISHES, ComfyUI releases its cache, and the
-# captioner has the card. A switch is for when you want the box captioning for a while;
-# a drain is for when you want it captioning now.
+# No recreate, no boot, no model re-stage, and the in-flight segment FINISHES instead of
+# being destroyed. The daemon already does the parking itself -- on a live drain it finishes
+# the segment, calls ComfyUI /free and stops claiming (wanly-gpu-daemon#182, main.py:283) --
+# so there is no separate /free to remember.
+#
+# IT WAITS, AND THE WAIT IS THE POINT. `POST /drain` sets the worker to `draining`
+# IMMEDIATELY, and wanly-api refuses an interactive caption only on `online-busy`
+# (app/joycaption.py busy_render_beside_the_captioner). So the instant you drain, the
+# captioner is un-gated -- while the render is still going, on a card that sits at ~23 of
+# 24 GB mid-render. Captioning in that window is exactly the VRAM fight the guard exists to
+# prevent. `pause` blocks until the engine reports nothing in flight, so the window is
+# closed by the time it returns.
+#
+# `caption` MODE is for when you want the box captioning for a long stretch and would rather
+# not have the render stack resident at all; `pause` is for everything else.
 #
 # WHY IT REFUSES WHILE BUSY
 #     Switching means run-worker.sh, and run-worker.sh recreates with `docker rm -f`. That
@@ -45,11 +54,15 @@ ENV_FILE="${WORKER_ENV:-$HERE/worker.env}"
 
 usage() {
     cat <<'USAGE'
-usage: wanly-mode.sh caption|render|status [--force]
+usage: wanly-mode.sh pause|resume|caption|render|status [--force]
+
+  pause     stop claiming, FINISH the segment in flight, park and free the card.
+            No recreate. Queue jobs and caption freely; nothing is lost.
+  resume    start claiming again -- everything queued processes.
 
   status    what the container is running now, and whether it could be switched
-  caption   image-description + face-crop only; queued jobs wait, the GPU is the
-            captioner's alone
+  caption   image-description + face-crop only, via a recreate; for a long
+            captioning stretch where the render stack need not be resident
   render    the full service line back (SERVICES_RENDER in worker.env)
   --force   switch even though the worker is busy. This DESTROYS an in-flight
             segment or training run.
@@ -61,7 +74,7 @@ ACTION=""
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=1 ;;
-        caption|render|status) ACTION="$arg" ;;
+        caption|render|status|pause|resume) ACTION="$arg" ;;
         -h|--help) ACTION="help" ;;
         # A typo must not exit 0. A wrapper that reads `wanly-mode.sh caprion || echo failed`
         # would otherwise be told the switch happened.
@@ -130,6 +143,82 @@ running_services() {
         | sed -n 's/^SERVICES=//p' | head -1
 }
 
+# ---- pause / resume: the drain, without a recreate ------------------------------------
+#
+# This box's worker row, found by FRIENDLY_NAME -- the same way update-worker.sh identifies
+# it. The id is not knowable from the host otherwise, and hand-assembling a UUID into a curl
+# is the reason this path went unused.
+worker_field() {
+    curl -sf --max-time 15 -H "X-API-Key: ${QUEUE_API_KEY:-}" "${QUEUE_URL:-}/workers" 2>/dev/null \
+        | FRIENDLY_NAME="${FRIENDLY_NAME:-}" FIELD="$1" python3 -c '
+import json, os, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+me = [w for w in rows if w.get("friendly_name") == os.environ.get("FRIENDLY_NAME")]
+if not me:
+    raise SystemExit(1)
+v = me[0].get(os.environ["FIELD"])
+print("" if v is None else v)
+'
+}
+
+# How many segments the ENGINE still has. The worker's own status is useless here: `POST
+# /drain` sets it to `draining` immediately, which is precisely the lie this has to see
+# through.
+engine_in_flight() {
+    docker exec "$NAME" curl -s --max-time 10 "http://127.0.0.1:${CONTROL_PORT:-8081}/health" 2>/dev/null \
+        | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+svc = {s.get("name"): s for s in d.get("services", []) if isinstance(s, dict)}
+e = svc.get("ltx-engine-api")
+if e is None: raise SystemExit(4)
+print((e.get("running") or 0) + (e.get("queue_depth") or 0))
+' 2>/dev/null
+}
+
+if [ "$ACTION" = "pause" ] || [ "$ACTION" = "resume" ]; then
+    WID="$(worker_field id)" || {
+        echo "!! could not find a worker named '${FRIENDLY_NAME:-}' in $QUEUE_URL/workers."
+        echo "!! Is the container running and registered? \`$0 status\` shows what it has."
+        exit 1
+    }
+
+    if [ "$ACTION" = "resume" ]; then
+        curl -sf -X DELETE --max-time 15 -H "X-API-Key: ${QUEUE_API_KEY:-}" \
+             "$QUEUE_URL/workers/$WID/drain" >/dev/null || {
+            echo "!! the API refused to cancel the drain"; exit 1; }
+        echo "resumed -- claiming again; anything queued starts now"
+        exit 0
+    fi
+
+    curl -sf -X POST --max-time 15 -H "X-API-Key: ${QUEUE_API_KEY:-}" \
+         "$QUEUE_URL/workers/$WID/drain" >/dev/null || {
+        echo "!! the API refused the drain"; exit 1; }
+    echo "draining $FRIENDLY_NAME -- not claiming any more work."
+
+    # THE WAIT. Without it this returns while the render is still going, and the caption
+    # routes are already un-gated (see the header): a caption then lands on a card that is
+    # ~23 of 24 GB into a render. An unreadable engine is NOT treated as finished.
+    if ! _service_absent "$NAME" ltx-engine; then
+        echo -n "waiting for the segment in flight to finish"
+        while :; do
+            n="$(engine_in_flight)" || n=""
+            [ -n "$n" ] || { echo; echo "!! cannot read the engine -- NOT safe to caption yet."
+                             echo "!! The drain stands; check \`$0 status\` before captioning."; exit 1; }
+            [ "$n" = "0" ] && break
+            echo -n "."
+            sleep 15
+        done
+        echo
+    fi
+    echo "parked -- the daemon has freed the card. Caption away; queued jobs wait."
+    echo "when you are done:  $0 resume"
+    exit 0
+fi
+
 RUNNING="$(running_services)"
 
 if [ "$ACTION" = "status" ]; then
@@ -143,6 +232,8 @@ if [ "$ACTION" = "status" ]; then
     echo "  SERVICES: ${SERVICES:-<unset>}"
     echo "  render:   $(render_line)"
     echo "  caption:  $SERVICES_CAPTION"
+    wstatus="$(worker_field status 2>/dev/null || echo unknown)"
+    echo "worker:     ${wstatus:-unknown}$([ "$wstatus" = draining ] && echo "  (paused -- $0 resume)")"
     reason="$(worker_idle_reason "$NAME")"
     echo "idle gate:  ${reason:-idle -- safe to switch}"
     exit 0
