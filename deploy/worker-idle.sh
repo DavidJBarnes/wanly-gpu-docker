@@ -57,6 +57,18 @@ me = [w for w in rows if w.get("friendly_name") == name]
 print(me[0].get("status") or "unknown" if me else "not-registered")
 ' 2>/dev/null || echo unreadable)
 
+    # `online-idle` is what the RENDER DAEMON publishes, and only it. A container with no
+    # ltx-engine has no daemon, registers itself through the control plane, and sits at a
+    # plain `online` forever -- so requiring online-idle there would refuse every switch OUT
+    # of caption mode, permanently, on the absence of the very service being restored.
+    # Observed on the 3090, 2026-09-25.
+    #
+    # Accepting it is not a hole: with no ltx-engine nothing can claim a segment, and a
+    # training claim is covered by the trainer signal below. What IS lost is an in-flight
+    # CAPTION, which is seconds long and fails one API call rather than a ten-minute render.
+    if [ "$worker_status" = "online" ] && ! _services_include "$name" ltx-engine; then
+        worker_status=online-idle
+    fi
     if [ "$worker_status" != "online-idle" ]; then
         echo "worker status is '$worker_status' (want online-idle)"
         return 0
