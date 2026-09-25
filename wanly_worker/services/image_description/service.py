@@ -108,10 +108,18 @@ PULL_TIMEOUT_S = float(os.environ.get("IMAGE_DESCRIPTION_PULL_TIMEOUT_S", "4800"
 PIN = -1
 DROP = 0
 #: Re-assert the pin on a timer, because a caption request RESETS the model's keep_alive to
-#: whatever that request asked for. Without this a box left in caption mode would unload 15
-#: minutes after its last caption -- the one thing "keep it loaded until I flip back" rules
-#: out. Comfortably inside wanly-api's 15m.
-PIN_INTERVAL_S = 300.0
+#: whatever that request asked for -- and wanly-api sends a DELIBERATELY TINY one.
+#:
+#: Measured on the 3090: IMAGE_DESCRIPTION_KEEP_ALIVE=10s, so the model expires ten seconds
+#: after each caption finishes and any pause longer than that costs a reload. That value is
+#: correct for the case it was chosen for -- a captioner sharing a card with a render must
+#: not squat on VRAM (app/joycaption.py) -- and exactly backwards in caption mode, where
+#: nothing else wants the card.
+#:
+#: So the interval is set against THAT, not against the 15m default in the code: it has to
+#: land inside the smallest keep_alive a caption can set, or the pin loses every race. A
+#: call on a model that is already resident returns immediately and generates nothing.
+PIN_INTERVAL_S = float(os.environ.get("CAPTION_PIN_INTERVAL_S") or "5")
 
 
 async def warm(client, model: str = MODEL, keep_alive: int = PIN) -> bool:
