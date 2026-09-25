@@ -345,3 +345,70 @@ def _clock():
         state["t"] += 20.0
         return state["t"]
     return now
+
+
+# ---------------------------------------------------------------------------------------
+# Warming and dropping the model around a mode switch (#131).
+#
+# The cold load is 88s (measured, qwen3-vl:32b on the 3090). Paid during the switch it is
+# expected; paid inside the first caption it reads as a hung request.
+# ---------------------------------------------------------------------------------------
+
+import asyncio
+
+from wanly_worker.services.image_description import service as imgsvc
+
+
+class _Ollama:
+    def __init__(self, status=200):
+        self.calls = []
+        self._status = status
+
+    async def post(self, url, json=None, timeout=None):
+        self.calls.append((url, json))
+
+        class _R:
+            status_code = self._status
+        return _R()
+
+
+def test_warm_pins_the_model_rather_than_leaving_it_on_a_timer():
+    """-1 is "hold it until told otherwise". Anything else lapses -- which is the one thing
+    "keep it loaded until I flip back" rules out."""
+    o = _Ollama()
+    assert asyncio.run(imgsvc.warm(o)) is True
+    _, body = o.calls[0]
+    assert body["keep_alive"] == -1
+
+
+def test_warm_loads_without_generating():
+    """An empty prompt is the documented way to ask ollama to load a model and return as
+    soon as it is resident."""
+    o = _Ollama()
+    asyncio.run(imgsvc.warm(o))
+    _, body = o.calls[0]
+    assert body["prompt"] == ""
+    assert body["model"] == imgsvc.MODEL
+
+
+def test_release_drops_it_now():
+    o = _Ollama()
+    asyncio.run(imgsvc.release(o))
+    _, body = o.calls[0]
+    assert body["keep_alive"] == 0
+
+
+def test_a_captioner_that_will_not_warm_is_not_fatal():
+    """It still answers requests; the first one just pays the load, which is the old
+    behaviour. Failing the mode switch over a warm-up would be worse than the warm-up."""
+    class _Dead:
+        async def post(self, *a, **k):
+            raise OSError("connection refused")
+
+    assert asyncio.run(imgsvc.warm(_Dead())) is False
+
+
+def test_the_pin_is_reasserted_well_inside_the_api_keep_alive():
+    """Every caption request RESETS the model's keep_alive to its own -- wanly-api sends
+    15m -- so a pin set once at the flip lapses 15 minutes after the last caption."""
+    assert imgsvc.PIN_INTERVAL_S < 15 * 60
