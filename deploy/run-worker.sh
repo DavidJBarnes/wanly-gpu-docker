@@ -39,6 +39,24 @@ done
 # Publishing every port unconditionally is how a box that does not run image-description
 # fails with `port is already allocated` on 11434.
 SERVICES="${SERVICES:-ltx-engine}"
+
+# MODE, the one-word lever (#131). MODE WINS OVER SERVICES when it is set -- it is the
+# coarse choice ("what is this box doing right now"), SERVICES is the fine one ("exactly
+# which services"), and a box that sets both means the coarse one.
+#
+#     MODE=ltx-engine   the full render line, from SERVICES_RENDER
+#     MODE=caption      image-description (+face-crop), from SERVICES_CAPTION
+#
+# Works as an env override too, so a one-off is `MODE=caption ./run-worker.sh` with nothing
+# edited. An unrecognised value is refused rather than defaulted: silently rendering on a box
+# you meant to put on captions is the mistake worth being loud about.
+case "${MODE:-}" in
+    "")         ;;
+    ltx-engine|render)  SERVICES="${SERVICES_RENDER:-ltx-engine}" ;;
+    caption|image-caption|image-description)
+                SERVICES="${SERVICES_CAPTION:-image-description,face-crop}" ;;
+    *) echo "!! MODE=$MODE is not one of: ltx-engine, caption"; exit 1 ;;
+esac
 case ",$SERVICES," in *,lora-trainer,*)       WANT_TRAINER=1 ;; *) WANT_TRAINER=0 ;; esac
 case ",$SERVICES," in *,image-description,*)  WANT_OLLAMA=1 ;;  *) WANT_OLLAMA=0 ;;  esac
 case ",$SERVICES," in *,face-crop,*)          WANT_FACE_CROP=1 ;; *) WANT_FACE_CROP=0 ;; esac

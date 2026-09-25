@@ -630,7 +630,12 @@ def _stage_mode(tmp, *, services=RENDER_LINE, running=SAME_AS_FILE, worker_statu
     # Records the line it was given, so a test can assert what would actually be created.
     (stage / "run-worker.sh").write_text(
         "#!/usr/bin/env bash\n"
-        'echo "RECREATED $(grep ^SERVICES= "$(dirname "$0")/worker.env" | cut -d= -f2-)"\n')
+        'set -a; . "$(dirname "$0")/worker.env"; set +a\n'
+        'case "${MODE:-}" in\n'
+        '  ltx-engine|render) SERVICES="${SERVICES_RENDER:-ltx-engine}" ;;\n'
+        '  caption) SERVICES="${SERVICES_CAPTION:-image-description,face-crop}" ;;\n'
+        'esac\n'
+        'echo "RECREATED $SERVICES"\n')
     (stage / "run-worker.sh").chmod(0o755)
     (stage / "worker.env").write_text(
         "QUEUE_URL=http://api.test:8001\nQUEUE_API_KEY=k\nFRIENDLY_NAME=3090.zero\n"
@@ -651,7 +656,9 @@ class TestTheModeSwitch:
     def test_caption_drops_the_render_stack(self, tmp_path):
         r = _mode(tmp_path, "caption")
         assert "RECREATED image-description,face-crop" in r.stdout, r.stdout
-        assert "\nSERVICES=image-description,face-crop\n" in r.env_file
+        # MODE is the lever that gets written, not its expansion: worker.env then reads as
+        # the choice that was made, and `MODE=caption ./run-worker.sh` does the same thing.
+        assert "\nMODE=caption\n" in r.env_file
 
     def test_caption_records_the_render_line_before_leaving_it(self, tmp_path):
         """SERVICES no longer holds it afterwards. Recorded rather than hardcoded because the
@@ -867,3 +874,76 @@ class TestAPausedBoxIsStillSwitchable:
         API called `draining` sends you looking for the wrong thing."""
         r = _mode(tmp_path, "caption", worker_status="draining", engine_busy=1)
         assert "draining" in r.stdout
+
+
+class TestTheModeFlag:
+    """MODE is the lever David asked for in #131, in those words: mode=ltx-engine |
+    mode=caption. It is read by run-worker.sh, so it works with no wrapper at all --
+    `MODE=caption ./run-worker.sh`."""
+
+    def _run_worker(self, tmp_path, env_lines, **env):
+        stage = tmp_path / "deploy"
+        stage.mkdir(exist_ok=True)
+        shutil.copy(RUN, stage / "run-worker.sh")
+        (stage / "worker.env").write_text(env_lines)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        # Echo the run so the resolved SERVICES is observable; refuse to actually start one.
+        (bin_dir / "docker").write_text('#!/usr/bin/env bash\necho "docker $*"\n')
+        (bin_dir / "docker").chmod(0o755)
+        for stub in ("ss", "nvidia-smi"):
+            (bin_dir / stub).write_text("#!/usr/bin/env bash\nexit 0\n")
+            (bin_dir / stub).chmod(0o755)
+        for d in ("jobs", "models", "models/loras", "ollama", "runs"):
+            (tmp_path / d).mkdir(parents=True, exist_ok=True)
+        e = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]), **env)
+        return subprocess.run(["bash", str(stage / "run-worker.sh")],
+                              capture_output=True, text=True, env=e)
+
+    BASE = ("QUEUE_API_KEY=k\nFRIENDLY_NAME=3090.zero\n"
+            "JOBS_DIR=%s/jobs\nMODELS_DIR=%s/models\nIMAGE=x:full\n"
+            "SERVICES_RENDER=ltx-engine,lora-trainer\nSERVICES_CAPTION=image-description\n")
+
+    def test_mode_caption_picks_the_caption_line(self, tmp_path):
+        r = self._run_worker(tmp_path,
+                             self.BASE % (tmp_path, tmp_path) + "MODE=caption\n"
+                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path)
+        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
+
+    def test_mode_ltx_engine_picks_the_render_line(self, tmp_path):
+        r = self._run_worker(tmp_path,
+                             self.BASE % (tmp_path, tmp_path) + "MODE=ltx-engine\n"
+                             "LORA_RUNS_DIR=%s/runs\n" % tmp_path)
+        assert "SERVICES=ltx-engine,lora-trainer)" in r.stdout, r.stdout + r.stderr
+
+    def test_MODE_WINS_over_an_explicit_SERVICES_line(self, tmp_path):
+        """The coarse choice beats the fine one. A box that sets both means the coarse one --
+        otherwise `MODE=caption` silently renders."""
+        r = self._run_worker(tmp_path,
+                             self.BASE % (tmp_path, tmp_path)
+                             + "SERVICES=ltx-engine,lora-trainer\nMODE=caption\n"
+                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path)
+        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
+
+    def test_it_works_as_a_one_off_env_override_with_no_file_edit(self, tmp_path):
+        r = self._run_worker(tmp_path,
+                             self.BASE % (tmp_path, tmp_path)
+                             + "SERVICES=ltx-engine,lora-trainer\n"
+                             "OLLAMA_HOST_STORE=%s/ollama\n" % tmp_path,
+                             MODE="caption")
+        assert "SERVICES=image-description)" in r.stdout, r.stdout + r.stderr
+
+    def test_no_MODE_leaves_SERVICES_alone(self, tmp_path):
+        r = self._run_worker(tmp_path,
+                             self.BASE % (tmp_path, tmp_path)
+                             + "SERVICES=ltx-engine\n")
+        assert "SERVICES=ltx-engine)" in r.stdout, r.stdout + r.stderr
+
+    def test_an_unrecognised_MODE_is_refused_not_defaulted(self, tmp_path):
+        """Silently rendering on a box you meant to put on captions is the mistake worth
+        being loud about."""
+        r = self._run_worker(tmp_path,
+                             self.BASE % (tmp_path, tmp_path) + "MODE=captions\n")
+        assert r.returncode != 0
+        assert "not one of" in r.stdout
+        assert "docker run" not in r.stdout

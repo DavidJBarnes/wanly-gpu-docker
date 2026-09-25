@@ -219,6 +219,16 @@ if [ "$ACTION" = "pause" ] || [ "$ACTION" = "resume" ]; then
     exit 0
 fi
 
+# What worker.env would give the container on the next recreate -- MODE wins over SERVICES,
+# resolved the same way run-worker.sh resolves it.
+env_services() {
+    case "${MODE:-}" in
+        ltx-engine|render) echo "${SERVICES_RENDER:-ltx-engine}" ;;
+        caption|image-caption|image-description) echo "$SERVICES_CAPTION" ;;
+        *) echo "${SERVICES:-}" ;;
+    esac
+}
+
 RUNNING="$(running_services)"
 
 if [ "$ACTION" = "status" ]; then
@@ -228,8 +238,8 @@ if [ "$ACTION" = "status" ]; then
         echo "container:  $NAME -- mode $(mode_of "$RUNNING")"
         echo "  SERVICES: $RUNNING"
     fi
-    echo "worker.env: mode $(mode_of "${SERVICES:-}")"
-    echo "  SERVICES: ${SERVICES:-<unset>}"
+    echo "worker.env: MODE=${MODE:-<unset>} -> mode $(mode_of "$(env_services)")"
+    echo "  SERVICES: $(env_services)"
     echo "  render:   $(render_line)"
     echo "  caption:  $SERVICES_CAPTION"
     wstatus="$(worker_field status 2>/dev/null || echo unknown)"
@@ -250,7 +260,7 @@ else
     WANT="$SERVICES_CAPTION"
 fi
 
-if [ "$RUNNING" = "$WANT" ] && [ "${SERVICES:-}" = "$WANT" ]; then
+if [ "$RUNNING" = "$WANT" ] && [ "$(env_services)" = "$WANT" ]; then
     echo "already in $ACTION mode (SERVICES=$WANT) -- nothing to do"
     exit 0
 fi
@@ -271,12 +281,16 @@ if [ "$FORCE" != "1" ]; then
     fi
 fi
 
-# Record the render line BEFORE leaving render mode -- afterwards SERVICES no longer holds it.
+# Record the render line BEFORE leaving render mode -- afterwards nothing else holds it.
 if [ "$ACTION" = "caption" ] && [ -z "${SERVICES_RENDER:-}" ] && [ -n "$(render_line)" ]; then
     set_env_line SERVICES_RENDER "$(render_line)"
     echo "recorded SERVICES_RENDER=$(render_line) in $ENV_FILE"
 fi
 
-set_env_line SERVICES "$WANT"
-echo "worker.env: SERVICES=$WANT -- recreating $NAME"
+# MODE is the lever run-worker.sh reads; SERVICES stays as the box's own fine-grained line.
+# Writing MODE rather than expanding it means worker.env reads as the choice that was made,
+# and `MODE=caption ./run-worker.sh` by hand does exactly the same thing.
+MODE_VALUE="$([ "$ACTION" = "caption" ] && echo caption || echo ltx-engine)"
+set_env_line MODE "$MODE_VALUE"
+echo "worker.env: MODE=$MODE_VALUE (SERVICES=$WANT) -- recreating $NAME"
 "$HERE/run-worker.sh"
