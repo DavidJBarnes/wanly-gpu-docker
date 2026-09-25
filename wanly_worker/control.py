@@ -61,10 +61,6 @@ _mode_lock = asyncio.Lock()
 #: error while the box is quietly doing exactly what was asked.
 _pending: str | None = None
 _mode_error: str | None = None
-#: Re-asserts the captioner's keep_alive while the box is in caption mode. A caption
-#: request resets it to whatever that request asked for (wanly-api sends 15m), so a pin set
-#: once at the flip would lapse 15 minutes after the last caption.
-_pin_task: asyncio.Task | None = None
 #: Held so the task is not garbage collected mid-switch. asyncio keeps only a weak
 #: reference, and a collected task stops the box half-flipped.
 _mode_task: asyncio.Task | None = None
@@ -168,26 +164,15 @@ class ModeRequest(BaseModel):
     mode: str
 
 
-async def _pin_captioner() -> None:
-    """Hold the caption model on the card for as long as the box is in caption mode."""
-    from wanly_worker.services import image_description as imgdesc
-    while True:
-        await asyncio.sleep(imgdesc.service.PIN_INTERVAL_S)
-        await imgdesc.service.warm(_client)
-
-
 async def _switch(target: str, names: list[str]) -> None:
     """Do the switch, off the request. Never raises: it has no caller left to raise to."""
-    global _mode, _pending, _mode_error, _pin_task
+    global _mode, _pending, _mode_error
     from wanly_worker.services import image_description as imgdesc
     try:
         async with _mode_lock:
             # LEAVING caption mode: drop the model BEFORE the render stack comes back, or
             # ComfyUI starts against a card a 20 GB captioner is still holding. That is the
             # collision in the other direction, and it is the one that costs a render.
-            if _pin_task is not None:
-                _pin_task.cancel()
-                _pin_task = None
             if target != "caption" and _mode == "caption":
                 await imgdesc.service.release(_client)
 
@@ -207,7 +192,6 @@ async def _switch(target: str, names: list[str]) -> None:
             # resets the model's keep_alive to its own.
             if target == "caption":
                 await imgdesc.service.warm(_client)
-                _pin_task = asyncio.create_task(_pin_captioner())
         print(f"mode: now {target} ({','.join(names)})", flush=True)
     except Exception as e:                      # noqa: BLE001 -- reported, not swallowed
         _mode_error = str(e)

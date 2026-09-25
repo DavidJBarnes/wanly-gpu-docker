@@ -347,11 +347,9 @@ class TestTheCaptionModelAroundASwitch:
         _post_and_settle("ltx-engine")
         assert list(imgsvc) == before
 
-    def test_the_pin_stops_when_the_box_leaves_caption_mode(self, sup, imgsvc, monkeypatch):
-        """A pin outliving caption mode would re-pin a 20 GB model onto a rendering card
-        every five minutes."""
+    def test_the_flip_warms_ONCE_and_does_not_keep_poking(self, sup, imgsvc):
+        """A periodic re-assert cost far more than the reload it prevented -- see
+        test_there_is_no_periodic_pin. One warm at the switch, then wanly-api's keep_alive
+        governs, which is where that decision belongs."""
         _post_and_settle("caption")
-        assert control._pin_task is not None
-        monkeypatch.setattr(control, "_mode", "caption")
-        _post_and_settle("ltx-engine")
-        assert control._pin_task is None
+        assert [c for c in imgsvc if c[0] == "warm"] == [("warm", -1)]
