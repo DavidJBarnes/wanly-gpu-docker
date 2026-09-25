@@ -107,19 +107,16 @@ PULL_TIMEOUT_S = float(os.environ.get("IMAGE_DESCRIPTION_PULL_TIMEOUT_S", "4800"
 #: own (wanly-api sends 15m). -1 means "hold it until told otherwise"; 0 means "drop it now".
 PIN = -1
 DROP = 0
-#: Re-assert the pin on a timer, because a caption request RESETS the model's keep_alive to
-#: whatever that request asked for -- and wanly-api sends a DELIBERATELY TINY one.
-#:
-#: Measured on the 3090: IMAGE_DESCRIPTION_KEEP_ALIVE=10s, so the model expires ten seconds
-#: after each caption finishes and any pause longer than that costs a reload. That value is
-#: correct for the case it was chosen for -- a captioner sharing a card with a render must
-#: not squat on VRAM (app/joycaption.py) -- and exactly backwards in caption mode, where
-#: nothing else wants the card.
-#:
-#: So the interval is set against THAT, not against the 15m default in the code: it has to
-#: land inside the smallest keep_alive a caption can set, or the pin loses every race. A
-#: call on a model that is already resident returns immediately and generates nothing.
-PIN_INTERVAL_S = float(os.environ.get("CAPTION_PIN_INTERVAL_S") or "5")
+# NO PERIODIC PIN. The first version re-asserted keep_alive every 5s so a caption could not
+# shorten it. Measured on the 3090 it made things WORSE by a wide margin: ollama runs
+# OLLAMA_NUM_PARALLEL=1, so every pin took a turn in the single slot and disturbed the model
+# between captions. Caption times climbed 25-35s -> 42s -> 54s -> 64s -> 86s and then a 500,
+# against the 6-10s page-cache reload the pin was there to avoid. Paying a minute a caption
+# to save ten seconds occasionally is not a trade worth making.
+#
+# The flip still warms with PIN, so the box is ready when the switch lands. From the first
+# caption onward wanly-api's keep_alive governs, which is where that decision belongs -- see
+# image_description_keep_alive there.
 
 
 async def warm(client, model: str = MODEL, keep_alive: int = PIN) -> bool:

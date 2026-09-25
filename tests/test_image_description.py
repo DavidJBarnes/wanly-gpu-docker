@@ -408,22 +408,9 @@ def test_a_captioner_that_will_not_warm_is_not_fatal():
     assert asyncio.run(imgsvc.warm(_Dead())) is False
 
 
-def test_the_pin_lands_inside_the_SMALLEST_keep_alive_a_caption_can_set():
-    """Not the 15m default in the code -- the live one. Measured on the 3090,
-    IMAGE_DESCRIPTION_KEEP_ALIVE=10s, so the model expires ten seconds after each caption
-    and a pin on a slower timer loses every race. Sizing this against the default rather
-    than the deployed value is the bug this replaces."""
-    assert imgsvc.PIN_INTERVAL_S < 10, "a 10s keep_alive would expire before the next pin"
-
-
-def test_the_interval_is_overridable_without_a_rebuild():
-    """The value it has to beat lives in another repo's env, so a box whose captioner is
-    configured differently must be able to say so."""
-    import importlib, os
-    os.environ["CAPTION_PIN_INTERVAL_S"] = "2.5"
-    try:
-        importlib.reload(imgsvc)
-        assert imgsvc.PIN_INTERVAL_S == 2.5
-    finally:
-        del os.environ["CAPTION_PIN_INTERVAL_S"]
-        importlib.reload(imgsvc)
+def test_there_is_no_periodic_pin():
+    """A 5s re-assert made captions WORSE by a wide margin. ollama runs NUM_PARALLEL=1, so
+    every pin took a turn in the single slot and disturbed the model between captions:
+    25-35s climbed to 42s, 54s, 64s, 86s and then a 500 -- against the 6-10s page-cache
+    reload it was there to avoid. Warming on the flip is kept; re-asserting forever is not."""
+    assert not hasattr(imgsvc, "PIN_INTERVAL_S")
