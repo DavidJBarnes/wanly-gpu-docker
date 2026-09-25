@@ -288,3 +288,70 @@ def test_health_carries_the_switch_in_progress(monkeypatch):
     _, body = _get()
     assert body["mode"] == "ltx-engine"
     assert body["pending_mode"] == "caption"
+
+
+class TestTheCaptionModelAroundASwitch:
+    """Warm on the way in, drop on the way out, and the ORDER of the drop is what matters:
+    a 20 GB captioner still resident when ComfyUI starts is 20 GB the renderer does not
+    have -- the same collision as captioning beside a render, pointed the other way."""
+
+    @pytest.fixture
+    def imgsvc(self, monkeypatch):
+        from wanly_worker.services.image_description import service as s
+        calls = []
+
+        async def warm(client, model=s.MODEL, keep_alive=s.PIN):
+            calls.append(("warm", keep_alive))
+            return True
+
+        async def release(client, model=s.MODEL):
+            calls.append(("release", s.DROP))
+            return True
+
+        monkeypatch.setattr(s, "warm", warm)
+        monkeypatch.setattr(s, "release", release)
+        return calls
+
+    def test_entering_caption_mode_warms_the_model(self, sup, imgsvc):
+        _post_and_settle("caption")
+        assert ("warm", -1) in imgsvc, "the first caption would pay the 88s cold load"
+
+    def test_leaving_caption_mode_drops_it_BEFORE_the_stack_starts(self, sup, imgsvc,
+                                                                   monkeypatch):
+        monkeypatch.setattr(control, "_mode", "caption")
+        order = []
+
+        async def apply(groups, client):
+            order.append("apply")
+        monkeypatch.setattr(sup, "apply", apply)
+
+        from wanly_worker.services.image_description import service as s
+
+        async def release(client, model=s.MODEL):
+            order.append("release")
+            return True
+        monkeypatch.setattr(s, "release", release)
+
+        _post_and_settle("ltx-engine")
+        assert order == ["release", "apply"], \
+            "ComfyUI started while the captioner still held the card"
+
+    def test_entering_render_mode_from_render_mode_drops_nothing(self, sup, imgsvc,
+                                                                 monkeypatch):
+        """Nothing was pinned, so there is nothing to drop -- and an unload here would be a
+        pointless round trip on every no-op."""
+        monkeypatch.setattr(control, "_mode", "caption")
+        _post_and_settle("ltx-engine")
+        before = list(imgsvc)
+        monkeypatch.setattr(control, "_mode", "ltx-engine")
+        _post_and_settle("ltx-engine")
+        assert list(imgsvc) == before
+
+    def test_the_pin_stops_when_the_box_leaves_caption_mode(self, sup, imgsvc, monkeypatch):
+        """A pin outliving caption mode would re-pin a 20 GB model onto a rendering card
+        every five minutes."""
+        _post_and_settle("caption")
+        assert control._pin_task is not None
+        monkeypatch.setattr(control, "_mode", "caption")
+        _post_and_settle("ltx-engine")
+        assert control._pin_task is None
