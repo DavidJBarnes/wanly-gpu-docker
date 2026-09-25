@@ -73,6 +73,19 @@ _MODE_ALIASES = {"render": "ltx-engine", "engine": "ltx-engine",
                  "image-caption": "caption", "image-description": "caption"}
 
 
+def canonical_mode(raw: str | None) -> str:
+    """The mode's one true spelling, so callers compare modes and not spellings.
+
+    Unset is `ltx-engine`: a box with no MODE runs everything, which IS render mode. Saying
+    so explicitly keeps "am I already in this mode?" a string comparison rather than a
+    special case for empty.
+    """
+    mode = (raw or "").strip().lower()
+    if not mode:
+        return "ltx-engine"
+    return _MODE_ALIASES.get(mode, mode)
+
+
 def select_mode(names: list[str], raw: str | None) -> list[str]:
     """Narrow `names` to the services MODE asks for. Unset means all of them.
 

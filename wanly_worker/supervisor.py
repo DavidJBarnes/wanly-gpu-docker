@@ -42,6 +42,10 @@ class ServiceState:
         self.ready = False
         self.error: str | None = None
         self.started_at: float | None = None
+        #: Stopped BY US, by a mode change -- not a crash. The watchdog takes the container
+        #: down when a service exits, which is right for a service that died and fatal for
+        #: one we asked to stop. This is the whole difference between the two.
+        self.stopped = False
 
     def snapshot(self) -> dict:
         running = self.proc is not None and self.proc.returncode is None
@@ -58,6 +62,9 @@ class ServiceState:
             "exit_code": self.proc.returncode if self.proc else None,
             "uptime_s": round(time.time() - self.started_at) if self.started_at else None,
             "error": self.error,
+            # Off on purpose, so /health does not read as a fault. A reader that cannot tell
+            # "not running" from "not supposed to be running" reports a healthy box as broken.
+            "stopped": self.stopped,
             **self.service.details(),
         }
 
@@ -183,6 +190,8 @@ class Supervisor:
         while True:
             await asyncio.sleep(5)
             for st in self.states:
+                if st.stopped:
+                    continue          # we asked for this one to be gone
                 if st.proc is not None and st.proc.returncode is not None:
                     st.ready = False
                     st.error = f"exited with {st.proc.returncode}"
@@ -191,6 +200,54 @@ class Supervisor:
                           f"stopping the container so Docker restarts it", flush=True)
                     os.kill(os.getpid(), signal.SIGTERM)
                     return
+
+    # ------------------------------------------------------------------ mode
+
+    async def apply(self, groups: list[str], client) -> None:
+        """Make the running set match `groups` (SERVICES names), in place.
+
+        This is the whole point of the control plane: flipping what a box is doing without
+        recreating the container. A recreate costs a boot and a model re-stage -- minutes --
+        which is long enough that nobody flips, which is how a box ends up locked into one
+        job. In place it is seconds.
+
+        STOPS BEFORE STARTS, deliberately: the two sets share one GPU, and starting the
+        captioner beside a render that has not exited yet is the VRAM collision the whole
+        arrangement exists to avoid.
+
+        Stop order is reversed for the same reason `stop()` reverses it -- the daemon stops
+        claiming before the engine it drives goes away.
+        """
+        wanted = set(groups)
+        for st in reversed(self.states):
+            if (st.service.group or st.service.name) in wanted:
+                continue
+            await self._stop_one(st)
+        for st in self.states:
+            if (st.service.group or st.service.name) not in wanted:
+                continue
+            if st.proc is not None and st.proc.returncode is None:
+                continue          # already up
+            st.stopped = False
+            st.error = None
+            await self._start_one(st, client)
+
+    async def _stop_one(self, st: ServiceState) -> None:
+        """Stop one service and MARK IT, so the watchdog does not read it as a crash."""
+        # Marked BEFORE the terminate, not after: the watchdog runs on its own task and a
+        # 5 s tick landing between the two would take the container down.
+        st.stopped = True
+        st.ready = False
+        if st.proc is None or st.proc.returncode is not None:
+            return
+        print(f"stopping {st.service.name} (mode change)", flush=True)
+        st.proc.terminate()
+        try:
+            await asyncio.wait_for(st.proc.wait(), timeout=st.service.stop_grace_s)
+        except asyncio.TimeoutError:
+            print(f"{st.service.name} ignored SIGTERM — killing it", flush=True)
+            st.proc.kill()
+            await st.proc.wait()
 
     # ----------------------------------------------------------------- stop
 

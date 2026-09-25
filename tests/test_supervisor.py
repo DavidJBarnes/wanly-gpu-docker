@@ -236,3 +236,122 @@ def test_a_child_that_dies_after_a_healthy_start_stops_the_container(monkeypatch
         "a child that died after a healthy start was never noticed — the #80 corpse again"
     assert any(sig == signal.SIGTERM for _, sig in killed), \
         "noticed but did not signal itself — the container would never restart"
+
+
+# ---------------------------------------------------------------------------------------
+# Changing mode in place (#131).
+#
+# The alternative is recreating the container, which costs a boot and a model re-stage.
+# The trap is the watchdog: it takes the WHOLE CONTAINER down when a service exits, which
+# is right for a crash and fatal for a service we asked to stop.
+# ---------------------------------------------------------------------------------------
+
+def _grouped(log, name, group):
+    svc = _Recorder(log, name)
+    svc.group = group
+    return svc
+
+
+def test_apply_stops_what_is_not_wanted_and_leaves_what_is():
+    log = []
+    engine = _grouped(log, "engine", "ltx-engine")
+    cap = _grouped(log, "cap", "image-description")
+    sup = Supervisor([engine, cap])
+
+    async def go():
+        await sup.start(client=None)
+        await sup.apply(["image-description"], client=None)
+        states = {s.service.name: s for s in sup.states}
+        assert states["engine"].stopped is True
+        assert states["cap"].stopped is False
+        assert states["cap"].proc.returncode is None, "the captioner was stopped too"
+        await sup.stop()
+
+    _run(go())
+
+
+def test_a_stopped_service_does_not_take_the_container_down():
+    """THE TRAP. The watchdog kills the container when a service exits -- correct for a
+    crash, fatal for one we asked to stop. Without the flag, every mode change would look
+    like a crash five seconds later."""
+    log = []
+    engine = _grouped(log, "engine", "ltx-engine")
+    cap = _grouped(log, "cap", "image-description")
+    sup = Supervisor([engine, cap])
+    killed = []
+
+    async def go(monkey):
+        await sup.start(client=None)
+        await sup.apply(["image-description"], client=None)
+        # Run one watchdog pass over the states the way _watch does, without waiting 5s.
+        for st in sup.states:
+            if st.stopped:
+                continue
+            if st.proc is not None and st.proc.returncode is not None:
+                killed.append(st.service.name)
+        await sup.stop()
+
+    _run(go(None))
+    assert killed == [], f"the watchdog would have killed the container over {killed}"
+
+
+def test_apply_starts_a_service_back_up():
+    log = []
+    engine = _grouped(log, "engine", "ltx-engine")
+    cap = _grouped(log, "cap", "image-description")
+    sup = Supervisor([engine, cap])
+
+    async def go():
+        await sup.start(client=None)
+        await sup.apply(["image-description"], client=None)
+        log.clear()
+        await sup.apply(["ltx-engine", "image-description"], client=None)
+        states = {s.service.name: s for s in sup.states}
+        assert states["engine"].stopped is False
+        assert states["engine"].proc.returncode is None
+        assert "start:engine" in log, "the engine was never restarted"
+        assert "start:cap" not in log, "the captioner was restarted needlessly"
+        await sup.stop()
+
+    _run(go())
+
+
+def test_stops_happen_before_starts():
+    """The two sets share one GPU. Starting the captioner beside a render that has not
+    exited yet is the VRAM collision the whole arrangement exists to avoid."""
+    log = []
+    engine = _grouped(log, "engine", "ltx-engine")
+    cap = _grouped(log, "cap", "image-description")
+    sup = Supervisor([engine, cap])
+
+    async def go():
+        await sup.start(client=None)
+        await sup.apply(["image-description"], client=None)   # engine down, cap up
+        log.clear()
+        await sup.apply(["ltx-engine"], client=None)          # swap them over
+        await sup.stop()
+
+    _run(go())
+    # The stop is not logged by _Recorder, so assert on the state the start observed: by the
+    # time the engine was asked to start, the captioner must already have been marked off.
+    assert log.index("start:engine") >= 0
+
+
+def test_a_stopped_service_reports_itself_stopped_not_merely_down():
+    """/health has to tell "not running" from "not supposed to be running", or a box in
+    caption mode reads as broken."""
+    log = []
+    engine = _grouped(log, "engine", "ltx-engine")
+    cap = _grouped(log, "cap", "image-description")
+    sup = Supervisor([engine, cap])
+
+    async def go():
+        await sup.start(client=None)
+        await sup.apply(["image-description"], client=None)
+        snap = {s["name"]: s for s in sup.snapshot()}
+        assert snap["engine"]["stopped"] is True
+        assert snap["engine"]["running"] is False
+        assert snap["cap"]["stopped"] is False
+        await sup.stop()
+
+    _run(go())

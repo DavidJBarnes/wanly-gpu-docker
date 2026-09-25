@@ -12,12 +12,14 @@ services/joycaption.py for why that is the right trade today.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from wanly_worker import registry
 from wanly_worker.queue_client import QueueClient, export_identity
@@ -41,6 +43,17 @@ def _code_ref() -> str:
 _sup: Supervisor | None = None
 _queue: QueueClient | None = None
 _poller = None
+#: Everything SERVICES said this box is equipped to run, and which subset is live. The
+#: capability list never changes for the life of the container; the mode does.
+_equipped: list[str] = []
+_mode: str = ""
+#: The lifespan's client, kept so POST /mode can use it for readiness probes. Starting a
+#: service means waiting for it to answer, which needs one.
+_client: httpx.AsyncClient | None = None
+#: One mode change at a time. Two overlapping flips interleave stops and starts and can
+#: leave the box with the render stack half up beside the captioner -- the exact collision
+#: the stop-before-start ordering exists to prevent.
+_mode_lock = asyncio.Lock()
 
 
 @contextlib.asynccontextmanager
@@ -55,12 +68,15 @@ async def lifespan(app: FastAPI):
     global _sup
     print(f"=== wanly-gpu-docker === image build: {BUILD} | code: {_code_ref()}", flush=True)
     try:
+        global _equipped, _mode
         equipped = registry.parse_services(os.environ.get("SERVICES"))
+        _equipped = equipped
         # MODE narrows what actually runs; SERVICES stays the box's own capability line, so
         # the switch is `docker run -e MODE=caption` and nothing has to remember the full
         # list to put back afterwards.
         names = registry.select_mode(equipped, os.environ.get("MODE"))
         mode = (os.environ.get("MODE") or "").strip()
+        _mode = registry.canonical_mode(os.environ.get("MODE"))
         print(f"SERVICES={','.join(names)}"
               + (f"  (MODE={mode} of {','.join(equipped)})" if mode else ""), flush=True)
         # Before any child starts: the render daemon reads these from its env and registers
@@ -77,6 +93,8 @@ async def lifespan(app: FastAPI):
         _fatal(e)
         raise
     async with httpx.AsyncClient() as client:
+        global _client
+        _client = client
         try:
             await _sup.start(client)
         except Exception as e:
@@ -132,6 +150,46 @@ def _fatal(e: Exception) -> None:
 app = FastAPI(title="wanly-gpu-docker", lifespan=lifespan)
 
 
+class ModeRequest(BaseModel):
+    mode: str
+
+
+@app.post("/mode")
+async def set_mode(body: ModeRequest):
+    """Change what this box is doing, WITHOUT recreating the container.
+
+    `MODE` as an env var can only be set when a container is created, so every flip through
+    it costs a `docker run`: a boot and a model re-stage, minutes each way. That is long
+    enough that nobody flips, which is how a box ends up locked into whichever job it
+    happened to start on. This does it in place, in seconds.
+
+    The mode is not persisted. A container that restarts comes back on its env MODE, which
+    is the right default: the flip is a thing you are doing right now, and a box that came
+    back from a crash still captioning -- because of a curl someone made on Tuesday -- is a
+    silently idle queue. `docker restart` is the way back to the declared state.
+    """
+    if _sup is None or _client is None:
+        raise HTTPException(status_code=503, detail="not started")
+    try:
+        names = registry.select_mode(_equipped, body.mode)
+    except registry.ConfigError as e:
+        # The caller's fault, and every one of them is actionable text: an unknown mode, or
+        # a mode that would leave this box running nothing.
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    global _mode
+    # Serialised: see _mode_lock. Held across the whole apply, so a second caller waits for
+    # a coherent box rather than racing into the middle of one.
+    async with _mode_lock:
+        if registry.canonical_mode(body.mode) == _mode:
+            return {"mode": _mode, "services": names, "changed": False}
+        print(f"mode: {_mode or 'ltx-engine'} -> {registry.canonical_mode(body.mode)} "
+              f"({','.join(names)})", flush=True)
+        await _sup.apply(names, _client)
+        _mode = registry.canonical_mode(body.mode)
+    return {"mode": _mode, "services": names, "changed": True}
+
+
 @app.get("/health")
 async def health():
     """503 when something it was asked to run is not answering.
@@ -142,9 +200,16 @@ async def health():
     unreadable status as busy rather than idle.
     """
     services = _sup.snapshot() if _sup else []
-    ok = bool(services) and all(s["ready"] for s in services)
+    # A service stopped ON PURPOSE is not a fault. Without this, every box in caption mode
+    # answers 503 and every probe that keys on the status code calls it dead.
+    live = [s for s in services if not s.get("stopped")]
+    ok = bool(live) and all(s["ready"] for s in live)
     body = {
         "status": "ok" if ok else "degraded",
+        # What this box CAN do and what it is doing, so a caller can offer the other mode
+        # without knowing anything about this container.
+        "equipped": _equipped,
+        "mode": _mode,
         "build": BUILD,
         "code": _code_ref(),
         "services": services,
