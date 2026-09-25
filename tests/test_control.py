@@ -353,3 +353,105 @@ class TestTheCaptionModelAroundASwitch:
         governs, which is where that decision belongs."""
         _post_and_settle("caption")
         assert [c for c in imgsvc if c[0] == "warm"] == [("warm", -1)]
+
+
+class TestSwitchingToRenderWaitsForCaptions:
+    """THE SYMMETRIC HALF. Switching TO captions already waits for the segment in flight --
+    the render daemon is allowed to finish what it started. Switching to render waited for
+    nothing, so a caption mid-flight raced ComfyUI loading its models on the same card.
+
+    One GPU doing one job at a time has to mean both directions or it means neither.
+    """
+
+    @pytest.fixture
+    def flow(self, sup, monkeypatch):
+        """Records the order of the three things the switch does."""
+        order = []
+        from wanly_worker.services.image_description import service as imgsvc
+
+        async def apply(groups, client):
+            order.append("start-render")
+        monkeypatch.setattr(sup, "apply", apply)
+
+        async def release(client, model=imgsvc.MODEL):
+            order.append("drop-model")
+            return True
+        monkeypatch.setattr(imgsvc, "release", release)
+
+        async def warm(client, model=imgsvc.MODEL, keep_alive=imgsvc.PIN):
+            return True
+        monkeypatch.setattr(imgsvc, "warm", warm)
+
+        monkeypatch.setattr(control, "_mode", "caption")
+        monkeypatch.setattr(control, "CAPTION_DRAIN_TIMEOUT_S", 100.0)
+        return order
+
+    def test_it_waits_for_the_queue_to_empty(self, flow, monkeypatch):
+        depths = iter([2, 1, 0])
+        seen = []
+
+        async def depth():
+            d = next(depths, 0)
+            seen.append(d)
+            flow.append(f"check:{d}")
+            return d
+        monkeypatch.setattr(control, "_caption_queue_depth", depth)
+        monkeypatch.setattr(control.asyncio, "sleep", _no_sleep)
+
+        _post_and_settle("ltx-engine")
+        assert seen == [2, 1, 0]
+        assert flow.index("check:0") < flow.index("drop-model"), \
+            "the model was dropped while captions were still running"
+        assert flow.index("drop-model") < flow.index("start-render")
+
+    def test_an_empty_queue_does_not_wait_at_all(self, flow, monkeypatch):
+        async def depth():
+            return 0
+        monkeypatch.setattr(control, "_caption_queue_depth", depth)
+
+        _post_and_settle("ltx-engine")
+        assert flow == ["drop-model", "start-render"]
+
+    def test_an_API_that_will_not_answer_does_not_block_the_switch(self, flow, monkeypatch):
+        """An older API has no such endpoint. Blocking every switch on a question nothing
+        answers would make the mode unusable."""
+        async def depth():
+            return None
+        monkeypatch.setattr(control, "_caption_queue_depth", depth)
+
+        _post_and_settle("ltx-engine")
+        assert flow == ["drop-model", "start-render"]
+
+    def test_a_wedged_captioner_does_not_hold_the_box_forever(self, flow, monkeypatch):
+        """Loud, and then proceed. A queue that never empties must not mean a box that can
+        never render again."""
+        async def depth():
+            return 5
+        monkeypatch.setattr(control, "_caption_queue_depth", depth)
+        monkeypatch.setattr(control.asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(control, "CAPTION_DRAIN_TIMEOUT_S", 1.0)
+
+        _post_and_settle("ltx-engine")
+        assert "start-render" in flow, "the switch never completed"
+
+    def test_switching_TO_caption_does_not_wait_for_captions(self, sup, monkeypatch):
+        """There is nothing to drain in that direction -- the captioner is what is being
+        turned on. Asking would be a pointless round trip on every flip."""
+        asked = []
+
+        async def depth():
+            asked.append(1)
+            return 0
+        monkeypatch.setattr(control, "_caption_queue_depth", depth)
+        from wanly_worker.services.image_description import service as imgsvc
+
+        async def warm(client, model=imgsvc.MODEL, keep_alive=imgsvc.PIN):
+            return True
+        monkeypatch.setattr(imgsvc, "warm", warm)
+
+        _post_and_settle("caption")
+        assert asked == []
+
+
+async def _no_sleep(_s):
+    return None
