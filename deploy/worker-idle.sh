@@ -40,7 +40,7 @@
 # Echoes NOTHING when the worker is safe to recreate, and a one-line reason when it is not.
 # The reason is the message the caller prints, so it reads the same wherever it is refused.
 worker_idle_reason() {
-    local name="$1" worker_status busy training
+    local name="$1" worker_status reported busy training
 
     worker_status=$(curl -sf --max-time 15 -H "X-API-Key: ${QUEUE_API_KEY:-}" \
                       "${QUEUE_URL:-}/workers" 2>/dev/null \
@@ -56,6 +56,7 @@ me = [w for w in rows if w.get("friendly_name") == name]
 # recreating then interrupts model staging.
 print(me[0].get("status") or "unknown" if me else "not-registered")
 ' 2>/dev/null || echo unreadable)
+    reported="$worker_status"
 
     # `online-idle` is what the RENDER DAEMON publishes, and only it. A container with no
     # ltx-engine has no daemon, registers itself through the control plane, and sits at a
@@ -67,6 +68,17 @@ print(me[0].get("status") or "unknown" if me else "not-registered")
     # training claim is covered by the trainer signal below. What IS lost is an in-flight
     # CAPTION, which is seconds long and fails one API call rather than a ten-minute render.
     if [ "$worker_status" = "online" ] && _service_absent "$name" ltx-engine; then
+        worker_status=online-idle
+    fi
+    # `draining` means NOT CLAIMING ANY MORE WORK -- which is a stronger statement than
+    # online-idle, not a weaker one. What it does not say is whether the segment already in
+    # flight has finished, and that is the engine's signal below, which still has to pass.
+    # A re-register preserves a drain (wanly-api workers.py reregistered_drain_state), so a
+    # recreate here brings the box back still parked rather than claiming.
+    #
+    # Without this, a box paused for captioning (`wanly-mode.sh pause`) could never be
+    # switched or updated -- refused forever on a status it was deliberately put into.
+    if [ "$worker_status" = "draining" ]; then
         worker_status=online-idle
     fi
     if [ "$worker_status" != "online-idle" ]; then
@@ -113,7 +125,7 @@ print((e.get("running") or 0) + (e.get("queue_depth") or 0))
     if [ "$busy" != "0" ]; then
         # The daemon said idle and the engine disagrees. Believe the engine: a failed status
         # push is a known mode, and being wrong here costs a render.
-        echo "the engine reports $busy job(s) in flight despite status '$worker_status'"
+        echo "the engine reports $busy job(s) in flight despite status '$reported'"
         return 0
     fi
 

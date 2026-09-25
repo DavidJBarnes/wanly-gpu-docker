@@ -774,3 +774,96 @@ class TestTheGateDoesNotStrandABoxInCaptionMode:
         r = _mode(tmp_path, "caption", running=None, engine_busy=None)
         assert r.returncode == 1, r.stdout
         assert "RECREATED" not in r.stdout
+
+
+class TestPauseAndResume:
+    """The no-recreate path (#131 follow-up): stop claiming, let the segment finish, park.
+
+    This is the one that answers "let me caption while jobs are queued", so the thing worth
+    pinning is the WAIT -- without it `pause` returns while the render is still running, and
+    wanly-api has already stopped refusing captions (it refuses only on `online-busy`, and
+    `POST /drain` sets `draining` immediately). A caption then lands on a card that is ~23 of
+    24 GB into a render.
+    """
+
+    @staticmethod
+    def _curl(stage_bin, *, status="online-busy", engine_calls_before_idle=1):
+        """A curl that answers /workers, and logs the drain calls it is asked to make."""
+        (stage_bin / "curl").write_text(
+            "#!/usr/bin/env bash\n"
+            'for a in "$@"; do case "$a" in *"/drain")'
+            ' echo "$*" >> "%s"; echo "{}"; exit 0 ;; esac; done\n' % (stage_bin / "drain.log")
+            + "echo '[{\"id\":\"w-1\",\"friendly_name\":\"3090.zero\",\"status\":\"%s\"}]'\n" % status)
+        (stage_bin / "curl").chmod(0o755)
+
+    def _run(self, tmp_path, *args, status="online-busy", engine_busy=0, services=None):
+        bin_dir, stage = _stage_mode(
+            tmp_path, worker_status=status, engine_busy=engine_busy,
+            **({"running": services} if services is not None else {}))
+        self._curl(bin_dir, status=status)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
+        r = subprocess.run(["bash", str(stage / "wanly-mode.sh"), *args],
+                           capture_output=True, text=True, env=env)
+        log = bin_dir / "drain.log"
+        r.drain = log.read_text() if log.exists() else ""   # type: ignore[attr-defined]
+        return r
+
+    def test_pause_drains_the_worker_by_its_own_id(self, tmp_path):
+        """The id is looked up from FRIENDLY_NAME. Hand-assembling a UUID into a curl is why
+        this path went unused."""
+        r = self._run(tmp_path, "pause")
+        assert "POST" in r.drain and "/workers/w-1/drain" in r.drain, r.drain
+
+    def test_pause_reports_parked_once_the_engine_is_clear(self, tmp_path):
+        r = self._run(tmp_path, "pause", engine_busy=0)
+        assert r.returncode == 0
+        assert "parked" in r.stdout
+
+    def test_pause_does_NOT_claim_parked_while_the_engine_is_unreadable(self, tmp_path):
+        """THE SAFETY. An unreadable engine is not a finished one, and saying "caption away"
+        there is the whole hazard this command exists to close."""
+        r = self._run(tmp_path, "pause", engine_busy=None)
+        assert r.returncode == 1
+        assert "parked" not in r.stdout
+        assert "NOT safe to caption" in r.stdout
+
+    def test_pause_still_drains_even_when_it_cannot_confirm(self, tmp_path):
+        """Refusing to drain would leave the box claiming MORE work, which is worse than a
+        drain it could not confirm. The drain stands; only the all-clear is withheld."""
+        r = self._run(tmp_path, "pause", engine_busy=None)
+        assert "/workers/w-1/drain" in r.drain
+
+    def test_a_caption_mode_box_has_no_engine_to_wait_for(self, tmp_path):
+        r = self._run(tmp_path, "pause", engine_busy=None, services="image-description")
+        assert r.returncode == 0
+        assert "parked" in r.stdout
+
+    def test_resume_cancels_the_drain(self, tmp_path):
+        r = self._run(tmp_path, "resume", status="draining")
+        assert r.returncode == 0
+        assert "DELETE" in r.drain and "/workers/w-1/drain" in r.drain, r.drain
+
+
+class TestAPausedBoxIsStillSwitchable:
+    """`draining` means NOT CLAIMING ANY MORE WORK -- stronger than online-idle, not weaker.
+
+    Without this a box paused for captioning could never be switched or updated: refused
+    forever on a status it was deliberately put into.
+    """
+
+    def test_a_parked_box_may_be_switched(self, tmp_path):
+        r = _mode(tmp_path, "caption", worker_status="draining", engine_busy=0)
+        assert "RECREATED" in r.stdout, r.stdout
+
+    def test_but_not_while_its_last_segment_is_still_rendering(self, tmp_path):
+        """What `draining` does NOT say is whether the segment already in flight has
+        finished. That is the engine's signal, and it still has to pass."""
+        r = _mode(tmp_path, "caption", worker_status="draining", engine_busy=1)
+        assert r.returncode == 1
+        assert "RECREATED" not in r.stdout
+
+    def test_the_refusal_names_the_status_the_api_actually_reported(self, tmp_path):
+        """Not the one the gate synthesised -- "despite status 'online-idle'" on a box the
+        API called `draining` sends you looking for the wrong thing."""
+        r = _mode(tmp_path, "caption", worker_status="draining", engine_busy=1)
+        assert "draining" in r.stdout
