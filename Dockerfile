@@ -160,8 +160,9 @@ ENV COMFY_PORT=8188 \
 # detects systemd, creates a user and writes a unit, none of which means anything here, and
 # always installs latest. The 0.20.x assets are .tar.zst, hence zstd.
 #
-# FACE-CROP needs nothing extra: insightface is already in the lean image for identity
-# scoring, and onnxruntime-gpu provides the CPU provider it uses.
+# FACE-CROP: insightface is already in the lean image for identity scoring. Its onnxruntime
+# is NOT inherited any more -- the onnxruntime-gpu that used to provide it left with
+# ReActor/FaceFusion (#132) -- so the CPU build is pinned in wanly_worker/requirements.txt.
 ARG WITH_TRAINER=0
 ARG TRAINER_COMMIT=e194f1f
 ARG OLLAMA_VERSION=0.20.2
