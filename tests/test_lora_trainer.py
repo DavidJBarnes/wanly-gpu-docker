@@ -1204,3 +1204,380 @@ class TestThreeGroups:
         toml = (run / "dataset.toml").read_text()
         assert toml.count("[[datasets]]") == 3
         assert 'image_directory = "%s/data2"' % run in toml
+
+
+# ------------------------------------------------------------------------------------------
+# #145: the job names its base checkpoint, captions are per image, repeats are per group.
+# ------------------------------------------------------------------------------------------
+
+def _img_dir(tmp_path, name, n):
+    d = tmp_path / name
+    d.mkdir()
+    for i in range(n):
+        (d / f"{i:02d}.jpg").write_bytes(b"x")
+    return str(d)
+
+
+class _Stop(Exception):
+    pass
+
+
+def _run_until_preflight(monkeypatch, tmp_path, req):
+    """Drive app._run up to the preflight and stop there: everything this section asserts is
+    decided before the GPU is ever asked for. Returns (job, what preflight saw, acquired)."""
+    from wanly_worker.services.lora_trainer import app as app_mod
+    from wanly_worker.services.lora_trainer import jobs as J
+    from wanly_worker.services.lora_trainer import pipeline
+    monkeypatch.setattr(J, "STATE_DIR", tmp_path / ".trainer")
+    monkeypatch.setattr(app_mod, "STORE", J.Store())
+    seen, acquired = {}, []
+
+    def preflight(job):
+        seen.update(base=job.base_checkpoint, per_epoch=job.per_epoch)
+
+    async def acquire(*a, **k):
+        acquired.append(1)
+        raise _Stop()
+    monkeypatch.setattr(pipeline, "preflight", preflight)
+    monkeypatch.setattr(app_mod.gpu, "acquire", acquire)
+    job = J.Job(id="t145", character="pay", trigger="p@y", version=1, steps=req.steps)
+    _run(app_mod._run(job, req))
+    return job, seen, acquired
+
+
+class TestTheBaseCheckpointIsTheJobs:
+    """#145: the base a LoRA trains against is the job's choice (config.base_checkpoint), and
+    the default is 10Eros -- the base the LoRAs are rendered on -- not ltx-2.3-22b-dev."""
+
+    def test_a_bare_name_resolves_inside_the_models_mount(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import recipe
+        monkeypatch.setattr(recipe, "MODELS_DIR", "/m")
+        want = "/m/ltx-2.3/diffusion_models/10Eros_v1.5_bf16.safetensors"
+        assert recipe.checkpoint_path("10Eros_v1.5_bf16") == want
+        assert recipe.checkpoint_path("10Eros_v1.5_bf16.safetensors") == want, \
+            "the extension is tolerated, never doubled"
+
+    def test_no_name_falls_back_to_the_default(self, monkeypatch):
+        """A legacy row retried after the upgrade carries no base_checkpoint."""
+        from wanly_worker.services.lora_trainer import recipe
+        monkeypatch.setattr(recipe, "CKPT", "/env/override.safetensors")
+        assert recipe.checkpoint_path(None) == "/env/override.safetensors"
+        assert recipe.checkpoint_path("  ") == "/env/override.safetensors"
+
+    def test_the_default_is_10eros_not_dev(self):
+        import os
+        from wanly_worker.services.lora_trainer import recipe
+        assert recipe.DEFAULT_BASE_CHECKPOINT == "10Eros_v1.5_bf16"
+        if "LTX_BASE_CKPT" not in os.environ:
+            assert recipe.CKPT.endswith("/ltx-2.3/diffusion_models/10Eros_v1.5_bf16.safetensors")
+        assert "ltx-2.3-22b-dev" not in recipe.CKPT
+
+    @pytest.mark.parametrize("name", ["../etc/passwd", "a/b", "/abs/x", ".hidden"])
+    def test_a_path_shaped_name_is_refused(self, name):
+        """The name arrives from the queue; it must not be able to point the trainer at an
+        arbitrary file."""
+        from wanly_worker.services.lora_trainer import recipe
+        with pytest.raises(ValueError):
+            recipe.checkpoint_path(name)
+
+    def test_the_train_command_takes_the_base_from_the_job_config(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import recipe
+        monkeypatch.setattr(recipe, "MODELS_DIR", "/m")
+        cmd = recipe.train_cmd(Path("/tmp/r"), "x", 1, {"base_checkpoint": "other_bf16"})
+        assert cmd[cmd.index("--ltx2_checkpoint") + 1] == \
+            "/m/ltx-2.3/diffusion_models/other_bf16.safetensors"
+        # And nothing else moves: the version check is what proved 10Eros is a 2.3 base.
+        assert cmd[cmd.index("--ltx_version") + 1] == "2.3"
+        assert cmd[cmd.index("--ltx_version_check_mode") + 1] == "error"
+
+    def test_all_three_stages_name_the_same_base(self, monkeypatch, tmp_path):
+        """Latents cached against one base and trained against another finishes cleanly and
+        learns the wrong thing."""
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+        argvs = []
+
+        class P:
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*argv, **kw):
+            argvs.append(list(argv))
+            return P()
+        monkeypatch.setattr(pipeline.asyncio, "create_subprocess_exec", fake_exec)
+        run = tmp_path / "run"
+        (run / "logs").mkdir(parents=True)
+        job = Job(id="j", character="x", trigger="x", version=1, steps=1200,
+                  base_checkpoint="/m/ltx-2.3/diffusion_models/10Eros_v1.5_bf16.safetensors")
+        _run(pipeline.train(job, run, {"steps": 1200}))
+        assert len(argvs) == 3
+        got = {a[a.index("--ltx2_checkpoint") + 1] for a in argvs}
+        assert got == {job.base_checkpoint}
+
+    def test_preflight_names_the_missing_base_and_where_it_looked(self, monkeypatch, tmp_path):
+        from wanly_worker.services.lora_trainer import pipeline, recipe
+        from wanly_worker.services.lora_trainer.jobs import Job
+        gemma = tmp_path / "gemma"
+        gemma.mkdir()
+        monkeypatch.setattr(recipe, "GEMMA", str(gemma))
+        job = Job(id="j", character="x", trigger="x", version=1, steps=1200,
+                  base_checkpoint=str(tmp_path / "nope_bf16.safetensors"))
+        with pytest.raises(pipeline.PipelineError) as e:
+            pipeline.preflight(job)
+        assert "'nope_bf16'" in str(e.value) and str(tmp_path) in str(e.value)
+
+    def test_the_run_resolves_and_logs_the_base_before_preflight(self, monkeypatch, tmp_path,
+                                                                  capsys):
+        from wanly_worker.services.lora_trainer import app as app_mod
+        from wanly_worker.services.lora_trainer import recipe
+        monkeypatch.setattr(recipe, "MODELS_DIR", "/m")
+        req = app_mod.TrainRequest(character="pay", trigger="p@y",
+                                   image_dir=_img_dir(tmp_path, "i", 2),
+                                   config={"base_checkpoint": "10Eros_v1.5_bf16"})
+        job, seen, _ = _run_until_preflight(monkeypatch, tmp_path, req)
+        want = "/m/ltx-2.3/diffusion_models/10Eros_v1.5_bf16.safetensors"
+        assert seen["base"] == want and job.base_checkpoint == want
+        assert f"base checkpoint {want}" in capsys.readouterr().out
+
+    def test_a_legacy_job_gets_the_default_and_says_so(self, monkeypatch, tmp_path, capsys):
+        from wanly_worker.services.lora_trainer import app as app_mod
+        from wanly_worker.services.lora_trainer import recipe
+        monkeypatch.setattr(recipe, "CKPT", "/d/default.safetensors")
+        req = app_mod.TrainRequest(character="pay", trigger="p@y",
+                                   image_dir=_img_dir(tmp_path, "i", 2))
+        job, seen, _ = _run_until_preflight(monkeypatch, tmp_path, req)
+        assert seen["base"] == "/d/default.safetensors"
+        assert "the default applies" in capsys.readouterr().out
+
+    def test_run_worker_forwards_the_override_only_when_set(self):
+        import pathlib
+        s = (pathlib.Path(__file__).parent.parent / "deploy/run-worker.sh").read_text()
+        assert 'if [ -n "${LTX_BASE_CKPT:-}" ]' in s
+        assert 'TRAINER_ENV_ARGS+=(-e "LTX_BASE_CKPT=$LTX_BASE_CKPT")' in s
+        assert '"${TRAINER_ENV_ARGS[@]}"' in s
+
+
+class TestPerImageCaptions:
+    """#145: a caption describes ITS image. The lists are parallel to the download URLs, so a
+    mismatch is a refusal -- one short would caption every later image with the wrong text."""
+
+    def _job(self):
+        from wanly_worker.services.lora_trainer.jobs import Job
+        return Job(id="j", character="pay", trigger="p@y", version=1, steps=1200)
+
+    def test_each_image_gets_its_own_caption(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        run = _run(pipeline.stage(self._job(), [
+            {"images": [("a.jpg", b"x"), ("b.png", b"y")], "num_repeats": 10,
+             "captions": ["p@y, woman, close-up", "p@y, woman, full body"]},
+            {"images": [("c.jpg", b"z")], "num_repeats": 2, "kind": "regularization",
+             "captions": ["a man standing in a kitchen"]},
+        ]))
+        assert (run / "data" / "sel_000.txt").read_text() == "p@y, woman, close-up\n"
+        assert (run / "data" / "sel_001.txt").read_text() == "p@y, woman, full body\n"
+        assert (run / "data" / "sel_001.png").read_bytes() == b"y"
+        assert (run / "data1" / "sel_000.txt").read_text() == "a man standing in a kitchen\n"
+
+    def test_a_length_mismatch_is_refused_before_anything_is_written(self):
+        from wanly_worker.services.lora_trainer import pipeline, recipe
+        job = self._job()
+        with pytest.raises(pipeline.PipelineError, match="2 images but 1 captions"):
+            _run(pipeline.stage(job, [
+                {"images": [("a.jpg", b"x"), ("b.jpg", b"y")], "num_repeats": 10,
+                 "captions": ["only one"]}]))
+        assert not recipe.run_dir(job.character, job.version).exists()
+
+    def test_an_empty_caption_is_refused(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        with pytest.raises(pipeline.PipelineError, match="empty captions at \\[1\\]"):
+            _run(pipeline.stage(self._job(), [
+                {"images": [("a.jpg", b"x"), ("b.jpg", b"y")], "num_repeats": 10,
+                 "captions": ["fine", "  "]}]))
+
+    def test_the_new_shape_has_no_silent_fallback(self):
+        """A regularization group with no trigger must not be captioned "p@y, woman"."""
+        from wanly_worker.services.lora_trainer import pipeline
+        with pytest.raises(pipeline.PipelineError, match="no per-image captions"):
+            _run(pipeline.stage(self._job(), [
+                {"images": [("a.jpg", b"x")], "num_repeats": 10, "captions": ["p@y, woman"]},
+                {"images": [("c.jpg", b"z")], "num_repeats": 1, "kind": "regularization",
+                 "caption": None}]))
+
+    def test_a_legacy_job_keeps_its_single_caption_and_fallback(self):
+        """A row from before #145, retried: no lists anywhere, so it stages as it always did."""
+        from wanly_worker.services.lora_trainer import pipeline
+        run = _run(pipeline.stage(self._job(), [
+            {"images": [("a.jpg", b"x"), ("b.jpg", b"y")], "num_repeats": 10,
+             "caption": "p@y, woman"},
+            {"images": [("c.jpg", b"z")], "num_repeats": 10, "caption": None}]))
+        assert (run / "data" / "sel_001.txt").read_text() == "p@y, woman\n"
+        assert (run / "data1" / "sel_000.txt").read_text() == "p@y, woman\n"
+
+    def test_a_mismatch_fails_the_job_before_the_gpu_is_asked_for(self, monkeypatch, tmp_path):
+        from wanly_worker.services.lora_trainer import app as app_mod
+        req = app_mod.TrainRequest(character="pay", trigger="p@y",
+                                   image_dir=_img_dir(tmp_path, "i", 3),
+                                   captions=["a", "b"])
+        job, _, acquired = _run_until_preflight(monkeypatch, tmp_path, req)
+        assert job.phase == "failed" and "3 images but 2 captions" in job.error
+        assert acquired == []
+
+    def test_the_run_passes_every_groups_captions_to_stage(self, monkeypatch, tmp_path):
+        from wanly_worker.services.lora_trainer import app as app_mod
+        from wanly_worker.services.lora_trainer import pipeline
+        staged = []
+
+        async def stage(job, groups):
+            staged.extend(groups)
+            raise _Stop()
+        monkeypatch.setattr(pipeline, "stage", stage)
+        req = app_mod.TrainRequest(
+            character="pay", trigger="p@y", image_dir=_img_dir(tmp_path, "i", 2),
+            captions=["c0", "c1"],
+            identities=[{"image_dir": _img_dir(tmp_path, "r", 1), "kind": "regularization",
+                         "trigger": None, "captions": ["r0"], "num_repeats": 1}])
+        _run_until_preflight(monkeypatch, tmp_path, req)
+        assert [g["captions"] for g in staged] == [["c0", "c1"], ["r0"]]
+        assert [g["kind"] for g in staged] == ["identity", "regularization"]
+
+    def test_the_claim_carries_captions_and_kind_through(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import app as app_mod
+        from wanly_worker.services.lora_trainer import poller as mod
+        monkeypatch.setattr(mod, "QUEUE_URL", "http://q")
+        monkeypatch.setattr(mod, "QUEUE_API_KEY", "k")
+        monkeypatch.setattr(mod, "_log", lambda m: None)
+        row = {
+            "id": "row-145-abcdef", "character": "pay", "trigger": "p@y", "version": 2,
+            "download_urls": ["u0", "u1"], "captions": ["c0", "c1"],
+            "config": {"base_checkpoint": "10Eros_v1.5_bf16", "steps": 1200},
+            "identities": [{"character": None, "trigger": None, "gender": None,
+                            "caption": "legacy", "captions": ["r0"], "kind": "regularization",
+                            "num_repeats": 1, "dataset_name": "reg", "download_urls": ["r"]}],
+        }
+
+        class R:
+            status_code = 200
+
+            def __init__(self, body):
+                self._b = body
+
+            def json(self):
+                return self._b
+
+        class C:
+            async def get(self, *a, **k):
+                return R(row)
+
+            async def patch(self, *a, **k):
+                return R({})
+
+        class S:
+            def claim_slot(self):
+                return True
+
+            def all(self):
+                return []
+
+            def add(self, job):
+                pass
+        got = []
+
+        async def fake_run(job, req, on_progress=None):
+            got.append(req)
+        monkeypatch.setattr(app_mod, "STORE", S())
+        monkeypatch.setattr(app_mod, "_run", fake_run)
+        p = mod.Poller(client=C(), worker_id_getter=lambda: "w")
+
+        async def go():
+            await p.tick()
+            await asyncio.sleep(0)
+        _run(go())
+        req = got[0]
+        assert req.captions == ["c0", "c1"]
+        assert req.config["base_checkpoint"] == "10Eros_v1.5_bf16"
+        g = req.identities[0]
+        assert g["captions"] == ["r0"] and g["kind"] == "regularization"
+        assert g["num_repeats"] == 1 and g["image_urls"] == ["r"]
+
+    def test_a_legacy_claim_leaves_captions_absent_not_empty(self):
+        """[] would read as "a list of zero captions" and fail every legacy retry."""
+        import inspect
+        from wanly_worker.services.lora_trainer import poller as mod
+        src = inspect.getsource(mod.Poller.tick)
+        assert 'captions=row.get("captions")' in src
+        assert '"captions": g.get("captions")' in src
+
+
+class TestRepeatsArePerGroup:
+    """#145: a regularization pool rides at its own repeats, so an epoch is the SUM of
+    images x repeats per group -- never total images x 10."""
+
+    def test_samples_per_epoch_sums_the_groups(self):
+        from wanly_worker.services.lora_trainer.recipe import samples_per_epoch
+        assert samples_per_epoch([(50, 10), (200, 1)]) == 700
+        assert samples_per_epoch([(13, None)]) == 130, "None is the recipe default"
+
+    def test_estimated_epochs_takes_the_real_figure(self):
+        from wanly_worker.services.lora_trainer.recipe import estimated_epochs
+        # 250 images x 10 would say 0 -> 1 epoch; the real 700/epoch says 3.
+        assert estimated_epochs(250, 2100, per_epoch=700) == 3
+        # The old signature still gives the old answer.
+        assert estimated_epochs(50, 1200) == 2
+
+    def test_the_toml_carries_each_groups_repeats(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+        job = Job(id="j", character="pay", trigger="p@y", version=1, steps=1200)
+        run = _run(pipeline.stage(job, [
+            {"images": [("a.jpg", b"x")], "num_repeats": 10, "captions": ["a"]},
+            {"images": [("b.jpg", b"y")], "num_repeats": 2, "captions": ["b"],
+             "kind": "regularization"}]))
+        toml = (run / "dataset.toml").read_text()
+        assert toml.count("num_repeats = 10") == 1 and toml.count("num_repeats = 2") == 1
+
+    def test_zero_repeats_is_refused(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+        job = Job(id="j", character="pay", trigger="p@y", version=1, steps=1200)
+        with pytest.raises(pipeline.PipelineError, match="num_repeats"):
+            _run(pipeline.stage(job, [
+                {"images": [("a.jpg", b"x")], "num_repeats": 0, "captions": ["a"]}]))
+
+    def test_the_run_records_the_real_epoch(self, monkeypatch, tmp_path):
+        from wanly_worker.services.lora_trainer import app as app_mod
+        req = app_mod.TrainRequest(
+            character="pay", trigger="p@y", image_dir=_img_dir(tmp_path, "i", 5),
+            config={"num_repeats": 10},
+            identities=[{"image_dir": _img_dir(tmp_path, "r", 20), "kind": "regularization",
+                         "num_repeats": 1}])
+        job, seen, _ = _run_until_preflight(monkeypatch, tmp_path, req)
+        assert job.samples_per_epoch == 5 * 10 + 20 * 1
+        assert seen["per_epoch"] == 70
+        assert job.images == 25
+
+    def test_the_epoch_steps_reported_use_the_real_epoch(self, tmp_path):
+        from wanly_worker.services.lora_trainer import poller as mod
+        from wanly_worker.services.lora_trainer import recipe
+        from wanly_worker.services.lora_trainer.jobs import Job
+        job = Job(id="j", character="pay", trigger="p@y", version=1, steps=2100, images=250,
+                  samples_per_epoch=700, loss_log=[[700, 0.5], [1400, 0.4]])
+        out = recipe.run_dir("pay", 1) / "output"
+        out.mkdir(parents=True)
+        for n in ("pay_v1-000001", "pay_v1-000002", "pay_v1"):
+            _real_safetensors(out / f"{n}.comfy.safetensors")
+        epochs = mod.Poller(client=None, worker_id_getter=lambda: "w")._epochs(job)
+        assert [(e["label"], e["step"]) for e in epochs] == \
+            [("e01", 700), ("e02", 1400), ("final", 2100)]
+        assert epochs[1]["loss"] == 0.4
+
+    def test_a_job_persisted_before_145_keeps_its_old_arithmetic(self):
+        """The state file has effective_repeats and no samples_per_epoch; it must load, and
+        report steps exactly as it did."""
+        from wanly_worker.services.lora_trainer.jobs import Job
+        old = {"id": "j", "character": "x", "trigger": "x", "version": 1, "steps": 1200,
+               "images": 50, "effective_repeats": None, "phase": "completed"}
+        job = Job(**old)
+        assert job.per_epoch == 500
+        assert Job(**{**old, "effective_repeats": 5}).per_epoch == 250

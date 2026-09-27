@@ -144,15 +144,20 @@ class Poller:
         _log(f"claimed {row['character']} v{row['version']} ({len(row['download_urls'])} images)")
         # THE EXTRA GROUPS (#102, #106). `identities` rides the claim response only for a
         # joint run; ABSENT for every single-identity job, so this maps to [] and the
-        # trainer's stage() writes the one-group shape it always has. Each entry keeps its
-        # own caption -- an identity group's is "<trigger>, <gender>", a composition group's
-        # names the people in its frames.
+        # trainer's stage() writes the one-group shape it always has.
+        #
+        # CAPTIONS ARE PER IMAGE (#145): `captions` is a list parallel to each group's
+        # download_urls (group 0's is top-level). Passed through untouched -- the length check
+        # belongs to stage(), which sees the images, and "absent" must stay None rather than
+        # become [] so a legacy row retried after the upgrade keeps its single `caption`.
         identities = [
             {
                 "character": g.get("character"),
                 "trigger": g.get("trigger"),
+                "kind": g.get("kind"),
                 "image_urls": g.get("download_urls") or [],
                 "caption": g.get("caption"),
+                "captions": g.get("captions"),
                 "num_repeats": g.get("num_repeats"),
             }
             for g in (row.get("identities") or [])
@@ -161,6 +166,7 @@ class Poller:
             character=row["character"], trigger=row["trigger"], version=row["version"],
             image_urls=row["download_urls"],
             caption=(row.get("config") or {}).get("caption"),
+            captions=row.get("captions"),
             identities=identities,
             steps=(row.get("config") or {}).get("steps") or 1200,
             config=row.get("config") or {},
@@ -341,11 +347,12 @@ class Poller:
     def _epochs(self, job: Job) -> list[dict]:
         """Every checkpoint on disk, with the step it was written at and the loss then.
 
-        The step is arithmetic -- an epoch is images x num_repeats samples -- and the loss is
-        the nearest point of the curve at or before it. Reported whether or not the file is
-        uploaded, so the console can list the ones that stayed behind and offer them.
+        The step is arithmetic -- an epoch is the sum over groups of images x THAT group's
+        num_repeats (#145), not total images x 10 -- and the loss is the nearest point of the
+        curve at or before it. Reported whether or not the file is uploaded, so the console
+        can list the ones that stayed behind and offer them.
         """
-        per_epoch = max(1, job.images * recipe.DEFAULTS["num_repeats"])
+        per_epoch = job.per_epoch
         out = []
         for path in self._local_checkpoints(job):
             label = _label(path)

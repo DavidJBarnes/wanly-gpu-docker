@@ -42,11 +42,16 @@ class LoraTrainer(Service):
                 f"no trainer at {recipe.TRAINER_PYTHON}. This image was built without "
                 f"WITH_TRAINER=1 — the lean :latest tag carries the render stack only, and "
                 f"the trainer needs the :full tag (IMAGE=davidjbarnes/wanly-gpu-docker:full).")
-        for label, path in (("base checkpoint", recipe.CKPT), ("Gemma", recipe.GEMMA)):
+        # The DEFAULT base (#145: 10Eros, or LTX_BASE_CKPT). A job may name another, and
+        # pipeline.preflight checks that one per job -- this proves the mount is there and the
+        # fallback a legacy job would use is on it.
+        for label, path in (("default base checkpoint", recipe.CKPT), ("Gemma", recipe.GEMMA)):
             if not Path(path).exists():
                 raise PreflightError(
                     f"{label} is not at {path}. It is bind-mounted from the host "
-                    f"(-v <host models>:{recipe.MODELS_DIR}:ro); the image does not carry it.")
+                    f"(-v <host models>:{recipe.MODELS_DIR}:ro); the image does not carry it."
+                    + (" LTX_BASE_CKPT overrides the default." if label.endswith("checkpoint")
+                       else ""))
         # THE CARD MUST BE VISIBLE TO TORCH, not just to nvidia-smi. After the host rebooted
         # on 2026-09-08 the container came back under its restart policy with the device
         # gone -- nvidia-smi listed it, torch said "No CUDA GPUs are available" -- and the

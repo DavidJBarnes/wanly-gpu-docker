@@ -63,6 +63,7 @@ case ",$SERVICES," in *,face-crop,*)          WANT_FACE_CROP=1 ;; *) WANT_FACE_C
 
 MOUNTS=()
 PORTS=()
+TRAINER_ENV_ARGS=()
 if [ "$WANT_TRAINER" = "1" ] || [ "$WANT_OLLAMA" = "1" ]; then
     # Both live in the :full layer. The lean tag fails in the trainer's preflight after a
     # pull, which is a slow way to learn a one-line mistake -- refuse by name, and BEFORE
@@ -80,6 +81,13 @@ if [ "$WANT_TRAINER" = "1" ]; then
     # Run directories writable, because that is where the checkpoints land. The models tree
     # is already mounted read-only below and the trainer reads the base checkpoint from it.
     MOUNTS+=(-v "$LORA_RUNS_DIR:/loras")
+    # The trainer's FALLBACK base checkpoint (#145) -- a CONTAINER path, under
+    # /workspace/models. A job's config.base_checkpoint wins over it; this only applies to a
+    # job that names none, and replaces the image's default (10Eros). Forwarded only when set,
+    # so an unset line leaves the default in the code rather than pinning an empty path.
+    if [ -n "${LTX_BASE_CKPT:-}" ]; then
+        TRAINER_ENV_ARGS+=(-e "LTX_BASE_CKPT=$LTX_BASE_CKPT")
+    fi
 fi
 if [ "$WANT_OLLAMA" = "1" ]; then
     : "${OLLAMA_HOST_STORE:?image-description is enabled — set OLLAMA_HOST_STORE in $ENV_FILE}"
@@ -202,6 +210,7 @@ docker run -d \
     -e "COMFYUI_PATH=" \
     -e "LORA_CACHE_DIR=/workspace/models/loras" \
     "${DEV_ENV_ARGS[@]}" \
+    "${TRAINER_ENV_ARGS[@]}" \
     "$IMAGE"
 
 echo "started: $(docker inspect -f '{{.Id}}' "$NAME" | cut -c1-12) on $(docker inspect -f '{{.Image}}' "$NAME" | cut -c8-19)"

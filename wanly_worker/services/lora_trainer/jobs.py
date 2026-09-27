@@ -30,9 +30,19 @@ class Job:
     version: int
     steps: int
     images: int = 0
-    #: The repeats the disk estimate applies: max across identity groups (#102). None for
-    #: single-identity runs, where recipe.DEFAULTS applies — the same estimate as before.
+    #: SUPERSEDED by samples_per_epoch (#145) -- a max across groups is a guess once groups
+    #: repeat differently. Kept, and still read as the fallback, because Job(**json) refuses an
+    #: unknown key: dropping the field would make every state file written before this change
+    #: unloadable, and a state file that will not load is a finished run nobody can publish.
     effective_repeats: int | None = None
+    #: One epoch in samples: SUM over groups of images x that group's repeats (#145). What the
+    #: disk gate and the per-checkpoint step arithmetic read. 0 on a job persisted before it
+    #: existed, which falls back to images x effective_repeats -- the old estimate, unchanged.
+    samples_per_epoch: int = 0
+    #: The base checkpoint FILE this run trains against, resolved from config.base_checkpoint
+    #: (#145). Recorded because it is the first thing to check about a LoRA that came out
+    #: wrong, and the config only holds the name that was asked for.
+    base_checkpoint: str = ""
     #: pending | staging | training | collecting | completed | failed | cancelled
     phase: str = "pending"
     step: int = 0
@@ -53,6 +63,14 @@ class Job:
     cancel_requested: bool = False
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
+
+    @property
+    def per_epoch(self) -> int:
+        """Samples per epoch: the real per-group figure when the run recorded one, else the
+        uniform estimate every job before #145 was reported with."""
+        if self.samples_per_epoch:
+            return self.samples_per_epoch
+        return max(1, self.images * (self.effective_repeats or recipe.DEFAULTS["num_repeats"]))
 
     @property
     def done(self) -> bool:

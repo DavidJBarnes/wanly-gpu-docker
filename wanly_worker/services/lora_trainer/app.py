@@ -41,12 +41,17 @@ class TrainRequest(BaseModel):
     image_urls: list[str] = Field(default_factory=list)
     image_dir: str = ""
     caption: str | None = None
-    #: THE EXTRA GROUPS (#102, #106). ABSENT means single-identity, which every run before
-    #: this is. Each entry: {character, trigger, gender, caption, image_urls, num_repeats}
-    #: -- presigned by the API alongside group 0's. An IDENTITY group has a trigger and its
-    #: caption is "<trigger>, <gender>"; a COMPOSITION group (#106) has no trigger and its
-    #: caption names the people in its frames, which is what teaches the model they appear
-    #: together. The claim builds the list; a POST body may also give it directly.
+    #: PER-IMAGE CAPTIONS for group 0 (#145), parallel to image_urls. Present, it replaces
+    #: `caption`; absent (a legacy row, retried), `caption` applies to every image as before.
+    captions: list[str] | None = None
+    #: THE EXTRA GROUPS (#102, #106, #145). ABSENT means single-identity. Each entry:
+    #: {character, trigger, gender, caption, captions, kind, image_urls, num_repeats} --
+    #: presigned by the API alongside group 0's. `kind` is identity | composition |
+    #: regularization. An IDENTITY group has a trigger; a COMPOSITION group (#106) has none
+    #: and its captions name the people in its frames, which is what teaches the model they
+    #: appear together; a REGULARIZATION group has none either and usually its own, lower
+    #: num_repeats. `captions` is per image, parallel to image_urls; `caption` is the legacy
+    #: one-for-all string. The claim builds the list; a POST body may also give it directly.
     identities: list[dict] = Field(default_factory=list)
     steps: int = Field(default=1200, ge=100, le=30000)
     config: dict = Field(default_factory=dict)
@@ -196,9 +201,10 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
             # The stage call takes the whole list so per-group captions and dirs stay paired
             # -- separate stage calls would mean separate dataset.toml writes, and the last
             # one would win.
-            groups = [{"images": images, "caption": req.caption,
-                       "num_repeats": (req.config or {}).get("num_repeats")
-                       or recipe.DEFAULTS["num_repeats"]}]
+            groups = [{"images": images, "caption": req.caption, "captions": req.captions,
+                       "kind": "identity",
+                       "num_repeats": int((req.config or {}).get("num_repeats")
+                                          or recipe.DEFAULTS["num_repeats"])}]
             for gi, g in enumerate(req.identities):
                 g_urls = g.get("image_urls") or []
                 if not g_urls and g.get("image_dir"):
@@ -213,14 +219,28 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
                 groups.append({
                     "images": g_images,
                     "caption": g.get("caption"),
-                    "num_repeats": g.get("num_repeats")
-                    or recipe.DEFAULTS["num_repeats"],
+                    "captions": g.get("captions"),
+                    "kind": g.get("kind"),
+                    "num_repeats": int(g.get("num_repeats")
+                                       or recipe.DEFAULTS["num_repeats"]),
                 })
                 job.images += len(g_images)
+            # THE REAL EPOCH, per group (#145). A regularization pool rides at its own repeats,
+            # so "total images x one repeats" is wrong in both directions: the disk gate
+            # over- or under-counts checkpoints, and every epoch's reported step is off.
+            job.samples_per_epoch = recipe.samples_per_epoch(
+                [(len(g["images"]), g["num_repeats"]) for g in groups])
             if req.identities:
-                # The disk gate reads repeats x total images; every group counts, and mixed
-                # repeats across groups would make the estimate a guess.
+                # Still written for anything that reads a job snapshot's old field.
                 job.effective_repeats = max(g["num_repeats"] for g in groups)
+            # THE BASE THIS RUN TRAINS AGAINST (#145), from the job, said out loud. It used to
+            # be one constant for every run; now two runs on the same box can differ, and a
+            # LoRA that came out wrong has to be traceable to the base it was trained on.
+            job.base_checkpoint = recipe.checkpoint_path(
+                (req.config or {}).get("base_checkpoint"))
+            pipeline._log(job, f"base checkpoint {job.base_checkpoint}"
+                               + ("" if (req.config or {}).get("base_checkpoint")
+                                  else " (the job names none; the default applies)"))
             pipeline.preflight(job)
             run = await pipeline.stage(job, groups)
             # SAY SO. Nothing reported between the claim and the first training step left the
