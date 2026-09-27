@@ -76,7 +76,8 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
             char_lora: str | None = None, char_s1: float = 0.8, char_s2: float = 1.5,
             char_loras: list | None = None,
             content_loras: list | None = None,
-            img_compression: int | None = None) -> dict:
+            img_compression: int | None = None,
+            text_to_video: bool = False) -> dict:
     """Patch the validated graph with this render's configuration.
 
     Values only, never topology — the graph template is the validated recipe and this moves
@@ -86,6 +87,13 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     in slot order -- for a shot with two people in it (console#473). `char_lora/char_s1/
     char_s2` remain as the one-character shorthand every existing caller uses, and produce
     the identical graph: a single character is `char_loras=[that one]`.
+
+    `text_to_video` (#145) renders with NO start frame: node 290, the graph's own "Text To
+    Video (no image ref)" switch, bypasses both LTXVImgToVideoInplace nodes (160/161), so
+    nothing conditions on `image_name`. The LoadImage at 167 stays -- the graph derives its
+    latent size from that image resized to 292/293, so the caller hands it a blank frame of
+    exactly width x height and the size is the requested one. Still values only: the switch
+    is a value the validated graph already carries, which is why this needs no new topology.
     """
     g = json.loads(json.dumps(graph))
     ck = checkpoint or DEFAULT_CHECKPOINT
@@ -98,6 +106,11 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
     g["167"]["inputs"]["image"] = image_name
     g["292"]["inputs"]["value"] = int(width)
     g["293"]["inputs"]["value"] = int(height)
+    # WRITTEN EITHER WAY, not only when True. The template ships false, so an image render
+    # hashes exactly as it did; but a template re-exported with the switch left on would
+    # otherwise turn every image-conditioned render into text-to-video, silently -- the start
+    # frame would be uploaded, logged and ignored.
+    g["290"]["inputs"]["value"] = bool(text_to_video)
     # Conditioning-frame CRF. `is not None` rather than truthiness: 0 is a real setting that
     # bypasses the encode, and `if img_compression:` would silently ignore it.
     if img_compression is not None:

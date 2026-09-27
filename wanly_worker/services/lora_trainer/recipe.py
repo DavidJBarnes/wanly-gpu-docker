@@ -25,6 +25,10 @@ bucket. The real sizes are visible ONLY in the latent cache filenames, never in 
 `num_repeats` is fixed, so EPOCHS SCALE INVERSELY WITH DATASET SIZE. 13 images x 10 = 130
 samples/epoch, so 1200 steps is 9.2 epochs rather than 2.4 -- four times the passes over each
 image at identical flags. Not wrong, but know which experiment you are running.
+
+And it is fixed PER GROUP, not per run (#145). A regularization group rides at fewer repeats
+than the identity it protects, so an epoch is the SUM of images x repeats over every group --
+never total images x 10. See `samples_per_epoch`.
 """
 from __future__ import annotations
 
@@ -40,10 +44,44 @@ TRAINER_ACCELERATE = os.environ.get("TRAINER_ACCELERATE", f"{TRAINER_DIR}/venv/b
 #: Mounted read-only from the host, exactly as the ollama store is: the image carries code, the
 #: mount carries weights. The base checkpoint alone is 43 GB.
 MODELS_DIR = os.environ.get("MODELS_DIR", "/workspace/models")
+#: THE BASE A JOB TRAINS AGAINST IS THE JOB'S CHOICE (#145): `config.base_checkpoint` names it,
+#: and `checkpoint_path` resolves it. This is only the FALLBACK, for a job whose config predates
+#: that field (a retried legacy row) and for the boot-time preflight.
+#:
+#: 10Eros, not ltx-2.3-22b-dev. The LoRAs render on 10Eros (engine/recipe.py's
+#: DEFAULT_CHECKPOINT), and training against the base they will actually be loaded onto is the
+#: point. Verified before the switch: same key set and shapes as dev, same config metadata,
+#: byte-identical VAE and connectors, and `--ltx_version 2.3 --ltx_version_check_mode error`
+#: passes on it -- so no other flag changes. LTX_BASE_CKPT still overrides it.
+DEFAULT_BASE_CHECKPOINT = "10Eros_v1.5_bf16"
 CKPT = os.environ.get(
     "LTX_BASE_CKPT",
-    f"{MODELS_DIR}/ltx-2.3/diffusion_models/ltx-2.3-22b-dev.safetensors")
+    f"{MODELS_DIR}/ltx-2.3/diffusion_models/{DEFAULT_BASE_CHECKPOINT}.safetensors")
 GEMMA = os.environ.get("LTX_GEMMA", f"{MODELS_DIR}/ltx-2.3/text_encoders/gemma-3-12b-it")
+
+
+
+def checkpoint_path(name: str | None) -> str:
+    """The file a job's `config.base_checkpoint` names, or the fallback when it names none.
+
+    A BARE NAME, the way the engine and the API spell a checkpoint everywhere else
+    ("10Eros_v1.5_bf16"); `.safetensors` is tolerated and not doubled. It resolves inside the
+    models mount and nowhere else -- anything path-shaped is refused rather than followed,
+    because the name arrives from the queue and a claim must not be able to point the trainer
+    at an arbitrary file.
+
+    Whether the file EXISTS is the preflight's question, not this one's: resolving and checking
+    separately is what lets the preflight say which name it was given and where it looked.
+    """
+    n = (name or "").strip()
+    if not n:
+        return CKPT
+    if n.endswith(".safetensors"):
+        n = n[: -len(".safetensors")]
+    if "/" in n or "\\" in n or n.startswith(".") or not n:
+        raise ValueError(f"base_checkpoint {name!r} is not a bare checkpoint name")
+    return f"{MODELS_DIR}/ltx-2.3/diffusion_models/{n}.safetensors"
+
 
 #: Where run directories live. One per character per version, never shared -- reusing one is how
 #: two versions' images, caches and checkpoints got mixed.
@@ -102,37 +140,45 @@ bucket_no_upscale = true
 """
 
 
-def cache_latents_cmd(run: Path) -> list[str]:
+def cache_latents_cmd(run: Path, ckpt: str | None = None) -> list[str]:
+    """`ckpt` is the resolved base (`checkpoint_path`). The three stages must name the SAME
+    file: latents cached against one base and trained against another is a run that
+    completes and learns nothing useful, with no error anywhere."""
     return [
         TRAINER_PYTHON, "-m", "musubi_tuner.ltx2_cache_latents",
         "--dataset_config", f"{run}/dataset.toml",
-        "--ltx2_checkpoint", CKPT,
+        "--ltx2_checkpoint", ckpt or CKPT,
         "--ltx2_mode", "video", "--device", "cuda", "--vae_dtype", "bf16",
     ]
 
 
-def cache_text_cmd(run: Path) -> list[str]:
+def cache_text_cmd(run: Path, ckpt: str | None = None) -> list[str]:
     return [
         TRAINER_PYTHON, "-m", "musubi_tuner.ltx2_cache_text_encoder_outputs",
         "--dataset_config", f"{run}/dataset.toml",
-        "--ltx2_checkpoint", CKPT,
+        "--ltx2_checkpoint", ckpt or CKPT,
         "--gemma_root", GEMMA, "--gemma_load_in_8bit",
         "--ltx2_mode", "video", "--device", "cuda",
         "--mixed_precision", "bf16", "--batch_size", "1",
     ]
 
 
-def train_cmd(run: Path, character: str, version: int, config: dict) -> list[str]:
+def train_cmd(run: Path, character: str, version: int, config: dict,
+              ckpt: str | None = None) -> list[str]:
     """The training invocation. `config` overrides DEFAULTS, and the job carries a snapshot of
-    it -- so a change to DEFAULTS cannot retroactively alter a job that is already queued."""
+    it -- so a change to DEFAULTS cannot retroactively alter a job that is already queued.
+
+    `ckpt` is the resolved base; absent, it is resolved from the same `config` the rest of the
+    flags come from, so a caller cannot get a base that disagrees with the job's."""
     c = {**DEFAULTS, **(config or {})}
+    ckpt = ckpt or checkpoint_path(c.get("base_checkpoint"))
     return [
         TRAINER_ACCELERATE, "launch",
         "--num_cpu_threads_per_process", "1", "--mixed_precision", "bf16",
         f"{TRAINER_DIR}/src/musubi_tuner/ltx2_train_network.py",
         "--mixed_precision", "bf16",
         "--dataset_config", f"{run}/dataset.toml",
-        "--ltx2_checkpoint", CKPT,
+        "--ltx2_checkpoint", ckpt,
         "--ltx_version", "2.3", "--ltx_version_check_mode", "error",
         "--ltx2_mode", "video", "--nf4_base", "--quantize_device", "cuda",
         "--gradient_checkpointing", "--sdpa",
@@ -157,9 +203,25 @@ def train_cmd(run: Path, character: str, version: int, config: dict) -> list[str
     ]
 
 
-def estimated_epochs(image_count: int, steps: int, repeats: int | None = None) -> int:
+def samples_per_epoch(groups: list[tuple[int, int | None]]) -> int:
+    """One epoch, in samples (= steps at batch_size 1): SUM over groups of images x repeats.
+
+    `groups` is [(image_count, num_repeats), ...]; a repeats of None is DEFAULTS'. Per group
+    because the repeats are (#145) -- a 50-image identity at 10 beside a 200-image
+    regularization pool at 1 is 700 samples, and "250 images x 10" would put the epoch at 2500
+    and label every checkpoint with a step it was never written at.
+    """
+    return max(1, sum(n * (r or DEFAULTS["num_repeats"]) for n, r in groups))
+
+
+def estimated_epochs(image_count: int, steps: int, repeats: int | None = None, *,
+                     per_epoch: int | None = None) -> int:
     """num_repeats is fixed, so this is not steps/1200 -- it is how many passes over each image
-    the run will actually make. A joint run's count is BOTH groups' images summed (the
-    caller passes the total), with the repeats that apply to them."""
-    per_epoch = max(1, image_count * (repeats or DEFAULTS["num_repeats"]))
-    return max(1, steps // per_epoch)
+    the run will actually make.
+
+    `per_epoch` is the real figure from `samples_per_epoch` and wins when given: a run whose
+    groups repeat differently has no single `repeats` to multiply by. `image_count x repeats`
+    remains for a caller (or a persisted job) that only knows the one number."""
+    if not per_epoch:
+        per_epoch = image_count * (repeats or DEFAULTS["num_repeats"])
+    return max(1, steps // max(1, per_epoch))

@@ -212,7 +212,12 @@ class JobRequest(BaseModel):
     checkpoint: str | None = None
     # Content LoRAs, spliced into the graph in order.
     loras: list[Lora] = Field(default_factory=list, max_length=4)
-    keyframes: list[Keyframe] = Field(min_length=1, max_length=12)
+    # EMPTY IS TEXT-TO-VIDEO (#145), on the recipe path only, and only with an explicit
+    # width and height -- with no start frame there is nothing to derive the size from. The
+    # daemon sends `[]` for a segment with no start image (the regularization pool renders
+    # these). Still required as a key: a request that forgot keyframes altogether is a bug,
+    # not a request for text-to-video.
+    keyframes: list[Keyframe] = Field(max_length=12)
     width: int = 512
     height: int = 768
     num_frames: int = 121
@@ -643,6 +648,21 @@ def derive_size(path: Path) -> tuple[int, int]:
     return max(64, (w // 64) * 64), max(64, (h // 64) * 64)
 
 
+def blank_frame(width: int, height: int) -> bytes:
+    """A black PNG at exactly the clip size: the text-to-video stand-in for a start frame.
+
+    The recipe graph's LoadImage (167) is not optional -- ComfyUI refuses a graph whose
+    LoadImage names no file -- and it is also where the latent's size comes from (167 ->
+    ImageResizeKJv2 to WIDTH/HEIGHT -> x0.5 -> EmptyLTXVLatentVideo). With node 290 on, the
+    image itself is bypassed, so a blank frame at exactly width x height gives the requested
+    size and conditions on nothing. Exact size, so the resize is an identity and cannot crop.
+    """
+    import io
+    buf = io.BytesIO()
+    Image.new("RGB", (int(width), int(height))).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def run_job(job: Job):
     workdir = JOBS_DIR / job.id
     workdir.mkdir(parents=True, exist_ok=True)
@@ -768,12 +788,22 @@ def run_job(job: Job):
             # No free-form patching and no guide splicing: the validated workflow conditions
             # on a single LoadImage which drives size as well.
             graph = comfy.load_workflow(resolve_workflow(recipe_mod.RECIPE_WORKFLOW))
-            w, h = derive_size(workdir / "kf1.png")
+            # TEXT-TO-VIDEO (#145): no keyframe, so no start frame to derive a size from. The
+            # request's width/height ARE the size (submit() refused this shape without them
+            # and checked them against the /64 grid), and a blank frame of exactly that size
+            # stands in at LoadImage -- see blank_frame() for why one is needed at all.
+            t2v = not job.req.keyframes
+            if t2v:
+                w, h = job.req.width, job.req.height
+                start = cf.upload_image(blank_frame(w, h), f"{job.id}_t2v.png")
+            else:
+                w, h = derive_size(workdir / "kf1.png")
+                start = guides[0]["name"]
             # Every entry of `loras` is a CHARACTER on this path (content LoRAs travel in
             # their own field), one per person in the shot, in slot order (console#473).
             # The cap is checked at submit, where a 422 reaches the caller.
             graph = recipe_mod.resolve(
-                graph, guides[0]["name"], w, h,
+                graph, start, w, h,
                 prompt=job.req.prompt,
                 negative=job.req.negative_prompt,
                 checkpoint=job.req.checkpoint,
@@ -794,6 +824,7 @@ def run_job(job: Job):
                     for c in job.req.content_loras
                 ],
                 img_compression=job.req.img_compression,
+                text_to_video=t2v,
             )
             if job.req.num_frames:
                 comfy.set_frames(graph, job.req.num_frames)
@@ -825,8 +856,14 @@ def run_job(job: Job):
             #
             # Absence is stated, never implied. "content none" and no line at all look the
             # same to a reader trying to work out whether a LoRA loaded.
+            # Mode first, and read off the graph like everything else on this line: a
+            # text-to-video render is a different configuration from an image render of the
+            # same pose, and "was it conditioned on a frame?" is the first question about one.
+            mode = ("text-to-video" if graph["290"]["inputs"]["value"]
+                    else "image-to-video")
             job.notes.append(
-                f"recipe {job.req.recipe!r} · base {recipe_mod.base_model_note(graph)} · "
+                f"recipe {job.req.recipe!r} · {mode} · "
+                f"base {recipe_mod.base_model_note(graph)} · "
                 f"{recipe_mod.lora_stack_note(graph)} · graph {gh[:12]}"
             )
             # base_model_note(graph), NOT the local `ck`. `ck` is assigned inside the
@@ -842,7 +879,7 @@ def run_job(job: Job):
             # The line above was fixed to read from the graph and this one was not, which is
             # the whole lesson: a loop-scoped variable used after the loop is a bug whether
             # or not one of its uses has been corrected.
-            print(f"[{job.id}] recipe {job.req.recipe!r} -> {w}x{h}, "
+            print(f"[{job.id}] recipe {job.req.recipe!r} ({mode}) -> {w}x{h}, "
                   f"base {recipe_mod.base_model_note(graph)}, "
                   f"{recipe_mod.lora_stack_note(graph)}, graph {gh}", flush=True)
             (workdir / "graph.json").write_text(json.dumps(graph, indent=1))
@@ -958,6 +995,29 @@ def submit(req: JobRequest):
                 f"{name}={v} must be divisible by 64. The two-stage distilled "
                 f"graph (spatial upsampler) requires it; only one-stage "
                 f"graphs accept 32. Nearest: {(v // 64) * 64} or {(v // 64 + 1) * 64}.")
+    # NO KEYFRAMES IS TEXT-TO-VIDEO (#145), and only the recipe graph can do it: it carries
+    # its own "Text To Video" switch (node 290). The free-form graphs condition on guides and
+    # have no such switch -- an empty guide list there would render something, conditioned on
+    # nothing anyone chose, so it is refused by name rather than attempted.
+    if not req.keyframes:
+        if not req.recipe:
+            raise HTTPException(422,
+                "no keyframes: text-to-video is only supported on the recipe path "
+                "(set `recipe`). The free-form workflows condition on keyframe guides and "
+                "have no text-to-video switch.")
+        # EXPLICIT, not the model's 512x768 default. An image render derives its size from
+        # the start frame; with none, a silently defaulted size would render a portrait
+        # thumbnail for a caller who simply forgot to say, and nothing would look wrong.
+        missing = [f for f in ("width", "height") if f not in req.model_fields_set]
+        if missing:
+            raise HTTPException(422,
+                f"no keyframes and no {' or '.join(missing)}: a text-to-video render has no "
+                f"start frame to derive its size from, so width and height must be sent.")
+        # 0 passes the /64 check above. An image render never reaches here with 0 -- its size
+        # comes from the frame -- but on this path the request's number IS the size.
+        for name, v in (("width", req.width), ("height", req.height)):
+            if v < 64:
+                raise HTTPException(422, f"{name}={v}: a text-to-video render needs at least 64")
     # On the recipe path every `loras` entry is a person, and the graph has room for two
     # (console#473). Refused here, in the first second, rather than as a failed job after
     # the claim -- and named, so the caller knows it is the count and not a missing file.
@@ -970,8 +1030,12 @@ def submit(req: JobRequest):
     with _LOCK:
         JOBS[job.id] = job
     QUEUE.put(job.id)
-    print(f"[{job.id}] queued: {len(placement)} keyframes at "
-          f"{[p['index'] for p in placement]} / {req.num_frames} frames", flush=True)
+    if placement:
+        print(f"[{job.id}] queued: {len(placement)} keyframes at "
+              f"{[p['index'] for p in placement]} / {req.num_frames} frames", flush=True)
+    else:
+        print(f"[{job.id}] queued: text-to-video (no keyframes) at {req.width}x{req.height} "
+              f"/ {req.num_frames} frames", flush=True)
     return {"job_id": job.id, "status": job.status, "placement": placement,
             "queue_depth": QUEUE.qsize()}
 

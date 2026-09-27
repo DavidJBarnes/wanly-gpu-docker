@@ -46,18 +46,27 @@ class Cancelled(PipelineError):
 
 def preflight(job: Job) -> None:
     """Everything knowable before an hour of GPU is spent. All of it has bitten someone."""
-    for label, path in (("base checkpoint", recipe.CKPT), ("Gemma", recipe.GEMMA)):
-        if not Path(path).exists():
-            raise PipelineError(
-                f"{label} is not at {path}. It is bind-mounted from the host; without the mount "
-                f"there is nothing to train against.")
+    # THE JOB'S base, not the boot-time default (#145). The service preflight proved the
+    # default is mounted; a job naming a checkpoint this box does not hold must fail HERE,
+    # before the drain and the hour, and must say which name it was and where it looked --
+    # "not at <path>" alone reads as a broken mount when the real answer is "wrong box".
+    ckpt = job.base_checkpoint or recipe.CKPT
+    if not Path(ckpt).exists():
+        raise PipelineError(
+            f"base checkpoint {Path(ckpt).stem!r} is not at {ckpt}. The job's "
+            f"config.base_checkpoint names a file under {recipe.MODELS_DIR}/ltx-2.3/"
+            f"diffusion_models, which is bind-mounted from the host: either this box does not "
+            f"hold that checkpoint or the mount is missing.")
+    if not Path(recipe.GEMMA).exists():
+        raise PipelineError(
+            f"Gemma is not at {recipe.GEMMA}. It is bind-mounted from the host; without the "
+            f"mount there is nothing to train against.")
     if not Path(recipe.TRAINER_PYTHON).exists():
         raise PipelineError(
             f"no trainer at {recipe.TRAINER_PYTHON} — this image was built without "
             f"WITH_TRAINER=1")
 
-    epochs = recipe.estimated_epochs(job.images, job.steps,
-                                     repeats=getattr(job, "effective_repeats", None))
+    epochs = recipe.estimated_epochs(job.images, job.steps, per_epoch=job.per_epoch)
     need = epochs * GB_PER_EPOCH
     free = shutil.disk_usage(recipe.RUNS_DIR).free / 1024 ** 3
     if free < need + 5:
@@ -66,18 +75,66 @@ def preflight(job: Job) -> None:
             f"free under {recipe.RUNS_DIR}")
 
 
+def check_captions(groups: list[dict]) -> None:
+    """Refuse a caption list that does not line up with its images, before anything is staged.
+
+    PER-IMAGE CAPTIONS (#145) are a list parallel to the group's images, in download order.
+    A list one short does not fail anywhere downstream: every caption after the gap binds to
+    the NEXT image, the run trains for an hour on text describing the wrong pictures, and the
+    LoRA comes out subtly wrong with nothing in any log to say why. So a length mismatch is a
+    refusal, and so is an empty entry -- an uncaptioned image trains the trigger onto nothing.
+
+    NO FALLBACK ON THE NEW SHAPE. A job that carries per-image captions for ANY group must
+    carry them for EVERY group: the old `"<trigger>, woman"` default is wrong for a
+    regularization or composition group (no trigger; not necessarily a woman), and inventing
+    one silently is exactly what this contract replaces. A job with no lists anywhere is a
+    legacy row -- a retry from before #145 -- and keeps the single-caption path it was built
+    for.
+    """
+    new_shape = any(g.get("captions") is not None for g in groups)
+    for gi, g in enumerate(groups):
+        caps = g.get("captions")
+        if caps is None:
+            if new_shape:
+                raise PipelineError(
+                    f"group {gi} ({g.get('kind') or 'identity'}) has no per-image captions "
+                    f"while other groups do. Every group of a per-image-caption job needs its "
+                    f"own list; there is no default caption to fall back on.")
+            continue
+        n = len(g["images"])
+        if len(caps) != n:
+            raise PipelineError(
+                f"group {gi} ({g.get('kind') or 'identity'}) has {n} images but {len(caps)} "
+                f"captions. They are paired by position, so a mismatch would caption every "
+                f"image after the gap with another image's text.")
+        blank = [i for i, c in enumerate(caps) if not str(c or "").strip()]
+        if blank:
+            raise PipelineError(
+                f"group {gi} ({g.get('kind') or 'identity'}) has empty captions at "
+                f"{blank[:10]}{'...' if len(blank) > 10 else ''}")
+
+
 async def stage(job: Job, groups: list[dict]) -> Path:
     """Write the dataset(s) and the config. Returns the run directory.
 
-    `groups` is one entry per identity: {images: [(name, bytes)], caption, num_repeats}.
-    ONE entry is the single-identity shape every run before #102 wrote — same directories
-    (`data/`, `cache/`), same toml bytes. A joint run writes `data0/`+`cache0/`,
-    `data1/`+`cache1/`, per-group captions and a two-entry toml.
+    `groups` is one entry per group: {images: [(name, bytes)], captions | caption,
+    num_repeats, kind}. `captions` is the per-image list (#145) and wins; `caption` is the
+    single string every image of a legacy group shares. ONE entry is the single-identity
+    shape every run before #102 wrote — same directories (`data/`, `cache/`), same toml
+    bytes. A joint run writes `data0/`+`cache0/`, `data1/`+`cache1/`, per-group captions and
+    a toml entry per group, each with its OWN num_repeats.
 
     The run directory is REBUILT, not added to. A version that reuses a directory trains on the
     previous version's leftover images while reporting the new count -- the failure
     new_character.sh had until it grew a version argument.
     """
+    # Before the rmtree below: a refused job must not also destroy the run directory a retry
+    # of the previous attempt could still be read from.
+    check_captions(groups)
+    for gi, g in enumerate(groups):
+        if not isinstance(g["num_repeats"], int) or g["num_repeats"] < 1:
+            raise PipelineError(f"group {gi} num_repeats={g['num_repeats']!r}; it must be >= 1")
+
     run = recipe.run_dir(job.character, job.version)
     if run.exists():
         shutil.rmtree(run)
@@ -95,17 +152,27 @@ async def stage(job: Job, groups: list[dict]) -> Path:
             data_dir.mkdir(parents=True, exist_ok=True)
             cache_dir.mkdir(parents=True, exist_ok=True)
 
-        _log(job, f"staging group {gi}: {len(g['images'])} images "
-                  f"({g['num_repeats']} repeats)")
+        caps = g.get("captions")
+        _log(job, f"staging group {gi}"
+                  + (f" ({g['kind']})" if g.get("kind") else "")
+                  + f": {len(g['images'])} images ({g['num_repeats']} repeats, "
+                  + ("per-image captions" if caps is not None else "one shared caption")
+                  + ")")
         for i, (name, blob) in enumerate(g["images"]):
             ext = Path(name).suffix.lower() or ".jpg"
             (data_dir / f"sel_{i:03d}{ext}").write_bytes(blob)
             # Captions bind whatever they do not name. All 13 of p@y's read "p@y, woman" over
-            # close-ups, so the trigger carried close-up framing as part of its identity.
+            # close-ups, so the trigger carried close-up framing as part of its identity --
+            # which is why a caption now describes ITS image (#145) rather than the set.
             # PER GROUP: a joint run's group 1 must say its OWN trigger, or its face binds
             # to whatever the text happens to be.
-            (data_dir / f"sel_{i:03d}.txt").write_text(
-                (g["caption"] or f"{job.trigger}, woman") + "\n")
+            if caps is not None:
+                text = str(caps[i]).strip()
+            else:
+                # LEGACY ONLY: a row from before per-image captions, retried. The fallback is
+                # what those jobs always got; check_captions keeps it off the new shape.
+                text = g.get("caption") or f"{job.trigger}, woman"
+            (data_dir / f"sel_{i:03d}.txt").write_text(text + "\n")
         toml_groups.append({"data": str(data_dir), "cache": str(cache_dir),
                             "num_repeats": g["num_repeats"]})
 
@@ -162,18 +229,23 @@ def read_progress(run: Path, expect_total: int = 0) -> tuple[int, int, float, fl
 
 
 async def train(job: Job, run: Path, config: dict, on_progress=None) -> None:
-    """Cache latents, cache text, train. Reports progress while the last one runs."""
+    """Cache latents, cache text, train. Reports progress while the last one runs.
+
+    ONE base for all three (#145): resolved once, from the job, and handed to each command.
+    Latents cached against one checkpoint and trained against another is a run that finishes
+    cleanly and learns the wrong thing."""
+    ckpt = job.base_checkpoint or recipe.checkpoint_path((config or {}).get("base_checkpoint"))
     await _stage_cmd(job, run, "caching latents",
-                     recipe.cache_latents_cmd(run), "01_cache_latents.log")
+                     recipe.cache_latents_cmd(run, ckpt), "01_cache_latents.log")
     await _stage_cmd(job, run, "caching text encoder",
-                     recipe.cache_text_cmd(run), "02_cache_text.log")
+                     recipe.cache_text_cmd(run, ckpt), "02_cache_text.log")
 
     _log(job, "training")
     t0 = time.time()
     logfile = run / "logs" / "03_train.log"
     with logfile.open("wb") as out:
         proc = await asyncio.create_subprocess_exec(
-            *recipe.train_cmd(run, job.character, job.version, config),
+            *recipe.train_cmd(run, job.character, job.version, config, ckpt),
             cwd=recipe.TRAINER_DIR, stdout=out, stderr=asyncio.subprocess.STDOUT)
         while proc.returncode is None:
             try:
