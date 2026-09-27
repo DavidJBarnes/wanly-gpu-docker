@@ -28,7 +28,9 @@ jobs:
         # insightface itself is not, and is not installed.
         # requests: engine/comfy.py imports it at module level (the ComfyUI HTTP client);
         # the guidance tests import the module but never open a socket.
-        run: pip install pytest "numpy<2" requests -r wanly_worker/requirements.txt
+        # pillow: engine/app.py imports it at module level (keyframe decode/resize); the
+        # text-to-video tests (#145) import the app and drive run_job against a fake ComfyUI.
+        run: pip install pytest "numpy<2" requests pillow -r wanly_worker/requirements.txt
 
       - name: Shell scripts parse
         run: bash -n start.sh fetch_daemon.sh download_models.sh deploy/*.sh
