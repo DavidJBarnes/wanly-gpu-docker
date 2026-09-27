@@ -4,12 +4,11 @@
 #
 # TWO deliberate exclusions -- both would collide with packages already installed above:
 #
-#   onnxruntime              onnxruntime-gpu is installed for ReActor/FaceFusion and provides
-#                            the same `onnxruntime` module. Installing the CPU build on top
-#                            replaces it and silently drops GPU execution for the swap.
-#                            The daemon only needs CPUExecutionProvider (identity scoring runs
-#                            on CPU on purpose, to leave the GPU to generation), and the -gpu
-#                            build provides that too.
+#   onnxruntime              NOT here, but no longer because something else provides it: the
+#                            onnxruntime-gpu that ReActor/FaceFusion brought is gone with them
+#                            (#132). The CPU build is installed by wanly_worker/requirements.txt,
+#                            in the image's last pip layer; see the note there. insightface
+#                            below cannot import without it.
 #
 #   opencv-python-headless   opencv-python is already pulled in by ReActor and FaceFusion, and
 #                            both packages provide `cv2`. Installing both leaves whichever

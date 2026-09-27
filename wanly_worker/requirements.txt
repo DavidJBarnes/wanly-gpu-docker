@@ -2,3 +2,12 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
+# face-crop's own dependency (#132). insightface (daemon-requirements.txt) cannot import
+# without it, and nothing else installs it any more: it used to arrive as a side effect of
+# onnxruntime-gpu, which came in with ReActor/FaceFusion and left with them when the image
+# became LTX-only. The CPU build on purpose -- identity scoring and cropping run on
+# CPUExecutionProvider to leave the GPU to generation, and it is ~10x smaller than -gpu.
+# Installed HERE, in the last pip layer, so shipping it does not invalidate the big layers
+# above it: a box pulls a few MB, not the image. Verified in the 63a631f image: imports
+# insightface and face_crop.detect, and leaves numpy at 2.2.6.
+onnxruntime==1.23.2
