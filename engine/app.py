@@ -638,13 +638,31 @@ DISTILLED_LORA = "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 
 
 
-def derive_size(path: Path) -> tuple[int, int]:
-    """Recipe resolution is derived, not chosen: take the start frame's native
-    size and round DOWN to /64, preserving aspect. 64 because the two-stage
-    pipeline's own assert_resolution demands it."""
+#: The largest clip a recipe renders, in pixels (#148). Start frames are now upscaled for
+#: quality (1216x832 -> ~1824x1248) and the render size came straight from the frame, so a
+#: better INPUT silently became a 2.2x bigger VIDEO -- more than twice the render time and a
+#: VRAM risk. The default is the area of 1024x1024 -- every size renders have used so far
+#: (1216x832, 832x1216, 1024x1024) sits at or under it and renders exactly as before, and it
+#: is the trainer's ~1 MP bucket area too. A bigger frame is downsampled into the clip
+#: (normalise() resizes the keyframe file to the derived size), which is the point of
+#: upscaling it: a cleaner first frame at the same cost.
+MAX_RENDER_PIXELS = int(os.environ.get("ENGINE_MAX_RENDER_PIXELS", str(1024 * 1024)))
+
+
+def derive_size(path: Path, max_pixels: int | None = None) -> tuple[int, int]:
+    """Recipe resolution is derived, not chosen: take the start frame's native size,
+    scale it DOWN (never up) to fit `max_pixels` keeping the aspect, then round DOWN to
+    /64. 64 because the two-stage pipeline's own assert_resolution demands it; rounding
+    down after capping keeps the result inside the cap."""
     from PIL import Image
+    cap = MAX_RENDER_PIXELS if max_pixels is None else max_pixels
     with Image.open(path) as im:
         w, h = im.size
+    if cap and w * h > cap:
+        scale = (cap / (w * h)) ** 0.5
+        # round() before flooring to /64: 1824 * 0.6667 is 1215.99..., and flooring that
+        # straight to /64 would drop a whole step to 1152.
+        w, h = round(w * scale), round(h * scale)
     return max(64, (w // 64) * 64), max(64, (h // 64) * 64)
 
 
