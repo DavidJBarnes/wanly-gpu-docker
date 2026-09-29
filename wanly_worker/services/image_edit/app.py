@@ -194,8 +194,15 @@ async def edit(req: EditRequest):
           f" aura {ident['aura']}", flush=True)
     buf = io.BytesIO()
     out.save(buf, "PNG", compress_level=6)
+    # A capped JPEG beside the PNG, for the console's "after" pane: wanly-api holds the job and
+    # has no image library of its own, and the PNG is ~1-2 MB across the home uplink.
+    small = out.copy()
+    small.thumbnail((1024, 1024))
+    pbuf = io.BytesIO()
+    small.save(pbuf, "JPEG", quality=88)
     return {
         "image": base64.b64encode(buf.getvalue()).decode(),
+        "preview": base64.b64encode(pbuf.getvalue()).decode(),
         "format": "png",
         "width": out.width,
         "height": out.height,

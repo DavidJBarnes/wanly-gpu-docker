@@ -201,6 +201,7 @@ class TestTheAPI:
         assert "full side profile" in body["prompt"] and "left edge" in body["prompt"]
         assert body["identity"] == {"aura": 0.71, "reason": None}
         assert body["seed"] == 5 and body["vram_peak_mib"] == 20480
+        assert base64.b64decode(body["preview"])[:2] == b"\xff\xd8", "a JPEG preview"
         assert ran[0]["3"]["inputs"]["prompt"] == body["prompt"]
         assert "20" not in ran[0], "the recipe is prompt-only: no LoRA node"
 
