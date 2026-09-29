@@ -19,6 +19,7 @@ import io
 import logging
 import os
 import time
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -113,6 +114,12 @@ class EditRequest(BaseModel):
     #: node's output untouched. See restore.py.
     detail_restore: float = Field(default=1.0, ge=0.0, le=1.0)
     detail_sharpen: float | None = Field(default=None, ge=0.0, le=3.0)
+    #: How the result comes back. PNG at full size is the product (see _encode). A PREVIEW --
+    #: the console's slider loop -- asks for jpeg at a capped edge instead: a 1248x1824 PNG is
+    #: ~3 MB, which is ~5 s per drag on the home uplink this box sits behind, against ~120 KB
+    #: as a 1024 px JPEG. The edit itself is identical; only the return trip shrinks.
+    format: Literal["png", "jpeg"] = "png"
+    max_edge: int | None = Field(default=None, ge=64, le=8192)
 
 
 def _decode(b64: str):
@@ -132,13 +139,20 @@ def _decode(b64: str):
     return np.asarray(im, dtype=np.uint8).copy()
 
 
-def _encode_png(rgb) -> str:
+def _encode(rgb, fmt: str = "png", max_edge: int | None = None) -> str:
     from PIL import Image
 
+    im = Image.fromarray(rgb)
+    if max_edge and max(im.size) > max_edge:
+        im.thumbnail((max_edge, max_edge), Image.LANCZOS)
     buf = io.BytesIO()
-    # PNG, never JPEG: the point of this engine is that the pixels it did not move are the
-    # source's own, byte for byte. A lossy re-encode would throw that away on the way out.
-    Image.fromarray(rgb).save(buf, "PNG", compress_level=6)
+    if fmt == "jpeg":
+        im.save(buf, "JPEG", quality=88)
+    else:
+        # PNG for anything that is kept: the point of this engine is that the pixels it did not
+        # move are the source's own, byte for byte, and a lossy encode would undo that on the
+        # way out. JPEG is only ever a preview.
+        im.save(buf, "PNG", compress_level=6)
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -213,7 +227,7 @@ async def edit(req: EditRequest):
     finally:
         _turn.release()
 
-    image = await asyncio.to_thread(_encode_png, res["out"])
+    image = await asyncio.to_thread(_encode, res["out"], req.format, req.max_edge)
     total = time.time() - t0
     print(f"[face-edit] {rgb.shape[1]}x{rgb.shape[0]} on {res['device']} ({res['reason']}) | "
           f"src={how} | {exp.nonzero() or 'neutral'} | {total:.1f}s "
@@ -222,7 +236,9 @@ async def edit(req: EditRequest):
           flush=True)
     return {
         "image": image,
-        "format": "png",
+        "format": req.format,
+        # The SOURCE's size, which is the edit's: a preview's max_edge only shrinks the copy
+        # sent back.
         "width": int(rgb.shape[1]),
         "height": int(rgb.shape[0]),
         "expression": exp.model_dump(),

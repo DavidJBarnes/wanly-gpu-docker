@@ -341,6 +341,16 @@ class TestTheAPI:
                                   "detail_restore": 0}).json()
         assert d["format"] == "png"
 
+    def test_a_preview_is_a_small_jpeg_of_the_same_edit(self, api):
+        """The slider loop's return trip: ~120 KB instead of ~3 MB behind a home uplink."""
+        from PIL import Image
+        c, _, _ = api
+        d = c.post("/edit", json={"image": _png(400, 300), "expression": {"smile": 0.5},
+                                  "detail_restore": 0, "format": "jpeg", "max_edge": 100}).json()
+        im = Image.open(io.BytesIO(base64.b64decode(d["image"])))
+        assert im.format == "JPEG" and max(im.size) == 100
+        assert (d["width"], d["height"]) == (400, 300)
+
     def test_a_prompt_is_accepted_as_sugar(self, api):
         c, fake, _ = api
         r = c.post("/edit", json={"image": _png(), "prompt": "look up", "detail_restore": 0})
