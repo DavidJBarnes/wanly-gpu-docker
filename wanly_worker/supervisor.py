@@ -46,6 +46,9 @@ class ServiceState:
         #: down when a service exits, which is right for a service that died and fatal for
         #: one we asked to stop. This is the whole difference between the two.
         self.stopped = False
+        #: Whether preflight() has run. A service that is not in the boot mode (image-edit,
+        #: console#548) is preflighted when a mode switch first starts it, not at boot.
+        self.preflighted = False
 
     def snapshot(self) -> dict:
         running = self.proc is not None and self.proc.returncode is None
@@ -77,8 +80,14 @@ class Supervisor:
 
     # ---------------------------------------------------------------- start
 
-    async def start(self, client) -> None:
+    async def start(self, client, active: list[str] | None = None) -> None:
         """Preflight everything, then start everything. Raises to abort the boot.
+
+        `active` (SERVICES names) is the boot mode's set, when the supervisor also holds
+        services that only run in another mode (console#548: image-edit is built at boot so
+        POST /mode can start it later, but it must not run beside the render stack). Those are
+        left stopped -- reported as such, not as down -- and are preflighted when a mode
+        switch first starts them. None means every service is active, as before.
 
         ALL preflights run before ANY process starts. Half-started is the worst outcome: the
         container looks alive, serves one of two services, and the missing one only surfaces
@@ -93,8 +102,16 @@ class Supervisor:
         degraded trainer leaves training jobs unclaimed, which the console shows; a dead
         render worker hides an entire queue.
         """
+        if active is not None:
+            wanted = set(active)
+            for st in self.states:
+                if (st.service.group or st.service.name) not in wanted:
+                    st.stopped = True
         for st in self.states:
+            if st.stopped:
+                continue
             try:
+                st.preflighted = True
                 st.service.preflight()
             except PreflightError as e:
                 if not getattr(st.service, "essential", True):
@@ -105,11 +122,11 @@ class Supervisor:
                     continue
                 raise PreflightError(f"{st.service.name}: {e}") from e
         print(f"preflight OK for "
-              f"{', '.join(s.service.name for s in self.states if not s.error)}",
+              f"{', '.join(s.service.name for s in self.states if not (s.error or s.stopped))}",
               flush=True)
 
         for st in self.states:
-            if st.error:
+            if st.error or st.stopped:
                 continue
             await self._start_one(st, client)
 
@@ -228,6 +245,17 @@ class Supervisor:
                 continue
             if st.proc is not None and st.proc.returncode is None:
                 continue          # already up
+            if not st.preflighted:
+                # First start of a service that was not in the boot mode. A failure here fails
+                # the SWITCH (the caller reports it and puts the box back), whether or not the
+                # service is essential at boot: the switch exists to run exactly this service.
+                st.preflighted = True
+                try:
+                    st.service.preflight()
+                except PreflightError as e:
+                    st.preflighted = False
+                    st.error = str(e)
+                    raise PreflightError(f"{st.service.name}: {e}") from e
             st.stopped = False
             st.error = None
             await self._start_one(st, client)

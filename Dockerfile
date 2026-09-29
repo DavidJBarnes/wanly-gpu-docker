@@ -285,6 +285,7 @@ ENV SERVICES=ltx-engine \
 ENV WANLY_IMAGE_REF=$GIT_SHA
 
 # ComfyUI, ltx-engine, the control API, sshd; then image-description (ollama), face-crop and
-# face-edit, which wanly-api calls across the network. The trainer binds loopback and is not exposed.
-EXPOSE 8188 8190 8081 22 11434 8084 8085
+# face-edit, which wanly-api calls across the network; image-edit (edit mode only, console#548)
+# likewise. The trainer and image-edit's own ComfyUI bind loopback and are not exposed.
+EXPOSE 8188 8190 8081 22 11434 8084 8085 8086
 CMD ["/app/start.sh"]

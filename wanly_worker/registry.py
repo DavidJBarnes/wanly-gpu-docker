@@ -23,6 +23,7 @@ from wanly_worker.service import Service
 from wanly_worker.services.face_crop import FaceCrop
 from wanly_worker.services.face_edit import FaceEdit
 from wanly_worker.services.image_description import ImageDescription
+from wanly_worker.services.image_edit import image_edit_group
 from wanly_worker.services.lora_trainer import LoraTrainer
 from wanly_worker.services.ltx_engine import ltx_engine_group
 
@@ -35,6 +36,7 @@ KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
     "image-description": ImageDescription,
     "face-crop": FaceCrop,
     "face-edit": FaceEdit,
+    "image-edit": image_edit_group,
 }
 
 #: Services whose presence changes what KIND of worker this box is. The API's claim gates key
@@ -70,9 +72,22 @@ class ConfigError(RuntimeError):
 #: can claim, queued jobs simply wait and the GPU belongs to the captioner. A service added
 #: to KIND_BY_SERVICE later is excluded automatically, which is the right default: anything
 #: that takes work does not belong in caption mode.
-MODES = ("ltx-engine", "caption")
+MODES = ("ltx-engine", "caption", "edit")
 _MODE_ALIASES = {"render": "ltx-engine", "engine": "ltx-engine",
-                 "image-caption": "caption", "image-description": "caption"}
+                 "image-caption": "caption", "image-description": "caption",
+                 "image-edit": "edit", "full-edit": "edit"}
+
+#: Services that run ONLY in one mode (console#548). image-edit is Qwen-Image-Edit: ~20 GB of
+#: a 24 GB card, the same class of tenant as a render or a Qwen captioner, so it cannot sit
+#: beside either and has no CPU fallback to retreat to. It is therefore not part of "everything
+#: this box is equipped for" in render mode, nor a "claims no work" service in caption mode --
+#: it is the card's tenant in edit mode and nowhere else.
+MODE_ONLY = {"image-edit": "edit"}
+
+#: What each mode leaves out on top of the claiming services. Edit mode drops the captioner for
+#: the reason MODE_ONLY exists: a caption landing mid-edit would load a 20 GB vision model onto
+#: a card Qwen is already holding. face-crop and face-edit stay -- CPU-first and ~2 GB at most.
+_MODE_EXCLUDES = {"edit": {"image-description"}}
 
 
 def canonical_mode(raw: str | None) -> str:
@@ -89,28 +104,36 @@ def canonical_mode(raw: str | None) -> str:
 
 
 def select_mode(names: list[str], raw: str | None) -> list[str]:
-    """Narrow `names` to the services MODE asks for. Unset means all of them.
+    """Narrow `names` to the services MODE asks for. Unset means render mode.
 
     Order is preserved -- see parse_services; services start in the order given.
     """
     mode = (raw or "").strip().lower()
-    if not mode:
-        return names
-    mode = _MODE_ALIASES.get(mode, mode)
+    mode = _MODE_ALIASES.get(mode, mode) if mode else "ltx-engine"
     if mode not in MODES:
         raise ConfigError(
             f"MODE={raw!r} is not a mode. Known modes: {', '.join(MODES)} "
             f"(aliases: {', '.join(sorted(_MODE_ALIASES))})"
         )
+    # A service tied to another mode never runs here. Render mode is otherwise everything.
+    mine = [n for n in names if MODE_ONLY.get(n, mode) == mode]
     if mode == "ltx-engine":
-        return names
-    kept = [n for n in names if n not in KIND_BY_SERVICE]
+        # A box equipped ONLY with mode-bound services (an edit-only box) has nothing else to
+        # run in render mode; running what it has beats a boot that refuses on a technicality.
+        return mine or list(names)
+    excluded = _MODE_EXCLUDES.get(mode, set())
+    kept = [n for n in mine if n not in KIND_BY_SERVICE and n not in excluded]
+    if mode == "edit" and "image-edit" not in kept:
+        raise ConfigError(
+            f"MODE=edit needs image-edit in SERVICES (SERVICES={','.join(names)}). Add it, "
+            f"with the Qwen checkpoint mounted -- see deploy/README.md."
+        )
     if not kept:
         # Refused rather than silently started empty, for the reason parse_services refuses
         # an empty list: a container running nothing boots clean, reports healthy and serves
         # nothing, and is diagnosed from another machine as "captioner unreachable".
         raise ConfigError(
-            f"MODE=caption leaves nothing to run: SERVICES={','.join(names)} contains only "
+            f"MODE={mode} leaves nothing to run: SERVICES={','.join(names)} contains only "
             f"services that claim work ({', '.join(sorted(KIND_BY_SERVICE))}). Add "
             f"image-description (and/or face-crop, face-edit) to SERVICES, or drop MODE."
         )

@@ -49,8 +49,8 @@ SERVICES="${SERVICES:-ltx-engine}"
 # Validated HERE as well as in the container because this script's rule is to refuse before
 # `docker rm -f`, not after: a typo must not cost the running worker.
 case "${MODE:-}" in
-    ""|ltx-engine|render|engine|caption|image-caption|image-description) ;;
-    *) echo "!! MODE=$MODE is not a mode. Known: ltx-engine, caption"; exit 1 ;;
+    ""|ltx-engine|render|engine|caption|image-caption|image-description|edit|image-edit|full-edit) ;;
+    *) echo "!! MODE=$MODE is not a mode. Known: ltx-engine, caption, edit"; exit 1 ;;
 esac
 
 case ",$SERVICES," in *,lora-trainer,*)       WANT_TRAINER=1 ;; *) WANT_TRAINER=0 ;; esac
@@ -58,6 +58,7 @@ case ",$SERVICES," in *,image-description,*)  WANT_OLLAMA=1 ;;  *) WANT_OLLAMA=0
 case ",$SERVICES," in *,face-crop,*)          WANT_FACE_CROP=1 ;; *) WANT_FACE_CROP=0 ;; esac
 case ",$SERVICES," in *,face-edit,*)          WANT_FACE_EDIT=1 ;; *) WANT_FACE_EDIT=0 ;; esac
 case ",$SERVICES," in *,ltx-engine,*)         WANT_ENGINE=1 ;;    *) WANT_ENGINE=0 ;;    esac
+case ",$SERVICES," in *,image-edit,*)         WANT_IMAGE_EDIT=1 ;; *) WANT_IMAGE_EDIT=0 ;; esac
 
 # THE RENDER STACK'S MOUNTS AND PORTS ARE THE RENDER STACK'S (console#547). They used to be
 # unconditional, which made a box that renders nothing -- the 2070, running face-edit beside
@@ -124,13 +125,33 @@ if [ "$WANT_OLLAMA" = "1" ]; then
         exit 1
     fi
 fi
-if [ "$WANT_FACE_CROP" = "1" ]; then
+if [ "$WANT_FACE_CROP" = "1" ] || [ "$WANT_IMAGE_EDIT" = "1" ]; then
     # buffalo_l is ~300 MB and insightface fetches it on first use. On a mount it survives a
-    # recreate; in the container it is re-downloaded every time.
+    # recreate; in the container it is re-downloaded every time. image-edit scores every
+    # result with AuraFace from the same store (console#548).
     INSIGHTFACE_HOST_DIR="${INSIGHTFACE_HOST_DIR:-$HOME/.insightface}"
     mkdir -p "$INSIGHTFACE_HOST_DIR"
     MOUNTS+=(-v "$INSIGHTFACE_HOST_DIR:/root/.insightface")
+fi
+if [ "$WANT_FACE_CROP" = "1" ]; then
     PORTS+=(-p "${FACE_CROP_PORT:-8084}:8084")
+fi
+IMAGE_EDIT_ENV_ARGS=()
+if [ "$WANT_IMAGE_EDIT" = "1" ]; then
+    # Qwen-Image-Edit "full mode" (console#548). It runs only in edit mode (POST /mode), but the
+    # mount and the port are the box's, like every other capability on its SERVICES line: the
+    # switch is in place, with no recreate to add them later. Read-only for the reason the LTX
+    # tree is -- the host is the source of truth for 28 GB of checkpoint.
+    : "${IMAGE_EDIT_MODELS_HOST_DIR:?image-edit is enabled — set IMAGE_EDIT_MODELS_HOST_DIR in $ENV_FILE (the 3090: /home/david/models/qwen)}"
+    [ -d "$IMAGE_EDIT_MODELS_HOST_DIR" ] || {
+        echo "!! $IMAGE_EDIT_MODELS_HOST_DIR does not exist — refusing to create a worker with a broken mount"
+        exit 1
+    }
+    MOUNTS+=(-v "$IMAGE_EDIT_MODELS_HOST_DIR:/workspace/qwen:ro")
+    PORTS+=(-p "${IMAGE_EDIT_PORT:-8086}:8086")
+    for v in IMAGE_EDIT_STEPS IMAGE_EDIT_MAX_MP EDIT_IDLE_RETURN_S; do
+        if [ -n "${!v:-}" ]; then IMAGE_EDIT_ENV_ARGS+=(-e "$v=${!v}"); fi
+    done
 fi
 FACE_EDIT_ENV_ARGS=()
 if [ "$WANT_FACE_EDIT" = "1" ]; then
@@ -226,6 +247,7 @@ docker run -d \
     "${PORTS[@]}" \
     "${MOUNTS[@]}" \
     "${FACE_EDIT_ENV_ARGS[@]}" \
+    "${IMAGE_EDIT_ENV_ARGS[@]}" \
     "${DEV_MOUNT_ARGS[@]}" \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
     -e "SERVICES=$SERVICES" \

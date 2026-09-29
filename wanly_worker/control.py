@@ -94,11 +94,14 @@ async def lifespan(app: FastAPI):
         # for THIS process as much as for the daemon: the trainer's poller and its drain read
         # the box's own row id from that file, and without the variable in the control
         # process's env they saw no id and never claimed (Payton v1, first night).
-        os.environ.update(export_identity(names))
+        os.environ.update(export_identity(names, equipped))
         if "ltx-engine" in names:
             from wanly_worker.services.ltx_engine import WORKER_ID_FILE
             os.environ["WORKER_ID_FILE"] = WORKER_ID_FILE
-        _sup = Supervisor(registry.build(names))
+        # Built from what the box is EQUIPPED for, started for what the mode asks. A service
+        # that only runs in another mode (image-edit, console#548) has to exist here for
+        # POST /mode to start it later; it is held stopped until then.
+        _sup = Supervisor(registry.build(equipped))
     except Exception as e:
         _fatal(e)
         raise
@@ -106,7 +109,7 @@ async def lifespan(app: FastAPI):
         global _client
         _client = client
         try:
-            await _sup.start(client)
+            await _sup.start(client, active=names)
         except Exception as e:
             _fatal(e)
             raise
@@ -221,10 +224,55 @@ async def _drain_captions() -> None:
     print("mode: captions drained", flush=True)
 
 
+#: Edit mode hands the card back by itself once edits stop coming (console#548). wanly-api asks
+#: for render mode when its edit queue empties, but a box left in edit mode because that call
+#: never came -- an API restart mid-queue -- would sit with every queued render waiting behind
+#: an idle 20 GB model. This is the backstop, not the mechanism.
+EDIT_IDLE_RETURN_S = float(os.environ.get("EDIT_IDLE_RETURN_S") or "600")
+#: The mode edit mode goes back to. Recorded on the way in; render when unknown.
+_return_from_edit: str = "ltx-engine"
+_edit_watch: asyncio.Task | None = None
+
+
+async def _edit_idle_s() -> float | None:
+    """Seconds since image-edit last worked, from its own /health. None when it will not say."""
+    from wanly_worker.services.image_edit.service import PORT
+    try:
+        r = await _client.get(f"http://127.0.0.1:{PORT}/health", timeout=5)
+        return float(r.json().get("idle_s"))
+    except Exception:
+        return None
+
+
+async def _watch_edit_idle() -> None:
+    """While in edit mode: switch back once image-edit has been idle EDIT_IDLE_RETURN_S."""
+    while _mode == "edit":
+        await asyncio.sleep(min(30.0, max(1.0, EDIT_IDLE_RETURN_S / 4)))
+        if _mode != "edit" or _pending is not None:
+            continue
+        idle = await _edit_idle_s()
+        if idle is not None and idle >= EDIT_IDLE_RETURN_S:
+            print(f"mode: no edit for {idle:.0f}s — handing the card back "
+                  f"({_return_from_edit})", flush=True)
+            _begin(_return_from_edit, registry.select_mode(_equipped, _return_from_edit))
+            return
+
+
+def _begin(target: str, names: list[str]) -> None:
+    """Start a switch in the background. The caller has checked nothing is pending."""
+    global _pending, _mode_error, _mode_task
+    _mode_error = None
+    _pending = target
+    print(f"mode: {_mode} -> {target} ({','.join(names)}) — "
+          f"a segment in flight will finish first", flush=True)
+    _mode_task = asyncio.create_task(_switch(target, names))
+
+
 async def _switch(target: str, names: list[str]) -> None:
     """Do the switch, off the request. Never raises: it has no caller left to raise to."""
-    global _mode, _pending, _mode_error
+    global _mode, _pending, _mode_error, _return_from_edit, _edit_watch
     from wanly_worker.services import image_description as imgdesc
+    before = _mode
     try:
         async with _mode_lock:
             # LEAVING caption mode: drop the model BEFORE the render stack comes back, or
@@ -253,10 +301,28 @@ async def _switch(target: str, names: list[str]) -> None:
             # resets the model's keep_alive to its own.
             if target == "caption":
                 await imgdesc.service.warm(_client)
+            if target == "edit":
+                if before != "edit":
+                    _return_from_edit = before
+                _edit_watch = asyncio.create_task(_watch_edit_idle())
         print(f"mode: now {target} ({','.join(names)})", flush=True)
     except Exception as e:                      # noqa: BLE001 -- reported, not swallowed
         _mode_error = str(e)
         print(f"!! mode switch to {target} failed: {e}", flush=True)
+        if target == "edit" and before != "edit":
+            # PUT THE BOX BACK. Entering edit mode stops the render stack first; if image-edit
+            # then fails to start (a missing mount, a truncated checkpoint), leaving it there
+            # would park every queued render behind a service that is not running.
+            try:
+                async with _mode_lock:
+                    await _sup.apply(registry.select_mode(_equipped, before), _client)
+                    _mode = before
+                    if _queue is not None:
+                        _queue.rebalance()
+                print(f"mode: restored {before} after the failed switch", flush=True)
+            except Exception as e2:             # noqa: BLE001
+                _mode_error = f"{e}; and restoring {before} failed too: {e2}"
+                print(f"!! could not restore {before}: {e2}", flush=True)
     finally:
         _pending = None
 
@@ -284,7 +350,6 @@ async def set_mode(body: ModeRequest):
         # a mode that would leave this box running nothing.
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    global _pending, _mode_error, _mode_task
     target = registry.canonical_mode(body.mode)
 
     # ACCEPTED AND RETURNED IMMEDIATELY. Stopping the render daemon waits for the segment in
@@ -300,11 +365,7 @@ async def set_mode(body: ModeRequest):
     if target == _mode:
         return {"mode": _mode, "pending": None, "services": names, "changed": False}
 
-    _mode_error = None
-    _pending = target
-    print(f"mode: {_mode} -> {target} ({','.join(names)}) — "
-          f"a segment in flight will finish first", flush=True)
-    _mode_task = asyncio.create_task(_switch(target, names))
+    _begin(target, names)
     return {"mode": _mode, "pending": target, "services": names, "changed": True}
 
 
