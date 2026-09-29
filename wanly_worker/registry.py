@@ -21,6 +21,7 @@ from typing import Callable
 
 from wanly_worker.service import Service
 from wanly_worker.services.face_crop import FaceCrop
+from wanly_worker.services.face_edit import FaceEdit
 from wanly_worker.services.image_description import ImageDescription
 from wanly_worker.services.lora_trainer import LoraTrainer
 from wanly_worker.services.ltx_engine import ltx_engine_group
@@ -33,13 +34,14 @@ KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
     "lora-trainer": LoraTrainer,
     "image-description": ImageDescription,
     "face-crop": FaceCrop,
+    "face-edit": FaceEdit,
 }
 
 #: Services whose presence changes what KIND of worker this box is. The API's claim gates key
 #: on kinds, not on `provides` -- a gate keyed on names needs an allowlist, and an engine
 #: missing from that allowlist claims nothing, indistinguishable from an empty queue. So the
-#: mapping lives here, in the one place that decides what to register as. image-description
-#: and face-crop add no kind: they are called, they claim nothing.
+#: mapping lives here, in the one place that decides what to register as. image-description,
+#: face-crop and face-edit add no kind: they are called, they claim nothing.
 KIND_BY_SERVICE = {"ltx-engine": "render", "lora-trainer": "trainer"}
 
 
@@ -110,7 +112,7 @@ def select_mode(names: list[str], raw: str | None) -> list[str]:
         raise ConfigError(
             f"MODE=caption leaves nothing to run: SERVICES={','.join(names)} contains only "
             f"services that claim work ({', '.join(sorted(KIND_BY_SERVICE))}). Add "
-            f"image-description (and/or face-crop) to SERVICES, or drop MODE."
+            f"image-description (and/or face-crop, face-edit) to SERVICES, or drop MODE."
         )
     return kept
 

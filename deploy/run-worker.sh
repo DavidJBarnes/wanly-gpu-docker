@@ -29,10 +29,6 @@ NAME="${NAME:-wanly-gpu-docker}"
 : "${QUEUE_API_KEY:?set QUEUE_API_KEY in $ENV_FILE}"
 : "${FRIENDLY_NAME:?set FRIENDLY_NAME in $ENV_FILE}"
 
-for d in "$JOBS_DIR" "$MODELS_DIR"; do
-    [ -d "$d" ] || { echo "!! $d does not exist — refusing to create a worker with a broken mount"; exit 1; }
-done
-
 # WHICH SERVICES, AND WHAT EACH ONE NEEDS (wanly-gpu-docker#83). Mounts and ports are
 # per-service: a pod-shaped render box has no ollama store and no run directories, and
 # requiring them everywhere would mean inventing empty directories to satisfy a check.
@@ -60,17 +56,37 @@ esac
 case ",$SERVICES," in *,lora-trainer,*)       WANT_TRAINER=1 ;; *) WANT_TRAINER=0 ;; esac
 case ",$SERVICES," in *,image-description,*)  WANT_OLLAMA=1 ;;  *) WANT_OLLAMA=0 ;;  esac
 case ",$SERVICES," in *,face-crop,*)          WANT_FACE_CROP=1 ;; *) WANT_FACE_CROP=0 ;; esac
+case ",$SERVICES," in *,face-edit,*)          WANT_FACE_EDIT=1 ;; *) WANT_FACE_EDIT=0 ;; esac
+case ",$SERVICES," in *,ltx-engine,*)         WANT_ENGINE=1 ;;    *) WANT_ENGINE=0 ;;    esac
+
+# THE RENDER STACK'S MOUNTS AND PORTS ARE THE RENDER STACK'S (console#547). They used to be
+# unconditional, which made a box that renders nothing -- the 2070, running face-edit beside
+# Automatic1111 -- invent an empty jobs dir and models tree to get past this check, and publish
+# ComfyUI and engine ports for processes that never start. Required exactly when something
+# that reads them runs: ltx-engine (jobs, models, loras) or lora-trainer (the base checkpoint
+# under the models tree). A box with either is unchanged, flag for flag.
+ENGINE_ARGS=()
+if [ "$WANT_ENGINE" = "1" ] || [ "$WANT_TRAINER" = "1" ]; then
+    for d in "${JOBS_DIR:-}" "${MODELS_DIR:-}"; do
+        [ -n "$d" ] && [ -d "$d" ] || { echo "!! '$d' does not exist — refusing to create a worker with a broken mount (set JOBS_DIR and MODELS_DIR in $ENV_FILE)"; exit 1; }
+    done
+    ENGINE_ARGS+=(-p "${COMFY_HOST_PORT:-8191}:8188")
+    ENGINE_ARGS+=(-p "${ENGINE_HOST_PORT:-8190}:8190")
+    ENGINE_ARGS+=(-v "$JOBS_DIR:/jobs")
+    ENGINE_ARGS+=(-v "$MODELS_DIR:/workspace/models:ro")
+    ENGINE_ARGS+=(-v "$MODELS_DIR/loras:/workspace/models/loras")
+fi
 
 MOUNTS=()
 PORTS=()
 TRAINER_ENV_ARGS=()
-if [ "$WANT_TRAINER" = "1" ] || [ "$WANT_OLLAMA" = "1" ]; then
-    # Both live in the :full layer. The lean tag fails in the trainer's preflight after a
+if [ "$WANT_TRAINER" = "1" ] || [ "$WANT_OLLAMA" = "1" ] || [ "$WANT_FACE_EDIT" = "1" ]; then
+    # All three live in the :full layer. The lean tag fails in the trainer's preflight after a
     # pull, which is a slow way to learn a one-line mistake -- refuse by name, and BEFORE
     # anything is removed, so a wrong IMAGE never costs the running container.
     case "$IMAGE" in
         *:latest|*:next|*:"${IMAGE##*:}" ) case "$IMAGE" in *full*) ;; *)
-            echo "!! SERVICES includes lora-trainer/image-description but IMAGE=$IMAGE is built WITHOUT them."
+            echo "!! SERVICES includes lora-trainer/image-description/face-edit but IMAGE=$IMAGE is built WITHOUT them."
             echo "!! Use IMAGE=davidjbarnes/wanly-gpu-docker:full (or :next-full) in $ENV_FILE"
             exit 1 ;; esac ;;
     esac
@@ -115,6 +131,22 @@ if [ "$WANT_FACE_CROP" = "1" ]; then
     mkdir -p "$INSIGHTFACE_HOST_DIR"
     MOUNTS+=(-v "$INSIGHTFACE_HOST_DIR:/root/.insightface")
     PORTS+=(-p "${FACE_CROP_PORT:-8084}:8084")
+fi
+FACE_EDIT_ENV_ARGS=()
+if [ "$WANT_FACE_EDIT" = "1" ]; then
+    # LivePortrait (console#547). Models are baked, so no mount. wanly-api calls it across the
+    # network (face_edit_url), like face-crop.
+    PORTS+=(-p "${FACE_EDIT_PORT:-8085}:8085")
+    # A1111 on the same card is on the HOST, not in this container: the alias is what makes
+    # FACE_EDIT_A1111_URL=http://host.docker.internal:7860 resolve, so face-edit can read its
+    # progress (never borrow the GPU mid-generation) and ask it to unload an idle checkpoint.
+    FACE_EDIT_ENV_ARGS+=(--add-host "host.docker.internal:host-gateway")
+    # Forwarded only when set, so an unset line keeps the image's default instead of pinning
+    # an empty value.
+    for v in FACE_EDIT_A1111_URL FACE_EDIT_DEVICE FACE_EDIT_CPU_FALLBACK FACE_EDIT_MIN_FREE_MIB \
+             FACE_EDIT_GPU_IDLE_S FACE_EDIT_FACE_PAD; do
+        if [ -n "${!v:-}" ]; then FACE_EDIT_ENV_ARGS+=(-e "$v=${!v}"); fi
+    done
 fi
 
 # SHM_SIZE, and it is not optional for the trainer. Docker gives a container 64 MB of
@@ -189,14 +221,11 @@ docker run -d \
     --restart unless-stopped \
     --device nvidia.com/gpu=all \
     --shm-size "$SHM_SIZE" \
-    -p "${COMFY_HOST_PORT:-8191}:8188" \
-    -p "${ENGINE_HOST_PORT:-8190}:8190" \
+    "${ENGINE_ARGS[@]}" \
     -p "${CONTROL_PORT}:8081" \
     "${PORTS[@]}" \
-    -v "$JOBS_DIR:/jobs" \
-    -v "$MODELS_DIR:/workspace/models:ro" \
-    -v "$MODELS_DIR/loras:/workspace/models/loras" \
     "${MOUNTS[@]}" \
+    "${FACE_EDIT_ENV_ARGS[@]}" \
     "${DEV_MOUNT_ARGS[@]}" \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
     -e "SERVICES=$SERVICES" \
@@ -225,4 +254,13 @@ echo "follow the boot with: docker logs -f $NAME"
 # Deliberately after the run, and non-fatal: a prune failure must never turn a successful
 # recreate into a failed one. Rollback to an older image stays possible -- the tag is
 # re-pulled when IMAGE names it.
-docker image prune -af >/dev/null 2>&1 || true
+#
+# PRUNE_IMAGES=0 turns it off (console#547). `prune -af` removes EVERY image no container
+# uses, not just this repo's -- right on the 3090, where Docker holds only the worker, and
+# destructive on a box whose Docker also stores other projects' images with no container
+# (the 2070: verbatim-worker, open-webui, ollama, postgres, ntfy -- ~40 GB of it).
+if [ "${PRUNE_IMAGES:-1}" = "1" ]; then
+    docker image prune -af >/dev/null 2>&1 || true
+else
+    echo "PRUNE_IMAGES=0 — leaving unreferenced images alone"
+fi
