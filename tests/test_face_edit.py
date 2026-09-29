@@ -296,7 +296,7 @@ class FakeEngine:
     def to(self, device):
         self.device = device
 
-    def edit(self, rgb, exp, *, face_pad, src_ratio):
+    def edit(self, rgb, exp, *, face_pad, src_ratio, expect_box=None):
         from wanly_worker.services.face_edit.engine import NoFace
         self.calls.append((exp, face_pad, src_ratio, self.device))
         if self.fail:
@@ -592,3 +592,312 @@ class TestDeployingIt:
         assert off.returncode == 0 and "leaving unreferenced images alone" in off.stdout
         src = (ROOT / "deploy" / "run-worker.sh").read_text()
         assert 'if [ "${PRUNE_IMAGES:-1}" = "1" ]; then\n    docker image prune -af' in src
+
+
+# ------------------------------------------------------------- choosing the face (#553)
+
+from wanly_worker.services.face_edit import faces as picking  # noqa: E402
+
+BG = (120, 90, 60)
+
+
+def _scene(w, h, boxes):
+    """A w x h frame with each face drawn as its own marker colour (255, 0, 10 * (i + 1))."""
+    rgb = np.zeros((h, w, 3), np.uint8)
+    rgb[:] = BG
+    for i, (x1, y1, x2, y2) in enumerate(boxes):
+        rgb[y1:y2, x1:x2] = (255, 0, 10 * (i + 1))
+    return rgb
+
+
+def _b64(rgb) -> str:
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _unb64(s):
+    from PIL import Image
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB"))
+
+
+class SceneEngine(FakeEngine):
+    """A detector that finds the marker rectangles in whatever pixels it is given -- so on a
+    crop it sees clipped faces exactly as a real detector would -- and an 'edit' that inverts
+    the face the node's own rule picks. `order` is the detector's listing order (by marker)."""
+
+    def __init__(self, order=None, smear=False):
+        super().__init__()
+        self.order, self.smear = order, smear
+        self.shapes = []
+
+    def detect(self, rgb):
+        found = {}
+        for k in range(1, 20):
+            ys, xs = np.nonzero((rgb[..., 0] == 255) & (rgb[..., 1] == 0) & (rgb[..., 2] == 10 * k))
+            if len(xs):
+                found[k] = [float(xs.min()), float(ys.min()), float(xs.max() + 1),
+                            float(ys.max() + 1)]
+        keys = [k for k in (self.order or sorted(found)) if k in found]
+        return [found[k] for k in keys]
+
+    def edit(self, rgb, exp, *, face_pad, src_ratio, expect_box=None):
+        from wanly_worker.services.face_edit.engine import NoFace, NotIsolated
+        self.calls.append((exp, face_pad, src_ratio, self.device))
+        self.shapes.append((rgb.shape, expect_box))
+        raw = self.detect(rgb)
+        if not picking.valid(raw):
+            raise NoFace("no face detected")
+        if expect_box is not None and not picking.isolates(raw, rgb.shape[1], expect_box):
+            raise NotIsolated("nope")
+        x1, y1, x2, y2 = map(int, picking.valid(raw)[picking.node_pick(raw, rgb.shape[1])])
+        out = rgb.copy()
+        if self.smear:        # an engine that touches every pixel it is handed
+            out = (out.astype(int) + 1).clip(0, 255).astype(np.uint8)
+        out[y1:y2, x1:x2] = 255 - rgb[y1:y2, x1:x2]
+        return out
+
+
+@pytest.fixture
+def scene_api(monkeypatch):
+    pytest.importorskip("PIL")
+    from fastapi.testclient import TestClient
+    from wanly_worker.services.face_edit import app as mod
+
+    fake = SceneEngine()
+    monkeypatch.setattr(mod, "engine", fake)
+    monkeypatch.setattr(mod.gpu, "choose", lambda resident_on_gpu: ("cpu", "test"))
+    with TestClient(mod.app) as c:
+        yield c, fake
+
+
+def _edited(before, after, boxes):
+    """Which of `boxes` came back changed."""
+    return [i for i, (x1, y1, x2, y2) in enumerate(boxes)
+            if not np.array_equal(before[y1:y2, x1:x2], after[y1:y2, x1:x2])]
+
+
+TWO = [(60, 100, 160, 220), (520, 90, 620, 210)]             # 800 wide: right one is central
+THREE = [(40, 80, 140, 200), (350, 90, 450, 210), (660, 100, 760, 220)]
+
+
+class TestTheGeometry:
+    def test_node_region_is_the_nodes_square(self):
+        # 100x120 face, pad 1.6 -> side 192 centred on (110, 160)
+        assert picking.node_region([60, 100, 160, 220], 800, 400, 1.6) == [14, 64, 206, 256]
+
+    def test_node_region_shifts_rather_than_shrinks_at_an_edge(self):
+        r = picking.node_region([0, 100, 100, 200], 800, 400, 1.6)
+        assert r[0] == 0 and r[2] - r[0] == 160
+
+    def test_the_default_is_the_nodes_pick_mapped_to_left_to_right(self):
+        """Detector order is not left to right; default_index must index the sorted list."""
+        raw = [[520, 90, 620, 210], [60, 100, 160, 220], [10, 10, 30, 30]]
+        boxes, default = picking.analyse(raw, 800)
+        assert [b[0] for b in boxes] == [60, 520]        # the 20 px box is not a face to it
+        assert default == 1
+
+    def test_a_tie_goes_to_the_detectors_first_box_as_in_the_node(self):
+        raw = [[250, 0, 350, 100], [450, 0, 550, 100]]   # both exactly 100 px from 400
+        assert picking.node_pick(raw, 800) == 0
+        assert picking.node_pick(raw[::-1], 800) == 0
+
+    @pytest.mark.parametrize("seed", range(40))
+    def test_every_planned_crop_makes_the_node_pick_the_chosen_face(self, seed):
+        """The property the whole feature rests on, over random layouts: on the pixels of the
+        planned crop -- other faces clipped as a detector would see them -- the node's rule
+        picks the chosen face, and the crop holds the node's whole square for it."""
+        rng = np.random.default_rng(seed)
+        w, h = int(rng.integers(500, 1400)), int(rng.integers(300, 900))
+        boxes = []
+        for _ in range(int(rng.integers(2, 5))):
+            s = int(rng.integers(40, 160))
+            x, y = int(rng.integers(0, w - s)), int(rng.integers(0, h - s))
+            b = [x, y, x + s, y + int(s * 1.2)]
+            if all(picking.iou(b, o) == 0 for o in boxes) and b[3] <= h:
+                boxes.append(b)
+        boxes, default = picking.analyse(boxes, w)
+        planned = 0
+        for idx in range(len(boxes)):
+            crop = picking.plan_crop(boxes, idx, w, h, 1.6)
+            if crop is None:
+                continue
+            planned += 1
+            x1, y1, x2, y2 = crop
+            seen = [[max(b[0], x1) - x1, max(b[1], y1) - y1, min(b[2], x2) - x1,
+                     min(b[3], y2) - y1] for b in boxes
+                    if b[0] < x2 and b[2] > x1 and b[1] < y2 and b[3] > y1]
+            f = boxes[idx]
+            assert picking.isolates(seen, x2 - x1, [f[0] - x1, f[1] - y1, f[2] - x1, f[3] - y1])
+            r = picking.node_region(f, w, h, 1.6)
+            assert x1 <= max(0, r[0]) and x2 >= min(w, r[2])
+        assert planned or len(boxes) < 2
+
+    def test_overlap_alone_is_not_fatal(self):
+        """Side by side and overlapping, the crop can still slide its centre toward the
+        chosen face -- only the horizontal centres matter to the node."""
+        boxes = [[300, 100, 400, 220], [340, 110, 440, 230]]
+        assert picking.plan_crop(boxes, 0, 800, 400, 1.6) is not None
+
+    def test_faces_stacked_on_one_centre_have_no_crop(self):
+        """Centres 2 px apart and rows overlapping: no window separates them by the margin."""
+        boxes = [[300, 100, 400, 220], [302, 130, 402, 250]]
+        assert picking.plan_crop(boxes, 0, 800, 400, 1.6) is None
+        assert picking.plan_crop(boxes, 1, 800, 400, 1.6) is None
+
+    def test_a_face_directly_above_another_is_isolated_by_rows(self):
+        boxes = [[350, 20, 450, 140], [355, 400, 455, 520]]
+        crop = picking.plan_crop(boxes, 0, 800, 600, 1.6)
+        assert crop is not None and crop[3] <= 400
+
+    def test_choose(self):
+        boxes = [[60, 100, 160, 220], [520, 90, 620, 210]]
+        assert picking.choose(boxes, 0, None) == 0
+        assert picking.choose(boxes, 0, [522, 92, 618, 212]) == 1, "the box wins"
+        with pytest.raises(picking.FacePickError, match="out of range"):
+            picking.choose(boxes, 2, None)
+        with pytest.raises(picking.FacePickError, match="matches none"):
+            picking.choose(boxes, None, [300, 0, 400, 100])
+
+
+class TestChoosingTheFace:
+    def test_faces_lists_them_left_to_right_with_the_default(self, scene_api):
+        c, fake = scene_api
+        fake.order = [2, 1]                      # the detector lists the right one first
+        d = c.post("/faces", json={"image": _b64(_scene(800, 400, TWO))}).json()
+        assert (d["width"], d["height"]) == (800, 400)
+        assert [f["box"] for f in d["faces"]] == [list(map(float, b)) for b in TWO]
+        assert [f["index"] for f in d["faces"]] == [0, 1]
+        assert d["faces"][0]["width"] == 100.0
+        assert d["default_index"] == 1
+
+    def test_faces_skips_what_the_node_would(self, scene_api):
+        c, _ = scene_api
+        d = c.post("/faces", json={"image": _b64(_scene(800, 400, [(10, 10, 30, 30),
+                                                                   (350, 90, 450, 210)]))}).json()
+        assert len(d["faces"]) == 1 and d["default_index"] == 0
+
+    def test_one_face_changes_nothing(self, scene_api):
+        c, fake = scene_api
+        src = _scene(800, 400, [(350, 90, 450, 210)])
+        d = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                  "detail_restore": 0, "face_index": 0}).json()
+        assert d["face_index"] == 0 and d["face_crop"] is None
+        assert fake.shapes[-1] == ((400, 800, 3), None)
+
+    def test_the_default_path_is_untouched(self, scene_api):
+        """Nothing chosen: the full frame, no expectation, no detection of our own."""
+        c, fake = scene_api
+        src = _scene(800, 400, TWO)
+        d = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                  "detail_restore": 0}).json()
+        assert fake.shapes[-1] == ((400, 800, 3), None)
+        assert d["face_index"] is None and d["face_box"] is None and d["face_crop"] is None
+        assert _edited(src, _unb64(d["image"]), TWO) == [1]
+
+    def test_choosing_the_default_face_is_the_default_edit(self, scene_api):
+        c, fake = scene_api
+        src = _scene(800, 400, TWO)
+        d = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                  "detail_restore": 0, "face_index": 1}).json()
+        assert d["face_crop"] is None and fake.shapes[-1][1] is None
+        assert _edited(src, _unb64(d["image"]), TWO) == [1]
+
+    def test_two_faces_either_one(self, scene_api):
+        c, _ = scene_api
+        src = _scene(800, 400, TWO)
+        for i in (0, 1):
+            d = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                      "detail_restore": 0, "face_index": i}).json()
+            assert d["face_index"] == i and d["face_box"] == list(map(float, TWO[i]))
+            assert _edited(src, _unb64(d["image"]), TWO) == [i]
+
+    def test_three_faces_each_one(self, scene_api):
+        c, _ = scene_api
+        src = _scene(800, 400, THREE)
+        for i in range(3):
+            r = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                      "detail_restore": 0, "face_index": i})
+            assert r.status_code == 200, r.text
+            assert _edited(src, _unb64(r.json()["image"]), THREE) == [i]
+
+    def test_a_face_at_the_frame_edge(self, scene_api):
+        """The crop cannot extend past the frame, so it cannot centre the face -- it has to
+        leave the neighbour out instead."""
+        c, _ = scene_api
+        boxes = [(0, 100, 90, 210), (330, 100, 430, 220)]
+        src = _scene(800, 400, boxes)
+        d = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                  "detail_restore": 0, "face_index": 0}).json()
+        assert d["face_crop"][0] == 0
+        assert _edited(src, _unb64(d["image"]), boxes) == [0]
+
+    def test_a_face_box_names_the_face(self, scene_api):
+        c, _ = scene_api
+        src = _scene(800, 400, TWO)
+        d = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                  "detail_restore": 0, "face_box": [58, 98, 161, 222]}).json()
+        assert d["face_index"] == 0
+        assert _edited(src, _unb64(d["image"]), TWO) == [0]
+
+    def test_pixels_outside_the_crop_are_the_sources_byte_for_byte(self, scene_api):
+        """Even from an engine that alters every pixel it is handed, and with the detail
+        restore on: the crop is pasted into a copy of the source."""
+        pytest.importorskip("cv2")
+        c, fake = scene_api
+        fake.smear = True
+        rng = np.random.default_rng(1)
+        src = _scene(800, 400, TWO)
+        noise = rng.integers(0, 40, src.shape, dtype=np.uint8)
+        mask = ~((src[..., 0] == 255) & (src[..., 1] == 0))
+        src[mask] = noise[mask]                  # texture, so a stray blend would show
+        d = c.post("/edit", json={"image": _b64(src), "expression": {"smile": 0.5},
+                                  "face_index": 0}).json()
+        out = _unb64(d["image"])
+        x1, y1, x2, y2 = d["face_crop"]
+        outside = np.ones(src.shape[:2], bool)
+        outside[y1:y2, x1:x2] = False
+        assert outside.any() and np.array_equal(out[outside], src[outside])
+        assert not np.array_equal(out[y1:y2, x1:x2], src[y1:y2, x1:x2])
+        assert fake.shapes[-1][0] == (y2 - y1, x2 - x1, 3)
+
+    def test_an_out_of_range_index_is_422(self, scene_api):
+        c, _ = scene_api
+        r = c.post("/edit", json={"image": _b64(_scene(800, 400, TWO)),
+                                  "expression": {"smile": 0.5}, "face_index": 2})
+        assert r.status_code == 422 and "out of range" in r.json()["detail"]
+        r = c.post("/edit", json={"image": _b64(_scene(800, 400, TWO)),
+                                  "expression": {"smile": 0.5}, "face_index": -1})
+        assert r.status_code == 422
+
+    def test_a_box_that_matches_no_face_is_422(self, scene_api):
+        c, _ = scene_api
+        r = c.post("/edit", json={"image": _b64(_scene(800, 400, TWO)),
+                                  "expression": {"smile": 0.5}, "face_box": [300, 0, 400, 80]})
+        assert r.status_code == 422 and "matches none" in r.json()["detail"]
+
+    def test_faces_too_close_to_separate_is_422(self, scene_api):
+        c, _ = scene_api
+        boxes = [(300, 100, 400, 220), (302, 130, 402, 250)]
+        r = c.post("/edit", json={"image": _b64(_scene(800, 400, boxes)),
+                                  "expression": {"smile": 0.5}, "face_index": 0})
+        assert r.status_code == 422 and "on its own" in r.json()["detail"]
+
+    def test_a_plan_the_detector_disagrees_with_is_422_not_the_wrong_face(self, scene_api):
+        from wanly_worker.services.face_edit.engine import NotIsolated
+        c, fake = scene_api
+
+        def disagree(*a, **k):
+            raise NotIsolated("x")
+
+        fake.edit = disagree
+        r = c.post("/edit", json={"image": _b64(_scene(800, 400, TWO)),
+                                  "expression": {"smile": 0.5}, "face_index": 0})
+        assert r.status_code == 422 and "isolated" in r.json()["detail"]
+
+    def test_choosing_a_face_in_a_faceless_image_is_the_usual_422(self, scene_api):
+        c, _ = scene_api
+        r = c.post("/edit", json={"image": _png(), "expression": {"smile": 0.5},
+                                  "face_index": 0})
+        assert r.status_code == 422 and "no face" in r.json()["detail"]

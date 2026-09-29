@@ -28,6 +28,9 @@ WHAT IS OURS:
     face ("Failed to detect face!!" and carry on). keyframe-server preflit with YuNet, which
     picks a different face on crowded frames than the node does; asking the node's detector
     means the preflight and the edit can never disagree.
+  * which face. The node edits the one nearest the horizontal centre; to edit another, app.py
+    hands it a crop planned by faces.py, and `edit(expect_box=...)` re-asks the same detector
+    on that crop so a wrong plan is refused rather than warping the wrong person (#553).
 """
 from __future__ import annotations
 
@@ -40,6 +43,7 @@ import types
 
 import numpy as np
 
+from wanly_worker.services.face_edit import faces as picking
 from wanly_worker.services.face_edit.expression import Expression
 
 #: The pinned ComfyUI-AdvancedLivePortrait checkout (Dockerfile).
@@ -54,7 +58,7 @@ LIVEPORTRAIT_MODELS = (
 )
 DETECTOR_MODEL = "face_yolov8n.pt"
 #: The node's detector skips boxes narrower than this (nodes.py detect_face).
-MIN_FACE_PX = 30
+MIN_FACE_PX = picking.MIN_FACE_PX
 
 
 def model_paths() -> list[str]:
@@ -69,6 +73,10 @@ def missing_models() -> list[str]:
 
 class NoFace(ValueError):
     """The node's own detector found nothing it would warp."""
+
+
+class NotIsolated(ValueError):
+    """On the crop it was given, the node would edit a face other than the chosen one."""
 
 
 def _install_shims() -> None:
@@ -210,20 +218,28 @@ class Engine:
 
     # -------------------------------------------------------------------- edit
 
+    def detect(self, rgb: np.ndarray) -> list[list[float]]:
+        """The node's detector's raw boxes, in its order -- the order its tie-break uses."""
+        return [list(map(float, b[:4])) for b in self.nodes.g_engine.get_face_bboxes(rgb)]
+
     def faces(self, rgb: np.ndarray) -> int:
-        boxes = self.nodes.g_engine.get_face_bboxes(rgb)
-        return sum(1 for x1, _y1, x2, _y2 in boxes if (x2 - x1) >= MIN_FACE_PX)
+        return len(picking.valid(self.detect(rgb)))
 
     def edit(self, rgb: np.ndarray, exp: Expression, *, face_pad: float,
-             src_ratio: float) -> np.ndarray:
+             src_ratio: float, expect_box: list[float] | None = None) -> np.ndarray:
         """HxWx3 uint8 RGB in, the node's full-frame composite out (same size, same dtype).
 
-        Call with `lock` held and the device already chosen.
+        `expect_box` (in rgb's coordinates) is the face a crop was planned around: the node
+        must pick it on these pixels or nothing is warped (NotIsolated). Call with `lock` held
+        and the device already chosen.
         """
         import torch
 
-        if not self.faces(rgb):
+        raw = self.detect(rgb)
+        if not picking.valid(raw):
             raise NoFace("no face detected")
+        if expect_box is not None and not picking.isolates(raw, rgb.shape[1], expect_box):
+            raise NotIsolated("the chosen face is not the one the node picks on its crop")
         src = torch.from_numpy(rgb.astype(np.float32) / 255.0).unsqueeze(0)
         on_gpu = self.device == "cuda"
         if on_gpu:

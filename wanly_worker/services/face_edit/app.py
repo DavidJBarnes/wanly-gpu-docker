@@ -4,7 +4,8 @@ Called, not claimed -- the same shape as face-crop and the captioner: wanly-api 
 and waits. An edit is ~1 s of GPU (keyframe-server measured 1.0 s on the 3090) or a few seconds
 of CPU, which is far below anything worth a queue row.
 
-    POST /edit     {image: b64, expression?: {...}, prompt?: str, ...} -> {image: b64 png, ...}
+    POST /edit     {image: b64, expression?: {...}, prompt?: str, face_box?, ...} -> {image, ...}
+    POST /faces    {image: b64} -> {width, height, faces: [{index, box, width}], default_index}
     GET  /health   model_loaded, device, the measured VRAM peak
 
 ONE EDIT AT A TIME. The pipeline is one set of weights on one device; two edits at once would
@@ -24,8 +25,9 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from wanly_worker.services.face_edit import faces as picking
 from wanly_worker.services.face_edit import gpu
-from wanly_worker.services.face_edit.engine import Engine, NoFace
+from wanly_worker.services.face_edit.engine import Engine, NoFace, NotIsolated
 from wanly_worker.services.face_edit.expression import (
     Expression, NothingToApply, resolve_expression, whole_face_motion,
 )
@@ -120,6 +122,16 @@ class EditRequest(BaseModel):
     #: as a 1024 px JPEG. The edit itself is identical; only the return trip shrinks.
     format: Literal["png", "jpeg"] = "png"
     max_edge: int | None = Field(default=None, ge=64, le=8192)
+    #: Which face, when there is more than one (#553): an index into /faces' left-to-right
+    #: list, or -- preferred, because it names the face by where it is rather than by a
+    #: position in a list that a different detection could reorder -- one of its boxes.
+    #: Neither means the node's own choice, exactly as before.
+    face_index: int | None = Field(default=None, ge=0)
+    face_box: list[float] | None = Field(default=None, min_length=4, max_length=4)
+
+
+class FacesRequest(BaseModel):
+    image: str = Field(min_length=1)
 
 
 def _decode(b64: str):
@@ -162,18 +174,54 @@ def _is_oom(e: Exception) -> bool:
     return type(e).__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(e)
 
 
+def _target(rgb, req: EditRequest, pad: float) -> dict | None:
+    """The chosen face and the crop that makes the node pick it, or None for the node's own
+    choice. None too when the chosen face IS the node's choice (or the only face): the
+    full-frame edit already does the right thing, and does it exactly as it always has."""
+    if req.face_index is None and req.face_box is None:
+        return None
+    h, w = rgb.shape[:2]
+    boxes, default = picking.analyse(engine.detect(rgb), w)
+    if not boxes:
+        raise NoFace("no face detected")
+    idx = picking.choose(boxes, req.face_index, req.face_box)
+    target = {"index": idx, "box": boxes[idx], "crop": None}
+    if len(boxes) == 1 or idx == default:
+        return target
+    crop = picking.plan_crop(boxes, idx, w, h, pad)
+    if crop is None:
+        raise picking.FacePickError(
+            f"face {idx} cannot be edited on its own: it is too close to another face for any "
+            f"crop to put it nearest the centre. Edit the other face, or crop the image first")
+    target["crop"] = crop
+    return target
+
+
 def _run(rgb, req: EditRequest, exp: Expression, pad: float) -> dict:
-    """The blocking part: pick a device, edit, fall back to CPU on an OOM. In a thread."""
+    """The blocking part: pick a device, edit, fall back to CPU on an OOM. In a thread.
+
+    With a chosen face that needs a crop, everything -- the edit and the detail restore --
+    happens on the crop, and the crop is pasted into a copy of the source. So pixels outside
+    it are the source's by construction, not by the restore's arithmetic.
+    """
     global _last_reason
 
     t0 = time.time()
+    full = rgb
+    target = _target(rgb, req, pad)
+    expect = None
+    if target and target["crop"]:
+        x1, y1, x2, y2 = target["crop"]
+        rgb = full[y1:y2, x1:x2]
+        b = target["box"]
+        expect = [b[0] - x1, b[1] - y1, b[2] - x1, b[3] - y1]
     device, reason = gpu.choose(resident_on_gpu=engine.device == "cuda")
     t_move = 0.0
     try:
         # Inside the try: moving ~0.5 GB of weights onto the card can itself be the OOM.
         engine.to(device)
         t_move = time.time() - t0
-        out = engine.edit(rgb, exp, face_pad=pad, src_ratio=req.src_ratio)
+        out = engine.edit(rgb, exp, face_pad=pad, src_ratio=req.src_ratio, expect_box=expect)
     except Exception as e:
         if device != "cuda" or not _is_oom(e):
             raise
@@ -182,7 +230,7 @@ def _run(rgb, req: EditRequest, exp: Expression, pad: float) -> dict:
         if not gpu.CPU_FALLBACK or gpu.DEVICE == "cuda":
             raise gpu.GpuUnavailable("GPU ran out of memory mid-edit and CPU fallback is off")
         device, reason = "cpu", "the GPU ran out of memory mid-edit"
-        out = engine.edit(rgb, exp, face_pad=pad, src_ratio=req.src_ratio)
+        out = engine.edit(rgb, exp, face_pad=pad, src_ratio=req.src_ratio, expect_box=expect)
     t_edit = time.time() - t0 - t_move
     _last_reason = reason
 
@@ -192,7 +240,11 @@ def _run(rgb, req: EditRequest, exp: Expression, pad: float) -> dict:
         out = restore_detail(rgb, out, req.detail_restore, sharpen,
                              whole_face_motion(exp, req.src_ratio))
     t_restore = time.time() - t1
-    return {"out": out, "device": device, "reason": reason,
+    if expect is not None:
+        pasted = full.copy()
+        pasted[y1:y2, x1:x2] = out
+        out = pasted
+    return {"out": out, "device": device, "reason": reason, "target": target,
             "timings_ms": {"device": round(t_move * 1000), "edit": round(t_edit * 1000),
                            "restore": round(t_restore * 1000)}}
 
@@ -222,6 +274,11 @@ async def edit(req: EditRequest):
         res = await asyncio.to_thread(_run, rgb, req, exp, pad)
     except NoFace:
         raise HTTPException(422, "no face detected in the image")
+    except picking.FacePickError as e:
+        raise HTTPException(422, str(e))
+    except NotIsolated:
+        raise HTTPException(422, "the chosen face could not be isolated: on its crop the "
+                                 "detector would still edit a different face")
     except gpu.GpuUnavailable as e:
         raise HTTPException(503, str(e))
     finally:
@@ -229,7 +286,10 @@ async def edit(req: EditRequest):
 
     image = await asyncio.to_thread(_encode, res["out"], req.format, req.max_edge)
     total = time.time() - t0
-    print(f"[face-edit] {rgb.shape[1]}x{rgb.shape[0]} on {res['device']} ({res['reason']}) | "
+    target = res["target"]
+    face = ("" if target is None else
+            f" | face {target['index']}" + (f" crop {target['crop']}" if target["crop"] else ""))
+    print(f"[face-edit] {rgb.shape[1]}x{rgb.shape[0]}{face} on {res['device']} ({res['reason']}) | "
           f"src={how} | {exp.nonzero() or 'neutral'} | {total:.1f}s "
           f"{res['timings_ms']}"
           + (f" | vram peak {engine.vram_peak_mib} MiB" if res["device"] == "cuda" else ""),
@@ -248,6 +308,49 @@ async def edit(req: EditRequest):
         "device_reason": res["reason"],
         "timings_ms": {**res["timings_ms"], "total": round(total * 1000)},
         "vram_peak_mib": engine.vram_peak_mib if res["device"] == "cuda" else None,
+        # The face actually edited, as the detector boxed it -- null when the node chose.
+        "face_index": target["index"] if target else None,
+        "face_box": _box(target["box"]) if target else None,
+        "face_crop": target["crop"] if target else None,
+    }
+
+
+def _box(b) -> list[float]:
+    return [round(float(v), 1) for v in b]
+
+
+@app.post("/faces")
+async def faces(req: FacesRequest):
+    """Every face the node would accept, left to right, and which one it picks unaided.
+
+    The same detector, threshold and 30 px rule as the edit, so a box from here is one /edit
+    can match. It takes the edit's turn: the detector is one model object shared with the
+    pipeline, and at ~50 ms on CPU a short wait is cheaper than a second copy of it.
+    """
+    if not engine.loaded:
+        try:
+            await asyncio.to_thread(engine.load)
+        except Exception:
+            raise HTTPException(503, f"face-edit could not load its models: {engine.load_error}")
+    rgb = await asyncio.to_thread(_decode, req.image)
+    try:
+        await asyncio.wait_for(_turn.acquire(), timeout=QUEUE_WAIT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(503, f"face-edit is busy: another edit held the pipeline for "
+                                 f"{QUEUE_WAIT_S:.0f}s")
+    try:
+        raw = await asyncio.to_thread(engine.detect, rgb)
+    finally:
+        _turn.release()
+    h, w = rgb.shape[:2]
+    boxes, default = picking.analyse(raw, w)
+    print(f"[face-edit] faces {w}x{h}: {len(boxes)} (default {default})", flush=True)
+    return {
+        "width": int(w),
+        "height": int(h),
+        "faces": [{"index": i, "box": _box(b), "width": round(b[2] - b[0], 1)}
+                  for i, b in enumerate(boxes)],
+        "default_index": default,
     }
 
 
