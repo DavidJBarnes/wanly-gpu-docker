@@ -582,3 +582,13 @@ class TestDeployingIt:
         r = self._run(tmp_path, self.BASE + "SERVICES=ltx-engine\nJOBS_DIR=/nope\n"
                       "MODELS_DIR=/nope\n")
         assert r.returncode != 0 and "broken mount" in r.stdout
+
+    def test_image_pruning_can_be_turned_off(self, tmp_path):
+        """The 2070's Docker holds other projects' images with no container; `prune -af`
+        would delete them."""
+        on = self._run(tmp_path, self.BASE + "IMAGE=x:full\nSERVICES=face-edit\n")
+        assert on.returncode == 0 and "leaving unreferenced images alone" not in on.stdout
+        off = self._run(tmp_path, self.BASE + "IMAGE=x:full\nSERVICES=face-edit\nPRUNE_IMAGES=0\n")
+        assert off.returncode == 0 and "leaving unreferenced images alone" in off.stdout
+        src = (ROOT / "deploy" / "run-worker.sh").read_text()
+        assert 'if [ "${PRUNE_IMAGES:-1}" = "1" ]; then\n    docker image prune -af' in src

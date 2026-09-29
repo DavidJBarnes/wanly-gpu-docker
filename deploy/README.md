@@ -91,7 +91,12 @@ QUEUE_URL=http://api.wanly22.com:8001
 QUEUE_API_KEY=...
 SERVICES=face-edit
 FACE_EDIT_A1111_URL=http://host.docker.internal:7860
+PRUNE_IMAGES=0
 ```
+
+**`PRUNE_IMAGES=0` is not optional there.** `run-worker.sh` ends with `docker image prune -af`,
+which removes every image no container uses -- on the 2070 that is verbatim-worker, open-webui,
+ollama, postgres and ntfy, none of which has a container.
 
 No `JOBS_DIR`/`MODELS_DIR`: those are required only with `ltx-engine` or `lora-trainer`, and a
 box without them publishes no ComfyUI or engine port. `run-worker.sh` adds the

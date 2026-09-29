@@ -254,4 +254,13 @@ echo "follow the boot with: docker logs -f $NAME"
 # Deliberately after the run, and non-fatal: a prune failure must never turn a successful
 # recreate into a failed one. Rollback to an older image stays possible -- the tag is
 # re-pulled when IMAGE names it.
-docker image prune -af >/dev/null 2>&1 || true
+#
+# PRUNE_IMAGES=0 turns it off (console#547). `prune -af` removes EVERY image no container
+# uses, not just this repo's -- right on the 3090, where Docker holds only the worker, and
+# destructive on a box whose Docker also stores other projects' images with no container
+# (the 2070: verbatim-worker, open-webui, ollama, postgres, ntfy -- ~40 GB of it).
+if [ "${PRUNE_IMAGES:-1}" = "1" ]; then
+    docker image prune -af >/dev/null 2>&1 || true
+else
+    echo "PRUNE_IMAGES=0 — leaving unreferenced images alone"
+fi
