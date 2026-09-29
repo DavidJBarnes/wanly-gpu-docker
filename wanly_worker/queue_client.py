@@ -102,7 +102,7 @@ def worker_kind(provides: list[str]) -> str:
     return worker_kinds(provides)[0]
 
 
-def export_identity(names: list[str]) -> dict[str, str]:
+def export_identity(names: list[str], equipped: list[str] | None = None) -> dict[str, str]:
     """WORKER_KINDS / WORKER_PROVIDES for the render daemon's env (wanly-gpu-daemon#185).
 
     ONE WRITER PER ROW. When the render daemon runs here it is the registrar for the box: it
@@ -110,8 +110,13 @@ def export_identity(names: list[str]) -> dict[str, str]:
     every enabled service. Written into os.environ before the supervisor starts anything,
     because that is where a child's env comes from.
     """
+    # PROVIDES also lists the services this box can switch INTO but is not running yet
+    # (image-edit, console#548), so the Workers row says the 3090 can do full-mode edits while
+    # it renders. KINDS stays what is running: it decides what the box may claim.
+    from wanly_worker.registry import MODE_ONLY
+    extra = [n for n in (equipped or []) if n in MODE_ONLY and n not in names]
     return {"WORKER_KINDS": ",".join(worker_kinds(names)),
-            "WORKER_PROVIDES": ",".join(names)}
+            "WORKER_PROVIDES": ",".join([*names, *extra])}
 
 
 class QueueClient:
@@ -156,7 +161,9 @@ class QueueClient:
         (wanly-gpu-docker#80). A service is never waiting for work, so borrowing it would
         extend exactly the confusion that is already costing us.
         """
-        rows = self._sup.snapshot()
+        # Stopped on purpose (another mode's service) is not a fault -- the same rule /health
+        # applies. Counting it read every box outside render mode as `degraded`.
+        rows = [r for r in self._sup.snapshot() if not r.get("stopped")]
         return "online" if rows and all(r["ready"] for r in rows) else "degraded"
 
     def _gpu_stats(self) -> dict | None:

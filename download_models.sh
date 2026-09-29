@@ -33,14 +33,29 @@
 # segment, which is what a missing or half-downloaded model actually costs.
 set -uo pipefail
 
-MODELS="${MODELS_DIR:-/workspace/models}"
-LTX="$MODELS/ltx-2.3"
+# `--image-edit` checks (and on a pod, fetches) the Qwen-Image-Edit set for the image-edit
+# service instead of the LTX set (wanly-console#548). Same rules, same mount logic, same
+# truncation check -- a second script would be a second copy of all three to drift.
+TARGET=ltx
+[ "${1:-}" = "--image-edit" ] && TARGET=image-edit
+
+if [ "$TARGET" = image-edit ]; then
+    MODELS="${IMAGE_EDIT_MODELS_DIR:-/workspace/qwen}"
+    LTX="$MODELS"
+else
+    MODELS="${MODELS_DIR:-/workspace/models}"
+    LTX="$MODELS/ltx-2.3"
+fi
 FAIL=0
 
 echo "model root: $MODELS"
 # A read-only bind mount is the 3090; anything else is a pod that may have to fetch.
-mkdir -p "$LTX/diffusion_models" "$LTX/text_encoders" "$LTX/latent_upscale_models" \
-         "$LTX/loras" "$MODELS/loras" 2>/dev/null || true
+if [ "$TARGET" = ltx ]; then
+    mkdir -p "$LTX/diffusion_models" "$LTX/text_encoders" "$LTX/latent_upscale_models" \
+             "$LTX/loras" "$MODELS/loras" 2>/dev/null || true
+else
+    mkdir -p "$MODELS/v23" "$MODELS/loras" 2>/dev/null || true
+fi
 if [ ! -d "$MODELS" ]; then
     echo "!! FATAL: $MODELS does not exist and could not be created."
     echo "!! On the 3090 this is a bind mount: -v /home/david/LTX-2/models:/workspace/models:ro"
@@ -126,6 +141,17 @@ _WANTED=(
 )
 # Character LoRAs are NOT here: the daemon syncs those per claim from S3, so a pod carries
 # only the ones its jobs actually name.
+
+# THE IMAGE-EDIT SET (wanly-console#548), relative to IMAGE_EDIT_MODELS_DIR (the 3090's
+# ~/models/qwen). One file: Phr00t's Rapid-AIO v23 (base Qwen-Image-Edit-2511, v20 onward),
+# the checkpoint keyframe-server ran. The 3090's copy matches HF by sha256
+# (fdb919fc81bea63f13759967fc92c9118142e5c70d4e6795199233a35eefa233). No LoRA: the head-angle
+# recipe is prompt-only; the #548 spike rejected the one community angle LoRA for this base.
+if [ "$TARGET" = image-edit ]; then
+    _WANTED=(
+      "v23|Qwen-Rapid-AIO-NSFW-v23.safetensors|Phr00t/Qwen-Image-Edit-Rapid-AIO|v23/Qwen-Rapid-AIO-NSFW-v23.safetensors|27"
+    )
+fi
 
 _report() {   # path started_at
     # Integers and builtins only. `bc` is NOT in this image, and calling it printed
@@ -243,7 +269,7 @@ if [ "$NEED_FETCH" -eq 1 ]; then
     if _is_mountpoint "$MODELS"; then
         echo "!! FATAL: $MODELS is a bind mount from the host, and it is incomplete."
         echo "!! The host provides these models; downloading a second copy here is wrong."
-        echo "!! Fix the host tree (on the 3090: /home/david/LTX-2/models) or the mount."
+        echo "!! Fix the host tree (on the 3090: /home/david/LTX-2/models, or ~/models/qwen for --image-edit) or the mount."
         exit 1
     fi
 
@@ -292,7 +318,9 @@ if [ "$NEED_FETCH" -eq 1 ]; then
     done
 fi
 
-for d in diffusion_models loras text_encoders latent_upscale_models; do
+[ "$TARGET" = ltx ] && LTX_DIRS="diffusion_models loras text_encoders latent_upscale_models" \
+                     || LTX_DIRS=""
+for d in $LTX_DIRS; do
     p="$LTX/$d"
     if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
         echo "  $d: $(ls -1 "$p" | wc -l) file(s) — $(ls -1 "$p" | head -3 | tr '\n' ' ')"
@@ -352,7 +380,34 @@ sys.exit(1 if bad else 0)
 PYEOF
 
 echo "checking safetensors headers against actual byte counts..."
-mapfile -t FILES < <(find "$LTX" "$MODELS/loras" -maxdepth 2 -name '*.safetensors' 2>/dev/null)
+if [ "$TARGET" = image-edit ]; then
+    # Only what the service loads: ~/models/qwen also holds v19 and unrelated LoRAs, and a
+    # broken file there is not this service's to refuse a boot over.
+    FILES=()
+    for row in "${_WANTED[@]}"; do
+        IFS='|' read -r d n _r _p _gib <<< "$row"
+        [ -f "$MODELS/$d/$n" ] && FILES+=("$MODELS/$d/$n")
+    done
+
+    # AuraFace (fal/AuraFace-v1 glintr100.onnx) scores each edit against its source. It lives in
+    # insightface's store -- a writable host mount beside face-crop's buffalo_l -- and is
+    # fetched there when absent. NOT fatal: an edit without a score is still an edit, and the
+    # service says why the number is missing.
+    AURA="${INSIGHTFACE_ROOT:-/root/.insightface}/models/auraface/glintr100.onnx"
+    if [ ! -s "$AURA" ]; then
+        echo "  fetching AuraFace glintr100.onnx into $(dirname "$AURA")"
+        mkdir -p "$(dirname "$AURA")" 2>/dev/null
+        python3 - "$(dirname "$AURA")" <<'PYEOF' || echo "  !! AuraFace fetch failed -- edits will come back unscored"
+import sys
+from huggingface_hub import hf_hub_download
+hf_hub_download(repo_id="fal/AuraFace-v1", filename="glintr100.onnx", local_dir=sys.argv[1])
+PYEOF
+    else
+        echo "  AuraFace present: $AURA"
+    fi
+else
+    mapfile -t FILES < <(find "$LTX" "$MODELS/loras" -maxdepth 2 -name '*.safetensors' 2>/dev/null)
+fi
 if [ ${#FILES[@]} -eq 0 ]; then
     echo "  (none found)"
 else

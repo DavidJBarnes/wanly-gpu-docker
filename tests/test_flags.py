@@ -122,7 +122,17 @@ class TestWhatABoxRegistersAs:
         import inspect
         from wanly_worker import control
         src = inspect.getsource(control.lifespan)
-        assert src.index("os.environ.update(export_identity(names))") < src.index("Supervisor(")
+        assert src.index("os.environ.update(export_identity(names, equipped))") \
+            < src.index("Supervisor(")
+
+    def test_a_mode_only_service_is_listed_as_a_capability_not_a_kind(self):
+        """console#548: the 3090 renders with image-edit stopped; the Workers row should still
+        say it can do full-mode edits, and must not claim anything new because of it."""
+        from wanly_worker.queue_client import export_identity
+        env = export_identity(["ltx-engine", "face-crop"],
+                              ["ltx-engine", "face-crop", "image-edit"])
+        assert env == {"WORKER_KINDS": "render",
+                       "WORKER_PROVIDES": "ltx-engine,face-crop,image-edit"}
 
 
 class TestTheTrainerDrainsItsOwnRow:

@@ -111,6 +111,44 @@ captioner's footprint (qwen3-vl:32b leaves ~2 GB, under the 2.5 GB bar -> CPU).
 `curl -s :8085/health` reports `model_loaded`, the device, why the last edit ran where it did,
 and `vram_peak_mib` -- torch's measured peak for the last GPU edit.
 
+## image-edit and edit mode (console#548)
+
+Qwen-Image-Edit "full mode" for the console's Edit dialog: head angles beyond LivePortrait's
+±20° (three-quarter, full profile, look up/down) and free-text instructions. It needs ~20 GB of
+the card and has no CPU fallback, so it runs **only in edit mode** (`registry.MODE_ONLY`): the
+supervisor builds it at boot and holds it stopped; render and caption modes never run it.
+
+```
+POST :8081/mode {"mode": "edit"}    # the segment in flight finishes, then the render stack,
+                                    # trainer and captioner stop and image-edit starts
+POST :8081/mode {"mode": "render"}  # back; queued renders resume
+```
+
+wanly-api drives this itself (`app/full_edit.py`): it asks for edit mode when a full-mode job
+arrives, waits (the console shows "3090 is rendering; edit queued"), runs the queue, and asks for
+the previous mode back 90 s after the last edit. As a backstop the box returns by itself after
+`EDIT_IDLE_RETURN_S` (600 s) with no edit -- an API restarted mid-queue must not leave every
+render parked behind an idle model. A switch that fails to start image-edit puts the previous
+mode back rather than leaving the box with nothing running. A training run is never interrupted:
+wanly-api waits while the trainer reports one.
+
+**The 3090** -- add `image-edit` to `SERVICES` (and to `SERVICES_RENDER` if the old
+`wanly-mode.sh` line is still in worker.env), and mount the Qwen tree:
+
+```
+SERVICES=ltx-engine,lora-trainer,image-description,face-crop,image-edit
+IMAGE_EDIT_MODELS_HOST_DIR=/home/david/models/qwen   # read-only, holds v23/Qwen-Rapid-AIO-NSFW-v23.safetensors
+IMAGE_EDIT_PORT=8086
+INSIGHTFACE_HOST_DIR=/home/david/.insightface       # AuraFace glintr100.onnx for the identity score
+```
+
+`download_models.sh --image-edit` (run by the preflight on the first switch) checks the
+checkpoint's safetensors header against its size and fetches AuraFace into the insightface store
+if it is missing. `curl -s :8086/health` reports `idle_s`, the last edit's time and VRAM peak.
+
+Measured in the #548 spike: ~13 s per edit warm, ~23 s with the checkpoint load, ComfyUI's peak
+23.1-23.7 GB with the card to itself.
+
 ## Render or caption, one command (#131)
 
 The 3090 runs every service in one container, which is right — one box, one row, one GPU. But
