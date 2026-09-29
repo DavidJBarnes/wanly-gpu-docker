@@ -30,7 +30,12 @@ jobs:
         # the guidance tests import the module but never open a socket.
         # pillow: engine/app.py imports it at module level (keyframe decode/resize); the
         # text-to-video tests (#145) import the app and drive run_job against a fake ComfyUI.
-        run: pip install pytest "numpy<2" requests pillow -r wanly_worker/requirements.txt
+        # opencv-python-headless: face-edit's detail restoration (services/face_edit/restore.py)
+        # is tested here -- its one hard guarantee, that pixels the warp did not move come
+        # back byte-for-byte, is exactly the kind of thing a refactor breaks silently.
+        # LivePortrait itself (torch, ultralytics) is not installed. 4.10 is the last opencv
+        # built against numpy 1.x, which the pin above keeps.
+        run: pip install pytest "numpy<2" requests pillow "opencv-python-headless==4.10.0.84" -r wanly_worker/requirements.txt
 
       - name: Shell scripts parse
         run: bash -n start.sh fetch_daemon.sh download_models.sh deploy/*.sh

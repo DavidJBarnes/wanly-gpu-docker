@@ -71,6 +71,41 @@ drains that row: the render daemon parks, the card frees, training runs, the dra
 released. The idle gate reads `training` off the container's own `/health` and leaves it
 alone throughout.
 
+## face-edit (console#547)
+
+LivePortrait face edits -- expression, gaze, small head turns -- for the console's Edit dialog.
+`:full` only; models are baked (no mount). wanly-api calls it at `face_edit_url`.
+
+It claims no work, so it runs in **every** mode, and it borrows the GPU per edit only when no
+neighbour needs it (`wanly_worker/services/face_edit/gpu.py`): a render in flight or an A1111
+generation sends the edit to CPU (~8-10 s measured on a 6-P-core laptop CPU, 1248x1824 frame)
+instead of taking VRAM a job with no fallback needs. On a free card an edit is ~1 s and the
+weights go back to CPU after `FACE_EDIT_GPU_IDLE_S` (45 s) or as soon as a neighbour starts.
+
+**The 2070** -- beside Automatic1111, where it is meant to live:
+
+```
+IMAGE=davidjbarnes/wanly-gpu-docker:full
+FRIENDLY_NAME=2070.zero
+QUEUE_URL=http://api.wanly22.com:8001
+QUEUE_API_KEY=...
+SERVICES=face-edit
+FACE_EDIT_A1111_URL=http://host.docker.internal:7860
+```
+
+No `JOBS_DIR`/`MODELS_DIR`: those are required only with `ltx-engine` or `lora-trainer`, and a
+box without them publishes no ComfyUI or engine port. `run-worker.sh` adds the
+`host.docker.internal` alias whenever face-edit is enabled, so the container can see A1111 on
+the host: it never uses the GPU while A1111 is generating, and asks an *idle* A1111 to unload
+its checkpoint only when the card is otherwise too full (the captioner's `_yield_the_gpu` rule).
+
+**The 3090** -- add `face-edit` to its `SERVICES` line. In render mode the card is ~23 of 24 GB,
+so edits there run on CPU while a segment is in flight; in caption mode it depends on the
+captioner's footprint (qwen3-vl:32b leaves ~2 GB, under the 2.5 GB bar -> CPU).
+
+`curl -s :8085/health` reports `model_loaded`, the device, why the last edit ran where it did,
+and `vram_peak_mib` -- torch's measured peak for the last GPU edit.
+
 ## Render or caption, one command (#131)
 
 The 3090 runs every service in one container, which is right — one box, one row, one GPU. But

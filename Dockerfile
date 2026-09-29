@@ -191,6 +191,62 @@ RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
       echo "built without the trainer and image-description (WITH_TRAINER=0) — this is the lean :latest tag"; \
     fi
 
+# ---------------------------------------------------------------- face-edit (console#547)
+#
+# LivePortrait's ExpressionEditor, run IN-PROCESS by wanly_worker/services/face_edit -- no
+# ComfyUI server (see engine.py for why). Its own RUN, after the trainer layer, so adding it
+# did not invalidate that ~7 GB layer's cache. In the :full tag only, like image-description:
+# RunPod pods pull the lean tag at every launch and would pay ~0.7 GB each for a service they
+# never run.
+#
+# THE NODE IS PINNED. engine.py calls its code unchanged; an unpinned clone would change what
+# an edit does between two builds with nothing in the diff.
+#
+# DEPENDENCIES UNDER CONSTRAINTS. ultralytics (the node's face detector, a hard import) pulls
+# opencv/torch/numpy requirements of its own, and this image has been bitten by a transitive
+# install replacing a pinned build (torchaudio cu130, onnxruntime) -- so the installed torch,
+# torchvision, torchaudio, numpy and opencv are frozen into a constraints file first and pip
+# must resolve around them. Verified with the image's exact versions (torch 2.11.0, numpy 2.2.6,
+# opencv 5.0.0.93): it adds ultralytics, polars, ultralytics-thop and dill, and moves nothing.
+# NOTE ultralytics is AGPL-3.0 (keyframe-server flagged it too) -- fine for a private tool.
+#
+# MODELS ARE BAKED and checked by sha256 (the content pin; the URLs say `main`). ~0.52 GB, and
+# the node's own runtime downloader would otherwise make the first edit depend on the network
+# and, on a failed download, leave a truncated file it then tries to load.
+ARG ALP_COMMIT=3bba732915e22f18af0d221b9c5c282990181f1b
+ENV FACE_EDIT_NODE_DIR=/opt/face-edit/ComfyUI-AdvancedLivePortrait \
+    FACE_EDIT_MODELS_DIR=/opt/face-edit/models
+RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
+      git clone https://github.com/PowerHouseMan/ComfyUI-AdvancedLivePortrait.git "$FACE_EDIT_NODE_DIR" \
+      && git -C "$FACE_EDIT_NODE_DIR" checkout "$ALP_COMMIT" \
+      && pip freeze | grep -iE '^(torch|torchvision|torchaudio|numpy|opencv-python|opencv-python-headless)==' \
+           > /tmp/face-edit-constraints.txt \
+      && cat /tmp/face-edit-constraints.txt \
+      && pip install --no-cache-dir -c /tmp/face-edit-constraints.txt \
+           "ultralytics==8.3.253" "dill==0.4.1" rich \
+      && mkdir -p "$FACE_EDIT_MODELS_DIR/liveportrait" "$FACE_EDIT_MODELS_DIR/ultralytics" \
+      && for m in appearance_feature_extractor motion_extractor warping_module spade_generator \
+                  stitching_retargeting_module; do \
+           curl -fsSL --retry 3 -o "$FACE_EDIT_MODELS_DIR/liveportrait/$m.safetensors" \
+             "https://huggingface.co/Kijai/LivePortrait_safetensors/resolve/main/$m.safetensors"; \
+         done \
+      && curl -fsSL --retry 3 -o "$FACE_EDIT_MODELS_DIR/ultralytics/face_yolov8n.pt" \
+           "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8n.pt" \
+      && cd "$FACE_EDIT_MODELS_DIR" \
+      && printf '%s  %s\n' \
+           38bef5de50a92bf1fc66e8c511051a19dfacdf80c37f8713425ec15dc9ca7d34 liveportrait/appearance_feature_extractor.safetensors \
+           3568cd410e29d046771acb55ecfdfe4c7c197d345bd8b7f95942ef63130b6c9e liveportrait/motion_extractor.safetensors \
+           f7b7834bd6039b4088f72e5161e60ad366f68a3763df8a3eac0bc0f9d46fdbbf liveportrait/warping_module.safetensors \
+           ca04fbec765745e9eae836d2d7522c274647b277ce5f25104fa1705b75222212 liveportrait/spade_generator.safetensors \
+           60725cf3523ae413880da28ed583c9e84c5c25695a0cef1b77210ea31cc424ea liveportrait/stitching_retargeting_module.safetensors \
+           70b640f8f60b1cf0dcc72f30caf3da9495eb2fb6509da48c53374ad6806e6a9c ultralytics/face_yolov8n.pt \
+         | sha256sum -c - \
+      && chmod -R a+rX /opt/face-edit \
+      && python3 -c "import ultralytics, dill, torch, numpy, cv2; print('face-edit deps:', ultralytics.__version__, torch.__version__, numpy.__version__, cv2.__version__)"; \
+    else \
+      echo "built without face-edit (WITH_TRAINER=0) — the lean :latest tag"; \
+    fi
+
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
@@ -228,7 +284,7 @@ ENV SERVICES=ltx-engine \
 # image that also clones ComfyUI and five node packs.
 ENV WANLY_IMAGE_REF=$GIT_SHA
 
-# ComfyUI, ltx-engine, the control API, sshd; then image-description (ollama) and face-crop,
-# which wanly-api calls across the network. The trainer binds loopback and is not exposed.
-EXPOSE 8188 8190 8081 22 11434 8084
+# ComfyUI, ltx-engine, the control API, sshd; then image-description (ollama), face-crop and
+# face-edit, which wanly-api calls across the network. The trainer binds loopback and is not exposed.
+EXPOSE 8188 8190 8081 22 11434 8084 8085
 CMD ["/app/start.sh"]
