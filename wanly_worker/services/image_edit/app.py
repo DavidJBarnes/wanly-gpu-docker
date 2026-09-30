@@ -1,21 +1,33 @@
-"""The image-edit service's HTTP API: Qwen-Image-Edit "full mode" (wanly-console#548).
+"""The image-edit service's HTTP API: Qwen-Image-Edit "full mode" (wanly-console#548, #569, #570).
 
-    POST /edit     {image: b64, instruction? | angle?: {yaw, pitch}, seed?, denoise?, ...}
+    POST /edit     {image: b64, angle?: {yaw, pitch}, expression?, instruction?, face_box?,
+                    seed?, denoise?, ...}
                    -> {image: b64 png, width, height, prompt, identity: {aura, reason}, ...}
-    GET  /health   comfy up, model loaded, busy, idle seconds, last edit's timings and VRAM
+    POST /faces    {image: b64} -> {width, height, faces: [{index, box, width}], default_index}
+    GET  /health   comfy up, model loaded, busy, idle seconds, what an edit is waiting for,
+                   last edit's timings and VRAM
 
-Called, not claimed, like face-edit -- but it only EXISTS in edit mode (registry.MODE_ONLY):
-Qwen holds ~20 GB of the 3090, so the render stack is stopped (its segment finished first) before
-this starts. wanly-api owns the queue and the mode switch; this answers one edit at a time.
+Called, not claimed, like face-edit. Two deployments of the same code:
+  * THE MAIN 3090, EDIT MODE ONLY (registry.MODE_ONLY): Qwen holds ~20 GB, so the render stack
+    is stopped (its segment finished first) before this starts. wanly-api owns the queue and
+    the mode switch.
+  * A STANDING BOX (console#570, the second 3090): SERVICES=image-edit and nothing that renders,
+    so it runs in the box's default mode with no switch at all. It shares its card with
+    Automatic1111 by the rule in share.py.
 
-WHAT IT IS ASKED TO DO is either free text (`instruction`) or a head angle (`angle`). The angle
-recipe -- the words, the LoRA or not -- lives here, next to the model it was measured on, the way
-face-edit's lexicon does; wanly-api sends numbers. See graph.py for the graph and the framing pins.
+WHAT IT IS ASKED TO DO is any mix of a head angle (`angle`), an expression preset
+(`expression`, console#569) and free text (`instruction`). The words -- angles and expressions
+-- live here, next to the model they were written for, the way face-edit's lexicon does;
+wanly-api sends numbers and names. See graph.py for the graph and the framing pins.
+
+WHICH FACE (console#569): `face_box` from POST /faces edits that face alone -- crop, edit, paste
+back feathered -- so nobody else in the picture is regenerated. See crop.py for why.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import os
 import random
@@ -27,7 +39,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from wanly_worker.services.image_edit import graph, identity
+from wanly_worker.services.image_edit import crop as cropping
+from wanly_worker.services.image_edit import graph, identity, share
 
 COMFY_PORT = int(os.environ.get("IMAGE_EDIT_COMFY_PORT", "8286"))
 COMFY = f"http://127.0.0.1:{COMFY_PORT}"
@@ -39,10 +52,25 @@ QUEUE_WAIT_S = float(os.environ.get("IMAGE_EDIT_QUEUE_WAIT_S", "900"))
 MAX_EDGE = int(os.environ.get("IMAGE_EDIT_MAX_EDGE", "8000"))
 
 _turn = asyncio.Lock()
-_state: dict = {"last_edit_at": None, "last": None, "model_loaded": False, "edits": 0}
+_state: dict = {"last_edit_at": None, "last": None, "model_loaded": False, "edits": 0,
+                "waiting": None, "unloads": 0, "last_unload": None}
 _started_at = time.time()
+#: What this service can be asked for beyond #548's angle/instruction, so wanly-api can tell an
+#: image that predates them (it would silently ignore the fields) from one that has them.
+FEATURES = ["angle", "instruction", "expression", "face_box", "faces"]
 
-app = FastAPI(title="wanly image-edit")
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    task = asyncio.create_task(_watch()) if share.watching() else None
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+
+
+app = FastAPI(title="wanly image-edit", lifespan=_lifespan)
 
 
 class Angle(BaseModel):
@@ -57,6 +85,10 @@ class EditRequest(BaseModel):
     image: str = Field(min_length=1)
     instruction: str | None = Field(None, max_length=2000)
     angle: Angle | None = None
+    #: An expression preset by name (graph.EXPRESSIONS, console#569). Combines with an angle.
+    expression: str | None = Field(None, max_length=50)
+    #: [x1, y1, x2, y2] in the source's pixels (from POST /faces): edit that face alone.
+    face_box: list[float] | None = Field(None, min_length=4, max_length=4)
     seed: int | None = Field(None, ge=0, le=2**48)
     #: < 1 starts from the source's latent; a head turn needs 1.0 (see graph.build_workflow).
     denoise: float = Field(1.0, gt=0.0, le=1.0)
@@ -78,15 +110,44 @@ def _decode(b64: str):
     return im
 
 
+class FacesRequest(BaseModel):
+    image: str = Field(min_length=1)
+
+
 def resolve(req: EditRequest) -> str:
     """The prompt for a request. ValueError -> 422."""
-    if req.angle is not None and req.instruction:
-        raise ValueError("send an instruction or a head angle, not both")
-    if req.angle is not None:
-        return graph.angle_prompt(req.angle.yaw, req.angle.pitch)
-    if req.instruction:
-        return graph.instruction_prompt(req.instruction)
-    raise ValueError("nothing to apply: send an instruction or a head angle")
+    if req.angle is None and not req.expression and not (req.instruction or "").strip():
+        raise ValueError("nothing to apply: send a head angle, an expression or an instruction")
+    a = req.angle or Angle()
+    return graph.compose_prompt(a.yaw, a.pitch, req.expression, req.instruction)
+
+
+def _check_box(box: list[float], size: tuple[int, int]) -> list[float]:
+    x1, y1, x2, y2 = box
+    if not (x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0 and x1 < size[0] and y1 < size[1]):
+        raise HTTPException(422, f"face_box {box} is not a box inside the "
+                                 f"{size[0]}x{size[1]} image")
+    return [x1, y1, min(x2, size[0]), min(y2, size[1])]
+
+
+def _others(rgb, box: list[float]) -> list[list[float]]:
+    """The OTHER faces, to keep out of the crop. Best effort: a detector that will not load
+    means a crop sized by padding alone, not a failed edit."""
+    try:
+        found = identity.face_boxes(rgb)
+    except Exception as e:                      # noqa: BLE001 -- the crop still works without
+        print(f"[image-edit] face detection unavailable ({e}); cropping by padding alone",
+              flush=True)
+        return []
+    return [b for b in found if _iou(b, box) < 0.5]
+
+
+def _iou(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
 
 
 def _vram_used_mib() -> int | None:
@@ -139,6 +200,22 @@ async def _run_graph(client: httpx.AsyncClient, wf: dict) -> bytes:
     raise HTTPException(504, f"the edit did not finish within {EDIT_TIMEOUT_S:.0f}s")
 
 
+@app.post("/faces")
+async def faces(req: FacesRequest):
+    """The faces an edit can be pointed at, left to right, and the one an edit that names none
+    is about: the largest (the one the identity score is taken on). CPU, a second or so."""
+    src = await asyncio.to_thread(_decode, req.image)
+    try:
+        boxes = await asyncio.to_thread(identity.face_boxes, src)
+    except Exception as e:                      # noqa: BLE001
+        raise HTTPException(503, f"face detection is unavailable: {e}") from e
+    default = (max(range(len(boxes)), key=lambda i: (boxes[i][2] - boxes[i][0])
+                   * (boxes[i][3] - boxes[i][1])) if boxes else None)
+    return {"width": src.width, "height": src.height, "default_index": default,
+            "faces": [{"index": i, "box": b, "width": round(b[2] - b[0], 1)}
+                      for i, b in enumerate(boxes)]}
+
+
 @app.post("/edit")
 async def edit(req: EditRequest):
     from PIL import Image
@@ -149,19 +226,40 @@ async def edit(req: EditRequest):
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     src = await asyncio.to_thread(_decode, req.image)
-    w, h = graph.latent_size(src.width, src.height)
+    # WHICH FACE: the region to regenerate. The whole frame unless a face was chosen.
+    region = (0, 0, src.width, src.height)
+    near = 0
+    if req.face_box is not None:
+        box = _check_box(req.face_box, src.size)
+        others = await asyncio.to_thread(_others, src, box)
+        region = cropping.crop_box(box, src.size, others)
+        near = cropping.neighbours_inside(region, others)
+    part = src if region == (0, 0, src.width, src.height) else src.crop(region)
+    # A small crop goes to the model scaled up; the result comes back to the crop's size.
+    ww, wh = cropping.work_size(*part.size) if req.face_box is not None else part.size
+    w, h = graph.latent_size(ww, wh)
     seed = req.seed if req.seed is not None else random.randrange(2**32)
     try:
         await asyncio.wait_for(_turn.acquire(), timeout=QUEUE_WAIT_S)
     except asyncio.TimeoutError:
         raise HTTPException(503, f"image-edit is busy: another edit held it for {QUEUE_WAIT_S:.0f}s")
-    t0 = time.time()
     stop, peak = asyncio.Event(), [0]
-    sampler = asyncio.create_task(_sample_vram(stop, peak))
+    sampler = None
     try:
+        # THE CARD'S OTHER TENANT FIRST (console#570): never start under an A1111 generation,
+        # and make room only when Qwen is not already resident. A no-op on the main 3090.
+        try:
+            waited = await share.wait_for_a1111(_state)
+        except share.A1111Busy as e:
+            raise HTTPException(503, str(e)) from e
+        room = await share.make_room(_state["model_loaded"])
+        if room:
+            print(f"[image-edit] {room}", flush=True)
+        t0 = time.time()
+        sampler = asyncio.create_task(_sample_vram(stop, peak))
         # The source goes in at the latent's size: a denoise < 1 needs it (VAEEncode emits a
         # latent at the image's own size), and at 1.0 it costs nothing.
-        cond = src if src.size == (w, h) else src.resize((w, h), Image.LANCZOS)
+        cond = part if part.size == (w, h) else part.resize((w, h), Image.LANCZOS)
         os.makedirs(os.path.join(WORK_DIR, "in"), exist_ok=True)
         name = f"edit_{uuid.uuid4().hex}.png"
         path = os.path.join(WORK_DIR, "in", name)
@@ -170,6 +268,9 @@ async def edit(req: EditRequest):
                                   denoise=req.denoise)
         async with httpx.AsyncClient() as client:
             png = await _run_graph(client, wf)
+        # Resident from here until the watcher unloads it; set before the turn is released so
+        # the watcher never sees "not busy, not resident" with the weights still on the card.
+        _state.update(last_edit_at=time.time(), model_loaded=True)
         t_edit = time.time() - t0
         try:
             os.remove(path)
@@ -177,21 +278,35 @@ async def edit(req: EditRequest):
             pass
     finally:
         stop.set()
-        await sampler
+        if sampler is not None:
+            await sampler
         _turn.release()
-    out = Image.open(io.BytesIO(png)).convert("RGB")
+    edited = Image.open(io.BytesIO(png)).convert("RGB")
+    if part is src:
+        out, scored_src, scored_out = edited, cond, edited
+    else:
+        piece = edited if edited.size == part.size else edited.resize(part.size, Image.LANCZOS)
+        out = Image.fromarray(cropping.paste(np.asarray(src), np.asarray(piece), region))
+        # Scored on the crop: the chosen face is its subject, whoever is larger elsewhere.
+        scored_src, scored_out = part, piece
     ident = {"aura": None, "reason": "not requested"}
     t1 = time.time()
     if req.score:
-        ident = await asyncio.to_thread(identity.score, np.asarray(cond), np.asarray(out))
+        ident = await asyncio.to_thread(identity.score, np.asarray(scored_src),
+                                        np.asarray(scored_out))
     t_score = time.time() - t1
-    _state.update(last_edit_at=time.time(), model_loaded=True, edits=_state["edits"] + 1,
+    _state.update(edits=_state["edits"] + 1,
                   last={"seconds": round(t_edit, 1), "vram_peak_mib": peak[0] or None,
-                        "width": out.width, "height": out.height})
-    print(f"[image-edit] {'angle ' + str(req.angle.model_dump()) if req.angle else 'instruction'}"
-          f" {src.width}x{src.height} -> {w}x{h} seed {seed}"
-          f" in {t_edit:.1f}s, vram peak {peak[0]} MiB,"
-          f" aura {ident['aura']}", flush=True)
+                        "width": out.width, "height": out.height,
+                        "waited_for_a1111_s": round(waited, 1)})
+    what = ", ".join(x for x in (
+        f"angle {req.angle.model_dump()}" if req.angle else "",
+        f"expression {req.expression}" if req.expression else "",
+        "instruction" if (req.instruction or "").strip() else "") if x)
+    print(f"[image-edit] {what} {src.width}x{src.height}"
+          f"{f' face crop {region}' if part is not src else ''} -> {w}x{h} seed {seed}"
+          f" in {t_edit:.1f}s{f' after {waited:.0f}s waiting for A1111' if waited >= 1 else ''},"
+          f" vram peak {peak[0]} MiB, aura {ident['aura']}", flush=True)
     buf = io.BytesIO()
     out.save(buf, "PNG", compress_level=6)
     # A capped JPEG beside the PNG, for the console's "after" pane: wanly-api holds the job and
@@ -212,9 +327,39 @@ async def edit(req: EditRequest):
         "denoise": req.denoise,
         "checkpoint": graph.CHECKPOINT,
         "identity": ident,
-        "timings_ms": {"edit": round(t_edit * 1000), "score": round(t_score * 1000)},
+        "timings_ms": {"edit": round(t_edit * 1000), "score": round(t_score * 1000),
+                       "waited_for_a1111": round(waited * 1000)},
         "vram_peak_mib": peak[0] or None,
+        # Echoed so wanly-api can tell a face-scoped edit from an image too old to know the
+        # field (which would have edited the whole frame and said nothing).
+        "face_box": req.face_box,
+        "crop": list(region) if part is not src else None,
+        "neighbours_in_crop": near if part is not src else None,
+        "expression": req.expression,
     }
+
+
+async def _watch() -> None:
+    """Hand the card back (share.py rule 3): unload Qwen when A1111 starts generating or after
+    the idle timeout, never while an edit runs. Only started where there is something to do."""
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(share.WATCH_S)
+            try:
+                if not _state["model_loaded"] or _turn.locked():
+                    continue
+                gen = await share.a1111_generating()
+                why = share.unload_reason(resident=_state["model_loaded"], busy=_turn.locked(),
+                                          idle_s=time.time() - (_state["last_edit_at"] or _started_at),
+                                          a1111_generating=gen)
+                if why and not _turn.locked() and await share.unload_qwen(COMFY, client):
+                    _state.update(model_loaded=False, unloads=_state.get("unloads", 0) + 1,
+                                  last_unload={"at": round(time.time()), "why": why})
+                    print(f"[image-edit] unloaded Qwen: {why}", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:              # noqa: BLE001 -- a watcher must not die
+                print(f"[image-edit] watcher: {e}", flush=True)
 
 
 @app.get("/health")
@@ -236,5 +381,13 @@ async def health():
         "edits": _state["edits"],
         "model_loaded": _state["model_loaded"],
         "last": _state["last"],
-        "checkpoint": graph.CHECKPOINT
+        "checkpoint": graph.CHECKPOINT,
+        "features": FEATURES,
+        # Sharing the card (console#570). wanly-api reads `a1111_generating` to say why a job
+        # waits ("second 3090 busy (A1111 generating)") and sends the edit only once it is not.
+        "shared_with_a1111": share.shared(),
+        "a1111_generating": await share.a1111_generating(),
+        "waiting": _state.get("waiting"),
+        "unload_idle_s": share.UNLOAD_IDLE_S,
+        "last_unload": _state.get("last_unload"),
     }

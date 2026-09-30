@@ -149,6 +149,62 @@ if it is missing. `curl -s :8086/health` reports `idle_s`, the last edit's time 
 Measured in the #548 spike: ~13 s per edit warm, ~23 s with the checkpoint load, ComfyUI's peak
 23.1-23.7 GB with the card to itself.
 
+### Faces and expressions (console#569)
+
+The Edit dialog sends every edit here now -- head angles, the expression presets (by name;
+the words are `graph.EXPRESSIONS`, beside the angle words) and free text. LivePortrait is off
+the dialog. `POST :8086/faces` lists the faces in an image, and `/edit` with a `face_box`
+edits that face alone: crop around it, edit the crop, paste it back feathered, so nobody else
+in the picture is regenerated (`services/image_edit/crop.py` says why). **A box running an
+older image ignores `expression` and `face_box`**; wanly-api reads `features` off
+`/health` and refuses rather than edit the whole frame, so re-pin the main 3090 for them.
+
+## A standing image-edit box: the second 3090 (console#570)
+
+With a second 24 GB card, Qwen runs **full-time** there and edits stop pausing renders on the
+main 3090. `SERVICES=image-edit` with nothing that renders needs no mode: `select_mode` runs a
+box's mode-bound services when it has nothing else. wanly-api prefers this box while its
+`/health` is ok (`image_edit_standing_url`) and falls back to the main 3090's edit mode when it
+is not.
+
+It shares its card with the host's Automatic1111 (`services/image_edit/share.py`):
+
+1. **A1111 is never interrupted.** An edit waits while A1111 is generating; wanly-api shows
+   "second 3090 busy (A1111 generating)" and sends the edit only once it is not. An edit that
+   still lands mid-generation waits `IMAGE_EDIT_A1111_WAIT_S` (300 s) and is then refused, not
+   forced.
+2. **Room is made only when needed:** with Qwen not resident and under
+   `IMAGE_EDIT_MIN_FREE_MIB` (21.5 GB) free, an *idle* A1111 is asked to unload its checkpoint
+   (face-edit's `yield_a1111`, reused). It reloads from RAM on its next generation.
+3. **A1111 gets the card back as soon as it wants it:** with no edit running, Qwen is unloaded
+   (ComfyUI `/free`) the moment A1111 starts generating, or after `IMAGE_EDIT_UNLOAD_IDLE_S`
+   idle. An edit in progress is never cut short.
+
+The one overlap it cannot prevent: generate-forever re-clicks Generate on its own timer, so
+its next image can start *during* an edit and run in what Qwen leaves (slow, or an OOM for that
+one image). For a run of edits, pause generate-forever -- or raise a1111-tweaks' "generate
+forever" delay, which is the gap an edit starts in.
+
+**Deploy, after the card swap** (not done yet -- the hardware is not in):
+
+1. Driver/CUDA/CDI check on the new card: `nvidia-smi` on the host, then
+   `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`.
+2. Copy the checkpoint from the main 3090 (~28 GB): `rsync -a --info=progress2
+   3090.zero:/home/david/models/qwen/v23/ /home/david/models/qwen/v23/`. The preflight checks
+   its safetensors header against its size, so a truncated copy fails the boot loudly.
+3. AuraFace: `download_models.sh --image-edit` fetches `glintr100.onnx` into the insightface
+   store on first boot if missing, or copy `~/.insightface/models/auraface/` from the 3090.
+   buffalo_l (face detection for `/faces`) is fetched on first use into the same store.
+4. `deploy/worker.env`: the standing block in `worker.env.example` -- `SERVICES=image-edit`,
+   `IMAGE_EDIT_MODELS_HOST_DIR`, `IMAGE_EDIT_A1111_URL`, `IMAGE_EDIT_UNLOAD_IDLE_S`, and
+   **`PRUNE_IMAGES=0`** (the prune would delete ~40 GB of other projects' images). Drop
+   `face-edit` from `SERVICES`: nothing in the console calls LivePortrait any more.
+5. `PRUNE_IMAGES=0 ./deploy/run-worker.sh`, then `curl -s :8086/health` (ok,
+   `shared_with_a1111: true`, `features` includes `face_box`), then one real edit.
+6. wanly-api needs nothing if the box keeps the name `2070.zero`: `image_edit_standing_url`
+   defaults to `http://2070.zero:8086` and is simply skipped while nothing healthy answers
+   there. If the box is renamed, set `IMAGE_EDIT_STANDING_URL` in the API's env.
+
 ## Render or caption, one command (#131)
 
 The 3090 runs every service in one container, which is right — one box, one row, one GPU. But

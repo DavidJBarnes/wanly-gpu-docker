@@ -149,7 +149,14 @@ if [ "$WANT_IMAGE_EDIT" = "1" ]; then
     }
     MOUNTS+=(-v "$IMAGE_EDIT_MODELS_HOST_DIR:/workspace/qwen:ro")
     PORTS+=(-p "${IMAGE_EDIT_PORT:-8086}:8086")
-    for v in IMAGE_EDIT_STEPS IMAGE_EDIT_MAX_MP EDIT_IDLE_RETURN_S; do
+    # A STANDING image-edit box (console#570) shares its card with the host's Automatic1111:
+    # the alias makes IMAGE_EDIT_A1111_URL=http://host.docker.internal:7860 resolve, so an edit
+    # can wait out a generation and ask an idle A1111 to unload (services/image_edit/share.py).
+    if [ -n "${IMAGE_EDIT_A1111_URL:-}" ]; then
+        IMAGE_EDIT_ENV_ARGS+=(--add-host "host.docker.internal:host-gateway")
+    fi
+    for v in IMAGE_EDIT_STEPS IMAGE_EDIT_MAX_MP EDIT_IDLE_RETURN_S IMAGE_EDIT_A1111_URL \
+             IMAGE_EDIT_A1111_WAIT_S IMAGE_EDIT_MIN_FREE_MIB IMAGE_EDIT_UNLOAD_IDLE_S; do
         if [ -n "${!v:-}" ]; then IMAGE_EDIT_ENV_ARGS+=(-e "$v=${!v}"); fi
     done
 fi

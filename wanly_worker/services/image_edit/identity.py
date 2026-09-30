@@ -26,6 +26,10 @@ AURA_PATH = os.environ.get("IMAGE_EDIT_AURAFACE",
 _lock = threading.Lock()
 _models: tuple | None = None
 _load_error: str | None = None
+_det = None
+#: Faces narrower than this are not offered for a face choice (console#569): too small to
+#: edit on their own, and usually a background face or a detector guess.
+MIN_FACE_PX = 30
 
 
 def cosine(a, b) -> float:
@@ -36,21 +40,46 @@ def cosine(a, b) -> float:
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def detector():
+    """buffalo_l detection alone, CPU. Separate from AuraFace so the face list (console#569)
+    works on a box whose AuraFace download failed -- a missing score is a reason, a missing
+    face picker would be a silently wrong edit."""
+    global _det
+    with _lock:
+        if _det is None:
+            from insightface.app import FaceAnalysis
+
+            det = FaceAnalysis(name="buffalo_l", root=ROOT, providers=["CPUExecutionProvider"],
+                               allowed_modules=["detection"])
+            det.prepare(ctx_id=-1, det_size=(640, 640))
+            _det = det
+        return _det
+
+
+def face_boxes(rgb) -> list[list[float]]:
+    """Every face's [x1, y1, x2, y2] in `rgb`'s pixels, LEFT TO RIGHT, narrow ones dropped."""
+    import numpy as np
+
+    faces = detector().get(np.ascontiguousarray(np.asarray(rgb)[:, :, ::-1]))
+    boxes = [[round(float(v), 1) for v in f.bbox[:4]] for f in faces]
+    boxes = [b for b in boxes if b[2] - b[0] >= MIN_FACE_PX]
+    return sorted(boxes, key=lambda b: (b[0], b[2]))
+
+
 def _load():
     global _models, _load_error
+    if _models is not None:
+        return _models
+    if not os.path.isfile(AURA_PATH):
+        _load_error = (f"AuraFace model not found at {AURA_PATH} (fal/AuraFace-v1 "
+                       f"glintr100.onnx; download_models.sh --image-edit fetches it)")
+        raise FileNotFoundError(_load_error)
+    det = detector()
     with _lock:
         if _models is not None:
             return _models
-        if not os.path.isfile(AURA_PATH):
-            _load_error = (f"AuraFace model not found at {AURA_PATH} (fal/AuraFace-v1 "
-                           f"glintr100.onnx; download_models.sh --image-edit fetches it)")
-            raise FileNotFoundError(_load_error)
-        from insightface.app import FaceAnalysis
         from insightface.model_zoo import get_model
 
-        det = FaceAnalysis(name="buffalo_l", root=ROOT, providers=["CPUExecutionProvider"],
-                           allowed_modules=["detection"])
-        det.prepare(ctx_id=-1, det_size=(640, 640))
         aura = get_model(AURA_PATH, providers=["CPUExecutionProvider"])
         aura.prepare(ctx_id=-1)
         _models = (det, aura)

@@ -48,6 +48,17 @@ FRAMING_PIN = (
     "the same camera position, distance, crop and zoom. Do not zoom out."
 )
 
+#: The pin for every edit that CHANGES the expression -- an expression preset, or a free-text
+#: instruction (console#569: the dialog's "describe the change" box is now how expressions are
+#: asked for). It is FRAMING_PIN without "the same facial expression": appended to "make her
+#: smile", that clause asked for the opposite of the edit. A head angle alone keeps FRAMING_PIN
+#: word for word -- that is the wording the #548 spike measured.
+EDIT_PIN = (
+    "Keep everything else in the photograph exactly the same: the same person and identity, "
+    "the same hair, clothes and background, the same lighting, "
+    "the same camera position, distance, crop and zoom. Do not zoom out."
+)
+
 #: Largest head turn / tilt the angle recipe accepts, in degrees. 90 is a full profile; past it
 #: the face is turning away from the camera, which is not a head-angle edit any more.
 MAX_YAW = 90.0
@@ -119,14 +130,109 @@ def angle_prompt(yaw: float, pitch: float) -> str:
 
 
 def instruction_prompt(instruction: str) -> str:
-    """A free-text instruction with the framing pin appended, unless the caller already pinned
-    it. The pin is what keeps an outfit change from zooming out to show the shoes."""
+    """A free-text instruction with the edit pin appended, unless the caller already pinned
+    it. The pin is what keeps an outfit change from zooming out to show the shoes.
+
+    EDIT_PIN, not FRAMING_PIN (console#569): the free-text box is how an expression is asked
+    for now, and FRAMING_PIN's "the same facial expression" contradicted every one of those."""
     text = instruction.strip()
     if not text:
         raise ValueError("nothing to apply: the instruction is empty")
-    if FRAMING_PIN in text:
+    if FRAMING_PIN in text or EDIT_PIN in text:
         return text
-    return f"{text.rstrip('.')}. {FRAMING_PIN}"
+    return f"{text.rstrip('.')}. {EDIT_PIN}"
+
+
+# --------------------------------------------------------------------------- expressions
+#
+# THE EXPRESSION PRESETS AS QWEN INSTRUCTIONS (console#569). LivePortrait is retired from the
+# Edit dialog -- it "drops every detail" -- so the dialog's Smile / Big laugh / ... buttons are
+# instructions here, written the way the head-angle words are: say what the face DOES,
+# explicitly, and scope the change ("change only the facial expression") so the model does not
+# take it as licence to redraw the rest. The gaze presets are image-space like the angles: "the
+# left edge of the image" is what yaw < 0 means too.
+#
+# NOT YET MEASURED. The head-angle wording was chosen from 36 renders (#548); these were
+# written from the same rules but are unrendered. The wording lives here, beside the model, so
+# retuning one is a change to this table and nothing else -- wanly-api sends only the name.
+#
+# name -> (label, instruction). The names are the old LivePortrait preset names where one
+# existed, so a saved file's `_edit-smile_` tag reads the same across the switch.
+
+EXPRESSIONS: dict[str, tuple[str, str]] = {
+    "smile": ("Smile", (
+        "Change only the person's facial expression to a natural, gentle smile: the corners "
+        "of the mouth turned up and the cheeks slightly lifted.")),
+    "big_laugh": ("Big laugh", (
+        "Change only the person's facial expression to a big, open-mouthed laugh: the mouth "
+        "wide open showing the teeth, the cheeks raised and the eyes creased with laughter.")),
+    "surprised": ("Surprised", (
+        "Change only the person's facial expression to surprise: the eyebrows raised high, the "
+        "eyes wide open and the mouth open in a small oval.")),
+    "eyes_closed": ("Eyes closed", (
+        "Close the person's eyes gently, the eyelids fully shut as if resting. Change nothing "
+        "else about the face.")),
+    "sad": ("Sad", (
+        "Change only the person's facial expression to sadness: the inner ends of the eyebrows "
+        "raised, the corners of the mouth turned down and the lips pressed slightly together.")),
+    "angry": ("Angry", (
+        "Change only the person's facial expression to anger: the eyebrows drawn down and "
+        "together, the eyes narrowed and the lips pressed firmly together.")),
+    "serious": ("Serious", (
+        "Change only the person's facial expression to a calm, serious look: no smile, the "
+        "mouth closed and relaxed, a steady gaze.")),
+    "speaking": ("Speaking", (
+        "Change only the person's mouth so they look caught mid-sentence while talking: the "
+        "lips naturally parted and the mouth slightly open.")),
+    "look_left": ("Eyes left", (
+        "Keep the head exactly where it is and move only the eyes, so the person looks toward "
+        "the left edge of the image.")),
+    "look_right": ("Eyes right", (
+        "Keep the head exactly where it is and move only the eyes, so the person looks toward "
+        "the right edge of the image.")),
+    "look_up": ("Eyes up", (
+        "Keep the head exactly where it is and move only the eyes, so the person looks "
+        "upward.")),
+    "look_down": ("Eyes down", (
+        "Keep the head exactly where it is and move only the eyes, so the person looks "
+        "downward.")),
+}
+
+
+def expression_words(name: str) -> str:
+    """The instruction for an expression preset. ValueError (-> 422) for an unknown name."""
+    try:
+        return EXPRESSIONS[name][1]
+    except KeyError:
+        raise ValueError(f"unknown expression {name!r}; known: {', '.join(EXPRESSIONS)}") \
+            from None
+
+
+def compose_prompt(yaw: float = 0.0, pitch: float = 0.0, expression: str | None = None,
+                   instruction: str | None = None) -> str:
+    """The prompt for any mix of a head angle, an expression preset and free text.
+
+    A head angle ALONE is angle_prompt verbatim -- the measured recipe, FRAMING_PIN and all.
+    Anything that changes the expression, alone or with an angle, ends in EDIT_PIN instead.
+    ValueError when there is nothing to do or a value is out of range.
+    """
+    angle = abs(yaw) >= 5 or abs(pitch) >= 5
+    text = (instruction or "").strip()
+    if not expression and not text:
+        if not angle and (yaw or pitch):
+            raise ValueError("nothing to apply: a head angle under 5 degrees is not a change")
+        return angle_prompt(yaw, pitch)
+    if abs(yaw) > MAX_YAW or abs(pitch) > MAX_PITCH:
+        raise ValueError(f"head angle out of range: yaw {yaw} (max ±{MAX_YAW:g}), "
+                         f"pitch {pitch} (max ±{MAX_PITCH:g})")
+    parts = [p for p in (_yaw_words(yaw), _pitch_words(pitch)) if p]
+    if expression:
+        parts.append(expression_words(expression))
+    if text:
+        if not parts:
+            return instruction_prompt(text)
+        parts.append(text.rstrip(".") + ".")
+    return " ".join(parts + [EDIT_PIN])
 
 
 # ------------------------------------------------------------------------------- graph
