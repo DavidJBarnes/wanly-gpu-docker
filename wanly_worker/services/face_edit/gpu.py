@@ -85,39 +85,45 @@ def render_busy() -> bool:
         return False
 
 
-def a1111_generating() -> bool:
-    """A1111's own progress endpoint. Unreachable or unconfigured is "not generating"."""
-    if not A1111_URL:
+def a1111_generating(url: str | None = None) -> bool:
+    """A1111's own progress endpoint. Unreachable or unconfigured is "not generating".
+
+    `url` defaults to face-edit's own FACE_EDIT_A1111_URL; image-edit passes its own
+    (console#570) -- the rule is the same, the box it is configured on is not."""
+    url = A1111_URL if url is None else url.strip().rstrip("/")
+    if not url:
         return False
     try:
-        r = httpx.get(f"{A1111_URL}/sdapi/v1/progress", timeout=5)
+        r = httpx.get(f"{url}/sdapi/v1/progress", timeout=5)
         return r.status_code == 200 and bool((r.json().get("state") or {}).get("job_count"))
     except Exception:
         return False
 
 
-def yield_a1111() -> bool:
+def yield_a1111(url: str | None = None, purpose: str = "a face edit") -> bool:
     """Ask Automatic1111 for the card back. True only if it actually let go.
 
     Never interrupts a generation: the check is repeated immediately before the unload, since
     generate-forever can start the next image between our first look and this call.
+    `url` defaults to FACE_EDIT_A1111_URL; image-edit passes its own (console#570).
     """
-    if not A1111_URL:
+    url = A1111_URL if url is None else url.strip().rstrip("/")
+    if not url:
         return False
     try:
         with httpx.Client(timeout=A1111_TIMEOUT_S) as c:
-            busy = c.get(f"{A1111_URL}/sdapi/v1/progress")
+            busy = c.get(f"{url}/sdapi/v1/progress")
             if busy.status_code == 200 and (busy.json().get("state") or {}).get("job_count"):
                 log.info("A1111 is generating; leaving its checkpoint alone")
                 return False
-            r = c.post(f"{A1111_URL}/sdapi/v1/unload-checkpoint")
+            r = c.post(f"{url}/sdapi/v1/unload-checkpoint")
             if r.status_code != 200:
                 log.warning("A1111 refused to unload: %s", r.status_code)
                 return False
     except httpx.HTTPError as e:
-        log.info("A1111 not reachable at %s (%s) — nothing to free", A1111_URL, e)
+        log.info("A1111 not reachable at %s (%s) — nothing to free", url, e)
         return False
-    log.info("A1111 released its checkpoint for a face edit")
+    log.info("A1111 released its checkpoint for %s", purpose)
     return True
 
 

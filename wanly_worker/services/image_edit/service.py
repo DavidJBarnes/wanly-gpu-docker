@@ -9,6 +9,8 @@ install (/app/ComfyUI), no custom nodes: every node in the graph is core ComfyUI
 MODE-ONLY (registry.MODE_ONLY). Qwen-Rapid-AIO is ~20 GB on the card with no CPU fallback worth
 the name, so it runs in edit mode and nowhere else. The supervisor builds it at boot and holds it
 stopped; POST /mode {"mode": "edit"} starts it once the render daemon has finished its segment.
+A box equipped with image-edit and nothing that renders (console#570: the second 3090) runs it
+in its default mode, full-time, with no switch -- registry.select_mode's edit-only rule.
 
 THE MODELS ARE MOUNTED, read-only, from the 3090's ~/models/qwen (run-worker.sh). The preflight
 runs `download_models.sh --image-edit`, which checks the checkpoint (and AuraFace) against

@@ -91,8 +91,18 @@ class TestFraming:
 
     def test_an_instruction_gets_the_pin_once(self):
         p = graph.instruction_prompt("Replace her sweater with a purple tank top")
-        assert p.endswith(graph.FRAMING_PIN)
-        assert graph.instruction_prompt(p).count(graph.FRAMING_PIN) == 1
+        assert p.endswith(graph.EDIT_PIN)
+        assert graph.instruction_prompt(p).count(graph.EDIT_PIN) == 1
+        # An instruction that already carries the angle pin is left alone too.
+        pinned = f"Make the sky pink. {graph.FRAMING_PIN}"
+        assert graph.instruction_prompt(pinned) == pinned
+
+    def test_the_edit_pin_does_not_forbid_the_edit(self):
+        """console#569: free text is how expressions are asked for now. FRAMING_PIN's "the same
+        facial expression" appended to "make her smile" asked for the opposite."""
+        assert "facial expression" not in graph.EDIT_PIN
+        assert "facial expression" in graph.FRAMING_PIN
+        assert graph.EDIT_PIN.endswith("Do not zoom out.")
 
     def test_an_empty_instruction_is_nothing_to_apply(self):
         with pytest.raises(ValueError, match="nothing to apply"):
@@ -210,11 +220,29 @@ class TestTheAPI:
         r = client.post("/edit", json={"image": base64.b64encode(_png()).decode(),
                                        "instruction": "make the sweater red"})
         assert r.status_code == 200
-        assert r.json()["prompt"].endswith(graph.FRAMING_PIN)
+        assert r.json()["prompt"].endswith(graph.EDIT_PIN)
 
-    @pytest.mark.parametrize("extra", [{}, {"instruction": "x", "angle": {"yaw": 45}},
-                                       {"angle": {"yaw": 2}}])
-    def test_nothing_or_both_is_a_422(self, api, extra):
+    def test_an_expression_edit(self, api):
+        client, ran = api
+        r = client.post("/edit", json={"image": base64.b64encode(_png()).decode(),
+                                       "expression": "big_laugh"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "laugh" in body["prompt"] and body["prompt"].endswith(graph.EDIT_PIN)
+        assert body["expression"] == "big_laugh"
+        assert body["face_box"] is None and body["crop"] is None
+
+    def test_an_angle_and_an_expression_together(self, api):
+        client, _ = api
+        r = client.post("/edit", json={"image": base64.b64encode(_png()).decode(),
+                                       "angle": {"yaw": -45}, "expression": "smile"})
+        assert r.status_code == 200, r.text
+        p = r.json()["prompt"]
+        assert "three-quarter" in p and "smile" in p and p.endswith(graph.EDIT_PIN)
+
+    @pytest.mark.parametrize("extra", [{}, {"angle": {"yaw": 2}}, {"expression": "wink"},
+                                       {"instruction": "   "}])
+    def test_nothing_or_nonsense_is_a_422(self, api, extra):
         client, _ = api
         r = client.post("/edit", json={"image": base64.b64encode(_png()).decode(), **extra})
         assert r.status_code == 422
@@ -233,9 +261,281 @@ class TestTheAPI:
     def test_health_reports_idle_time_for_the_hand_back(self, api, monkeypatch):
         client, _ = api
         monkeypatch.setattr(edit_app, "_state", {"last_edit_at": None, "last": None,
-                                                 "model_loaded": False, "edits": 0})
+                                                 "model_loaded": False, "edits": 0,
+                                                 "waiting": None})
         body = client.get("/health").json()
         assert body["busy"] is False and body["idle_s"] >= 0 and body["edits"] == 0
+
+
+class TestExpressions:
+    """console#569: the Edit dialog's expression presets are Qwen instructions now."""
+
+    def test_every_preset_the_api_offers_has_words(self):
+        for name in ("smile", "big_laugh", "surprised", "eyes_closed", "sad", "angry",
+                     "serious", "speaking", "look_left", "look_right", "look_up", "look_down"):
+            assert graph.EXPRESSIONS[name][1].endswith(".")
+
+    def test_gaze_is_image_space_like_the_angles(self):
+        assert "left edge of the image" in graph.expression_words("look_left")
+        assert "right edge of the image" in graph.expression_words("look_right")
+        assert "move only the eyes" in graph.expression_words("look_up")
+
+    def test_an_unknown_expression(self):
+        with pytest.raises(ValueError, match="unknown expression"):
+            graph.compose_prompt(expression="wink")
+
+    def test_an_angle_alone_is_the_measured_recipe_verbatim(self):
+        """#548's 36 renders were of angle_prompt; composing must not change a word of it."""
+        for yaw, pitch in ((-90, 0), (45, 0), (0, 30), (-45, -20)):
+            assert graph.compose_prompt(yaw, pitch) == graph.angle_prompt(yaw, pitch)
+
+    def test_an_expression_changes_the_pin(self):
+        p = graph.compose_prompt(expression="smile")
+        assert p.endswith(graph.EDIT_PIN) and graph.FRAMING_PIN not in p
+
+    def test_all_three_compose_in_order(self):
+        p = graph.compose_prompt(-90, 0, "smile", "make the sweater red")
+        assert p.index("profile") < p.index("smile") < p.index("sweater")
+        assert p.count(graph.EDIT_PIN) == 1
+
+    def test_the_angle_range_still_holds_with_an_expression(self):
+        with pytest.raises(ValueError, match="out of range"):
+            graph.compose_prompt(120, 0, "smile")
+
+
+class TestFaceCrop:
+    """console#569: one face of several is edited by crop, edit, feathered paste."""
+
+    def test_the_crop_is_generous_and_clamped(self):
+        from wanly_worker.services.image_edit import crop
+        l, t, r, b = crop.crop_box([400, 300, 500, 420], (2000, 1500))
+        assert l < 400 - 100 and r > 500 + 100, "room to turn the head"
+        assert b - 420 > 300 - t, "more below (neck, shoulders) than above"
+        assert crop.crop_box([10, 10, 110, 130], (400, 300)) [:2] == (0, 0)
+        assert crop.crop_box([300, 150, 390, 280], (400, 300))[2:] == (400, 300)
+
+    def test_a_neighbour_is_kept_out(self):
+        from wanly_worker.services.image_edit import crop
+        me, left_n, right_n = [800, 300, 900, 420], [560, 300, 660, 420], [1060, 300, 1160, 420]
+        l, t, r, b = crop.crop_box(me, (2000, 1500), [left_n, right_n])
+        assert l >= 660 and r <= 1060
+        assert crop.neighbours_inside((l, t, r, b), [left_n, right_n]) == 0
+
+    def test_a_neighbour_too_close_still_leaves_the_face_its_margin(self):
+        from wanly_worker.services.image_edit import crop
+        me, n = [800, 300, 900, 420], [880, 300, 980, 420]
+        l, t, r, b = crop.crop_box(me, (2000, 1500), [n])
+        assert r >= 900 + crop.MIN_PAD * 100 - 1
+        assert crop.neighbours_inside((l, t, r, b), [n]) == 1, "reported, not hidden"
+
+    def test_small_crops_are_scaled_up_for_the_model(self):
+        from wanly_worker.services.image_edit import crop
+        assert crop.work_size(300, 450) == (768, 1152)
+        assert crop.work_size(900, 1200) == (900, 1200)
+
+    def test_the_paste_leaves_everything_outside_the_crop_alone(self):
+        import numpy as np
+        from wanly_worker.services.image_edit import crop
+        rng = np.random.default_rng(0)
+        src = rng.integers(0, 255, (300, 400, 3), dtype=np.uint8)
+        region = (100, 50, 300, 250)
+        edited = np.full((200, 200, 3), 7, dtype=np.uint8)
+        out = crop.paste(src, edited, region)
+        mask = np.ones(src.shape[:2], bool)
+        mask[50:250, 100:300] = False
+        assert (out[mask] == src[mask]).all(), "byte for byte outside the crop"
+        assert (out[150, 200] == 7).all(), "the edit inside"
+        # Feathered: the crop's outermost column is mostly source.
+        assert abs(int(out[150, 100, 0]) - int(src[150, 100, 0])) <= \
+            abs(int(src[150, 100, 0]) - 7) * 0.2 + 1
+
+    def test_an_image_edge_gets_no_feather(self):
+        import numpy as np
+        from wanly_worker.services.image_edit import crop
+        m = crop.feather_mask((0, 0, 100, 100), (400, 300))
+        assert m[0, 0] == 1.0 and m[50, 50] == 1.0 and m[99, 99] < 0.2
+
+
+@pytest.fixture
+def faces_api(api, monkeypatch):
+    client, ran = api
+    boxes = [[10.0, 10.0, 40.0, 45.0], [60.0, 8.0, 90.0, 44.0]]
+    monkeypatch.setattr(edit_app.identity, "face_boxes", lambda rgb: [list(b) for b in boxes])
+
+    async def fake_graph(client_, wf):
+        ran.append(wf)
+        w, h = wf["9"]["inputs"]["width"], wf["9"]["inputs"]["height"]
+        return _png(w, h, (0, 0, 255))
+
+    monkeypatch.setattr(edit_app, "_run_graph", fake_graph)
+    return client, ran, boxes
+
+
+class TestFaceChoiceInTheAPI:
+    def test_faces_left_to_right_with_the_largest_as_default(self, faces_api):
+        client, _, boxes = faces_api
+        r = client.post("/faces", json={"image": base64.b64encode(_png(100, 60)).decode()})
+        body = r.json()
+        assert r.status_code == 200 and (body["width"], body["height"]) == (100, 60)
+        assert [f["box"] for f in body["faces"]] == boxes
+        assert body["default_index"] == 1, "the second is larger (30x36 vs 30x35)"
+
+    def test_a_face_box_edits_that_face_alone(self, faces_api):
+        import numpy as np
+        from PIL import Image
+        client, ran, boxes = faces_api
+        src = _png(100, 60, (200, 150, 120))
+        r = client.post("/edit", json={"image": base64.b64encode(src).decode(),
+                                       "expression": "smile", "face_box": boxes[0]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["face_box"] == boxes[0]
+        l, t, rr, b = body["crop"]
+        assert rr <= 60, "kept out of the neighbour's box"
+        assert body["neighbours_in_crop"] == 0
+        assert (body["width"], body["height"]) == (100, 60), "pasted back at full size"
+        out = np.asarray(Image.open(io.BytesIO(base64.b64decode(body["image"]))).convert("RGB"))
+        assert (out[:, 70:] == (200, 150, 120)).all(), "the other person is not regenerated"
+        assert tuple(out[25, 25]) != (200, 150, 120), "the chosen one is"
+        # The crop went to the model scaled up to MIN_EDGE on its short side.
+        assert min(ran[0]["9"]["inputs"]["width"], ran[0]["9"]["inputs"]["height"]) >= 752
+
+    def test_a_box_outside_the_image_is_a_422(self, faces_api):
+        client, _, _ = faces_api
+        r = client.post("/edit", json={"image": base64.b64encode(_png(100, 60)).decode(),
+                                       "expression": "smile", "face_box": [500, 5, 600, 50]})
+        assert r.status_code == 422
+
+    def test_health_says_what_it_can_do(self, api):
+        client, _ = api
+        body = client.get("/health").json()
+        assert {"expression", "face_box", "faces"} <= set(body["features"])
+        assert body["shared_with_a1111"] is False and body["a1111_generating"] is None
+
+
+class TestSharingTheCardWithA1111:
+    """console#570: the standing box shares its 3090 with Automatic1111."""
+
+    def test_an_edit_waits_for_a1111_and_says_why(self, api, monkeypatch):
+        from wanly_worker.services.image_edit import share
+        client, ran = api
+        looks = iter([True, True, False])
+        seen = []
+        monkeypatch.setattr(share, "A1111_URL", "http://a1111:7860")
+        monkeypatch.setattr(share, "A1111_POLL_S", 0.01)
+        monkeypatch.setattr(share.fe_gpu, "a1111_generating",
+                            lambda url=None: (seen.append(edit_app._state.get("waiting")),
+                                              next(looks))[1])
+        monkeypatch.setattr(share.fe_gpu, "free_mib", lambda: 23000)
+        r = client.post("/edit", json={"image": base64.b64encode(_png()).decode(),
+                                       "expression": "smile"})
+        assert r.status_code == 200, r.text
+        assert "Automatic1111 on this card is generating" in seen
+        assert edit_app._state["waiting"] is None, "cleared once it stops"
+        assert len(ran) == 1
+
+    def test_an_endless_generation_is_a_503_not_a_forced_load(self, api, monkeypatch):
+        from wanly_worker.services.image_edit import share
+        client, ran = api
+        monkeypatch.setattr(share, "A1111_URL", "http://a1111:7860")
+        monkeypatch.setattr(share, "A1111_POLL_S", 0.01)
+        monkeypatch.setattr(share, "A1111_WAIT_S", 0.05)
+        monkeypatch.setattr(share.fe_gpu, "a1111_generating", lambda url=None: True)
+        r = client.post("/edit", json={"image": base64.b64encode(_png()).decode(),
+                                       "expression": "smile"})
+        assert r.status_code == 503 and "generating" in r.json()["detail"]
+        assert ran == [], "Qwen never started under a live generation"
+        assert not edit_app._turn.locked()
+
+    def test_room_is_made_only_when_short_and_not_resident(self, monkeypatch):
+        from wanly_worker.services.image_edit import share
+        yields = []
+        monkeypatch.setattr(share, "A1111_URL", "http://a1111:7860")
+        monkeypatch.setattr(share.fe_gpu, "yield_a1111",
+                            lambda url, purpose: yields.append((url, purpose)) or True)
+        monkeypatch.setattr(share.fe_gpu, "free_mib", lambda: 16000)
+        assert asyncio.run(share.make_room(resident=True)) is None
+        assert yields == []
+        assert "unloaded" in asyncio.run(share.make_room(resident=False))
+        assert yields == [("http://a1111:7860", "a Qwen image edit")]
+        monkeypatch.setattr(share.fe_gpu, "free_mib", lambda: 23000)
+        assert asyncio.run(share.make_room(resident=False)) is None
+        assert len(yields) == 1
+
+    def test_no_a1111_is_no_sharing(self, monkeypatch):
+        from wanly_worker.services.image_edit import share
+        monkeypatch.setattr(share, "A1111_URL", "")
+        monkeypatch.setattr(share, "UNLOAD_IDLE_S", 0.0)
+        assert asyncio.run(share.wait_for_a1111({})) == 0.0
+        assert asyncio.run(share.make_room(resident=False)) is None
+        assert not share.watching()
+
+    @pytest.mark.parametrize("kw,idle,want", [
+        (dict(resident=False, busy=False, a1111_generating=True), 0, None),
+        (dict(resident=True, busy=True, a1111_generating=True), 0, None),
+        (dict(resident=True, busy=False, a1111_generating=True), 0, "Automatic1111"),
+        (dict(resident=True, busy=False, a1111_generating=False), 50, None),
+        (dict(resident=True, busy=False, a1111_generating=False), 61, "no edit for"),
+        (dict(resident=True, busy=False, a1111_generating=None), 61, "no edit for"),
+    ])
+    def test_when_qwen_leaves_the_card(self, monkeypatch, kw, idle, want):
+        from wanly_worker.services.image_edit import share
+        monkeypatch.setattr(share, "UNLOAD_IDLE_S", 60.0)
+        why = share.unload_reason(idle_s=idle, **kw)
+        assert (why is None) if want is None else (want in why)
+
+    def test_the_watcher_unloads_when_a1111_starts(self, monkeypatch):
+        from wanly_worker.services.image_edit import share
+        unloads = []
+
+        async def gen():
+            return True
+
+        async def unload(url, client=None):
+            unloads.append(url)
+            return True
+
+        monkeypatch.setattr(share, "WATCH_S", 0.01)
+        monkeypatch.setattr(share, "a1111_generating", gen)
+        monkeypatch.setattr(share, "unload_qwen", unload)
+        monkeypatch.setattr(edit_app, "_state", {"last_edit_at": 0, "last": None,
+                                                 "model_loaded": True, "edits": 1,
+                                                 "waiting": None, "unloads": 0})
+
+        async def run():
+            t = asyncio.create_task(edit_app._watch())
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if unloads:
+                    break
+            t.cancel()
+
+        asyncio.run(run())
+        assert unloads == [edit_app.COMFY]
+        assert edit_app._state["model_loaded"] is False
+        assert "Automatic1111" in edit_app._state["last_unload"]["why"]
+
+    def test_resident_forever_when_asked(self, monkeypatch):
+        from wanly_worker.services.image_edit import share
+        monkeypatch.setattr(share, "UNLOAD_IDLE_S", 0.0)
+        assert share.unload_reason(resident=True, busy=False, idle_s=10**6,
+                                   a1111_generating=None) is None
+
+    def test_a1111_url_is_passed_through_to_face_edits_helpers(self, monkeypatch):
+        """The helpers are face-edit's, reused; the URL must be image-edit's own."""
+        from wanly_worker.services.face_edit import gpu
+        got = []
+
+        class R:
+            status_code = 200
+
+            def json(self):
+                return {"state": {"job_count": 1}}
+
+        monkeypatch.setattr(gpu, "A1111_URL", "http://not-this:7860")
+        monkeypatch.setattr(gpu.httpx, "get", lambda url, timeout: got.append(url) or R())
+        assert gpu.a1111_generating("http://a1111:7860/") is True
+        assert got == ["http://a1111:7860/sdapi/v1/progress"]
 
 
 class TestIdentity:
