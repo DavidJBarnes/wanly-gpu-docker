@@ -841,57 +841,60 @@ class TestTheModelSetIsOneList:
         assert "v23" not in y
 
 
-# ------------------------------------------------------------------ character sheets (#582)
+# ------------------------------------------------------------------ character sheets (#582, #585)
 
-#: loras/reftest-2026-09-30/sheets.py qwen_prompt(PEOPLE["k2026"]), the approved recipe, verbatim.
+#: loras/phase0-2026-10-01/character_sheet_one_input.json, the tested one-photo workflow: its
+#: four text nodes joined by its three StringConcatenate nodes, verbatim.
 RECIPE_K2026 = (
     "Create a photorealistic full-body character turnaround of the woman in image 1 on a plain "
     "pure white studio background. Three full-body views of the same person side by side, left "
     "to right: a front view facing the camera, a side view facing 90 degrees to the right, and a "
     "back view facing completely away from the camera. Each view shows her whole body from head "
     "to toe with no cropping, standing upright with arms relaxed at her sides, feet visible. "
-    "Keep her exact face, facial features, skin tone, and her ash-blonde hair pulled back into a "
-    "low bun. She wears the same light grey zip-neck fleece pullover over a turquoise t-shirt "
-    "that she wears in image 1, dark blue straight-leg jeans and white sneakers, identical in "
-    "all three views. Soft even studio lighting, equal white spacing between the views, no text, "
-    "no labels, no borders.")
+    "Keep her exact face, facial features, skin tone, body shape, build and proportions from "
+    "image 1, and her ash-blonde hair pulled back into a low bun. She wears the same light grey "
+    "zip-neck fleece pullover over a turquoise t-shirt that she wears in image 1, dark blue "
+    "straight-leg jeans and white sneakers, identical in all three views. Soft even studio "
+    "lighting, equal white spacing between the views, no text, no labels, no borders.")
 K2026_OUTFIT = ("the same light grey zip-neck fleece pullover over a turquoise t-shirt that she "
                 "wears in image 1, dark blue straight-leg jeans and white sneakers")
 K2026_HAIR = "her ash-blonde hair pulled back into a low bun"
 
 
 class TestTheTurnaroundPrompt:
-    def test_the_recipe_word_for_word(self):
+    def test_the_one_photo_workflow_word_for_word(self):
         assert graph.turnaround_prompt(K2026_OUTFIT, K2026_HAIR) == RECIPE_K2026
 
-    def test_body_is_its_own_sentence_between_hair_and_outfit(self):
-        p = graph.turnaround_prompt(K2026_OUTFIT, K2026_HAIR, "a slim, athletic build.")
-        assert "low bun. She has a slim, athletic build. She wears the same light grey" in p
-        assert K2026_OUTFIT + ", identical" in p, "the outfit is not touched"
-        assert p.replace("She has a slim, athletic build. ", "") == RECIPE_K2026
+    def test_build_comes_from_the_photo_not_from_words(self):
+        """#585: the model ignored body words, so there is no way to send any."""
+        import inspect
+        assert "body" not in inspect.signature(graph.turnaround_prompt).parameters
+        assert "body shape, build and proportions from image 1" in RECIPE_K2026
+        assert "She has" not in RECIPE_K2026
 
     def test_a_man(self):
-        p = graph.turnaround_prompt("a navy suit", "short dark hair", "a broad build",
-                                    gender="male")
+        p = graph.turnaround_prompt("a navy suit", "short dark hair", gender="male")
         assert "of the man in image 1" in p and "his whole body" in p and "his sides" in p
-        assert "He has a broad build. He wears a navy suit" in p
+        assert "Keep his exact face" in p and "and short dark hair. He wears a navy suit" in p
         assert " her " not in p and "She " not in p
 
     def test_subject_and_default_hair(self):
         p = graph.turnaround_prompt("jeans", subject="young woman")
         assert "of the young woman in image 1" in p
-        assert "skin tone, and her hair exactly as in image 1." in p
+        assert "proportions from image 1, and her hair exactly as in image 1." in p
 
     def test_an_outfit_is_required(self):
         with pytest.raises(ValueError, match="outfit"):
             graph.turnaround_prompt("  . ")
 
     def test_the_recipe_graph(self):
-        """sheets.py qwen_graph: FluxKontextImageScale on the face, 1088x1024, 40/4/euler."""
-        wf = graph.turnaround_workflow("face.png", "p", seed=11)
+        """The one-input workflow: FluxKontextImageScale on the photo, 1088x1024, 40/4/euler."""
+        wf = graph.turnaround_workflow("photo.png", "p", seed=11)
+        assert wf["101"]["inputs"]["image"] == "photo.png"
         assert wf["102"] == {"class_type": "FluxKontextImageScale",
                              "inputs": {"image": ["101", 0]}}
         assert wf["3"]["inputs"]["image1"] == ["102", 0] == wf["4"]["inputs"]["image1"]
+        assert "image2" not in wf["3"]["inputs"], "one photo, one reference"
         assert wf["9"]["inputs"] == {"width": 1088, "height": 1024, "batch_size": 1}
         k = wf["2"]["inputs"]
         assert (k["steps"], k["cfg"], k["sampler_name"], k["scheduler"], k["seed"],
@@ -901,50 +904,69 @@ class TestTheTurnaroundPrompt:
             graph.settings_note()
 
 
-class TestTheSheetLayout:
-    def _photo(self, w, h):
-        from PIL import Image
-        im = Image.new("RGB", (w, h), (90, 90, 90))
-        return im
+def _full_body(w=3000, h=4000, face=(1400, 600, 1600, 860)):
+    """A full-body photo stand-in: grey all over (no white anywhere), the face a red box."""
+    from PIL import Image
+    im = Image.new("RGB", (w, h), (90, 90, 90))
+    im.paste((255, 0, 0), face)
+    return im
 
-    def test_a_face_that_fits_is_a_full_bleed_strip_centred_on_it(self):
-        from wanly_worker.services.image_edit import sheet
-        from PIL import Image
-        im = Image.new("RGB", (3000, 2000), (0, 0, 255))
-        im.paste((255, 0, 0), (2200, 0, 3000, 2000))      # red right of x=2200
-        # A face at x 2300-2500: the strip (875 px wide at full height) is clamped to the edge.
-        panel, mode = sheet.face_panel(im, [2300, 500, 2500, 760])
-        assert mode == "crop" and panel.size == (448, 1024)
-        assert panel.getpixel((440, 500)) == (255, 0, 0), "clamped to the photo's right edge"
-        assert panel.getpixel((5, 500)) == (0, 0, 255)
 
-    def test_a_tight_close_up_is_letterboxed_on_white_not_cut(self):
+class TestTheFacePanel:
+    def test_the_face_box_plus_padding_is_cropped_from_the_photo(self):
         from wanly_worker.services.image_edit import sheet
-        im = self._photo(1024, 1024)
-        panel, mode = sheet.face_panel(im, [150, 200, 870, 900])   # face 720 wide
-        assert mode == "letterbox"
-        assert panel.getpixel((224, 2)) == (255, 255, 255), "white above"
-        assert panel.getpixel((224, 512)) == (90, 90, 90)
+        assert sheet.crop_region([1400, 600, 1600, 860], (3000, 4000), 140) == \
+            (1260, 460, 1740, 1000)
 
-    def test_no_face_is_centred(self):
+    def test_the_crop_is_clamped_not_shifted_at_the_edge(self):
+        """CropByBBoxes' rule: a face near the edge keeps its own side, nothing invented."""
         from wanly_worker.services.image_edit import sheet
-        panel, mode = sheet.face_panel(self._photo(2000, 1500), None)
-        assert mode == "centre" and panel.size == (448, 1024)
+        assert sheet.crop_region([20, 30, 220, 280], (1000, 1500), 140) == (0, 0, 360, 420)
 
-    def test_a_photo_too_narrow_for_a_strip_is_cropped_vertically(self):
+    def test_the_panel_is_the_face_centred_on_white(self):
         from wanly_worker.services.image_edit import sheet
-        panel, mode = sheet.face_panel(self._photo(300, 2000), [100, 300, 200, 420])
-        assert mode == "crop" and panel.size == (448, 1024)
+        im = _full_body()
+        panel, info = sheet.face_panel(im, [1400, 600, 1600, 860], 140)
+        assert panel.size == (448, 1024)
+        assert info["mode"] == "auto_crop" and info["crop"] == [1260, 460, 1740, 1000]
+        # 480x540 crop -> fits 448 wide: x0.93, 448x504, centred vertically on white.
+        assert info["scale"] == 0.93
+        assert panel.getpixel((224, 5)) == (255, 255, 255), "white above"
+        assert panel.getpixel((224, 1018)) == (255, 255, 255), "white below"
+        assert panel.getpixel((224, 512)) == (255, 0, 0), "the face in the middle"
+        assert panel.getpixel((10, 512)) == (90, 90, 90), "padding: the photo around the face"
+
+    def test_more_padding_shows_more_of_her(self):
+        from wanly_worker.services.image_edit import sheet
+        im = _full_body()
+        _, tight = sheet.face_panel(im, [1400, 600, 1600, 860], 0)
+        _, wide = sheet.face_panel(im, [1400, 600, 1600, 860], 400)
+        assert tight["crop"] == [1400, 600, 1600, 860] and wide["crop"] == [1000, 200, 2000, 1260]
+        assert tight["scale"] > wide["scale"]
+
+    def test_a_small_face_is_upscaled_and_says_so(self):
+        """A full-body shot by a tent: the face is small, the panel is soft, and `scale` > 1
+        is how the record shows it."""
+        from wanly_worker.services.image_edit import sheet
+        _, info = sheet.face_panel(_full_body(4000, 3000, (2000, 900, 2064, 980)),
+                                   [2000, 900, 2064, 980], 140)
+        assert info["scale"] > 1
+
+    def test_no_detector_is_centred(self):
+        from wanly_worker.services.image_edit import sheet
+        panel, info = sheet.face_panel(_full_body(2000, 1500), None)
+        assert info == {"mode": "centre", "crop": None, "scale": None}
+        assert panel.size == (448, 1024)
 
     def test_the_sheet_is_1536x1024_real_face_left(self):
         from wanly_worker.services.image_edit import sheet
         from PIL import Image
-        face = Image.new("RGB", (1200, 1600), (0, 255, 0))
-        body = Image.new("RGB", (1088, 1024), (255, 0, 0))
-        out, mode = sheet.compose(face, body, [500, 400, 700, 650])
-        assert out.size == (1536, 1024) and mode == "crop"
-        assert out.getpixel((200, 500)) == (0, 255, 0)
-        assert out.getpixel((448, 500)) == (255, 0, 0) and out.getpixel((1535, 0)) == (255, 0, 0)
+        body = Image.new("RGB", (1088, 1024), (0, 255, 0))
+        out, panel, info = sheet.compose(_full_body(), body, [1400, 600, 1600, 860])
+        assert out.size == (1536, 1024) and info["mode"] == "auto_crop"
+        assert out.getpixel((224, 512)) == (255, 0, 0), "the photo's face, left"
+        assert out.crop((0, 0, 448, 1024)).tobytes() == panel.tobytes()
+        assert out.getpixel((448, 500)) == (0, 255, 0) and out.getpixel((1535, 0)) == (0, 255, 0)
 
     def test_the_largest_face_is_the_subject(self):
         from wanly_worker.services.image_edit import sheet
@@ -955,13 +977,22 @@ class TestTheSheetLayout:
 class TestTheTurnaroundAPI:
     def _req(self, **kw):
         return {"image": base64.b64encode(_png(600, 800)).decode(), "outfit": "jeans",
-                "hair": "her red hair", "body": "a petite frame", "seed": 22, **kw}
+                "hair": "her red hair", "seed": 22, **kw}
+
+    def _faces(self, monkeypatch, found_at):
+        """face_boxes that finds the face only at the detector sizes in `found_at`."""
+        asked = []
+
+        def boxes(rgb, det_size=640):
+            asked.append(det_size)
+            return [[250.0, 200.0, 350.0, 330.0]] if det_size in found_at else []
+        monkeypatch.setattr(edit_app.identity, "face_boxes", boxes)
+        return asked
 
     def test_one_candidate_and_its_sheet(self, api, monkeypatch):
         from PIL import Image
         client, ran = api
-        monkeypatch.setattr(edit_app.identity, "face_boxes",
-                            lambda rgb: [[250.0, 200.0, 350.0, 330.0]])
+        asked = self._faces(monkeypatch, {640})
         r = client.post("/turnaround", json=self._req())
         assert r.status_code == 200, r.text
         body = r.json()
@@ -969,27 +1000,55 @@ class TestTheTurnaroundAPI:
         sheet_im = Image.open(io.BytesIO(base64.b64decode(body["sheet"])))
         assert cand.size == (1088, 1024) and sheet_im.size == (1536, 1024)
         assert sheet_im.getpixel((1000, 500)) == (10, 20, 30), "the turnaround, right"
-        assert sheet_im.getpixel((200, 500)) == (200, 150, 120), "the real photo, left"
+        assert sheet_im.getpixel((224, 512)) == (200, 150, 120), "the photo's face, left"
+        assert sheet_im.getpixel((224, 3)) == (255, 255, 255), "on white"
         assert body["seed"] == 22 and body["steps"] == 40 and body["cfg"] == 4.0
-        assert "She has a petite frame. She wears jeans" in body["prompt"]
-        assert body["face_panel"]["mode"] == "crop"
+        assert "build and proportions from image 1, and her red hair. She wears jeans" in \
+            body["prompt"]
+        fp = body["face_panel"]
+        assert fp["mode"] == "auto_crop" and fp["source"] == "same_photo"
+        assert fp["box"] == [250.0, 200.0, 350.0, 330.0] and fp["padding"] == 140
+        assert fp["crop"] == [110, 60, 490, 470] and fp["det_size"] == 640
+        assert fp["photo_size"] == [600, 800] and asked == [640]
         assert body["model"] == graph.MODEL and body["files"] == graph.MODEL_FILES
         assert body["identity"] == {"aura": 0.71, "reason": None}
         assert base64.b64decode(body["sheet_preview"])[:2] == b"\xff\xd8"
+        panel = Image.open(io.BytesIO(base64.b64decode(body["face_panel_preview"])))
+        assert panel.size == (448, 1024), "the panel, for the console's preview"
         assert ran[0]["9"]["inputs"]["width"] == 1088 and ran[0]["3"]["inputs"]["prompt"] == \
             body["prompt"]
 
+    def test_the_padding_is_the_callers(self, api, monkeypatch):
+        client, _ = api
+        self._faces(monkeypatch, {640})
+        fp = client.post("/turnaround", json=self._req(crop_padding=20)).json()["face_panel"]
+        assert fp["padding"] == 20 and fp["crop"] == [230, 180, 370, 350]
+
+    def test_a_small_face_is_looked_for_again_at_1280(self, api, monkeypatch):
+        client, ran = api
+        asked = self._faces(monkeypatch, {1280})
+        r = client.post("/turnaround", json=self._req())
+        assert r.status_code == 200, r.text
+        assert asked == [640, 1280] and r.json()["face_panel"]["det_size"] == 1280
+
+    def test_a_body_field_is_not_a_prompt(self, api, monkeypatch):
+        """#585 dropped the field; a stale caller's `body` must not reach the words."""
+        client, _ = api
+        self._faces(monkeypatch, {640})
+        r = client.post("/turnaround", json=self._req(body="a petite frame"))
+        assert r.status_code == 200 and "petite" not in r.json()["prompt"]
+
     def test_a_photo_with_no_face_is_refused_before_the_card(self, api, monkeypatch):
         client, ran = api
-        monkeypatch.setattr(edit_app.identity, "face_boxes", lambda rgb: [])
+        asked = self._faces(monkeypatch, set())
         r = client.post("/turnaround", json=self._req())
         assert r.status_code == 422 and "no face" in r.json()["detail"]
-        assert ran == []
+        assert ran == [] and asked == [640, 1280]
 
     def test_a_detector_that_will_not_load_still_makes_a_sheet(self, api, monkeypatch):
         client, ran = api
 
-        def broken(rgb):
+        def broken(rgb, det_size=640):
             raise RuntimeError("no buffalo_l")
         monkeypatch.setattr(edit_app.identity, "face_boxes", broken)
         r = client.post("/turnaround", json=self._req())
@@ -1001,8 +1060,13 @@ class TestTheTurnaroundAPI:
         client, _ = api
         assert client.post("/turnaround", json=self._req(outfit=" ")).status_code == 422
 
+    def test_padding_out_of_range_is_a_422(self, api):
+        client, _ = api
+        assert client.post("/turnaround", json=self._req(crop_padding=-1)).status_code == 422
+        assert client.post("/turnaround", json=self._req(crop_padding=5000)).status_code == 422
+
     def test_health_advertises_it(self, api):
         client, _ = api
         body = client.get("/health").json()
-        assert {"turnaround", "official_2511"} <= set(body["features"])
+        assert {"turnaround", "official_2511", "one_photo"} <= set(body["features"])
         assert body["model"] == graph.MODEL and body["checkpoint"] == graph.UNET

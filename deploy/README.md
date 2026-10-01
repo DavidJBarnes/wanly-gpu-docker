@@ -168,13 +168,18 @@ steps at two passes each, so expect an edit in minutes, not seconds. `IMAGE_EDIT
 `IMAGE_EDIT_CFG` in worker.env override them; **an old `IMAGE_EDIT_STEPS=4` line must go**, or
 the official model runs at 4 steps and comes out as noise.
 
-### Character sheets (console#582)
+### Character sheets (console#582, #585)
 
-`POST :8086/turnaround` is the sheet recipe (loras/reftest-2026-09-30/sheets.py): a real face
-photo plus outfit, hair and body words in; one seed's 1088x1024 front/side/back turnaround out,
-**and** the 1536x1024 sheet already composed from it -- the face-detected 448 px real-face panel
-beside the turnaround (`services/image_edit/sheet.py`). wanly-api asks once per seed, on the
-same queue and the same edit mode as the Edit dialog's edits.
+`POST :8086/turnaround` is the sheet recipe, one-photo form
+(loras/phase0-2026-10-01/character_sheet_one_input.json): ONE photo of her -- full body or most
+of it, in the outfit -- plus outfit and hair words (and `crop_padding`, default 140 px) in; one
+seed's 1088x1024 front/side/back turnaround out, drawn with that photo as image 1 so her build
+carries into all three views, **and** the 1536x1024 sheet already composed from it -- a 448 px
+face panel auto-cropped from the same photo beside the turnaround
+(`services/image_edit/sheet.py`). There is no body-words field: Qwen-Image-Edit-2511 ignored it.
+The face is found by the buffalo_l detector the service already has (640 px, then 1280 px for a
+small face in a wide shot), so the image needs no MediaPipe model. wanly-api asks once per seed,
+on the same queue and the same edit mode as the Edit dialog's edits.
 
 ### Faces and expressions (console#569)
 
