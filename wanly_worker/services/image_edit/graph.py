@@ -3,16 +3,25 @@
 PURE: no I/O, no ComfyUI, no torch -- everything here is decided before a request reaches the
 card, and is tested without one.
 
-THE GRAPH is keyframe-server's `build_workflow` (3090:~/keyframe-server/server.py), which ran
-this checkpoint in production: CheckpointLoaderSimple -> TextEncodeQwenImageEditPlus (the source
-as image1) -> KSampler -> VAEDecode. Phr00t's Rapid-AIO merges transformer, VAE and text encoder
-into one file with the Lightning accelerators baked in -- hence 4 steps at cfg 1, and the
-author's euler_ancestral/beta for v23. Topology is fixed; only values move.
+THE MODEL IS THE OFFICIAL Qwen-Image-Edit-2511 (wanly-console#574, wanly-gpu-docker#157), as
+Comfy-Org ships it for ComfyUI: three files, loaded separately -- the fp8mixed transformer
+(UNETLoader), the Qwen2.5-VL 7B text encoder (CLIPLoader, type qwen_image) and the Qwen-Image VAE.
+It replaced Phr00t's Qwen-Rapid-AIO-NSFW-v23, a community merge with the Lightning accelerators
+baked in (4 steps, cfg 1): v23 turned heads into a different person -- younger, smoother skin,
+another nose and jaw (#574) -- while keyframe-server's good results came from the official
+model. The settings are the official template's, the ones the character-sheet recipe
+(loras/reftest-2026-09-30/sheets.py) was proven with: 40 steps, CFG 4, euler/simple,
+ModelSamplingAuraFlow shift 3.1, CFGNorm 1, reference latents by `index_timestep_zero`.
+Ten times v23's steps, at two passes each for real CFG: an edit costs minutes, not seconds.
 
-THE CHECKPOINT'S BASE IS Qwen-Image-Edit-2511. Verified, not assumed: v23's own metadata carries
-the merge graph (UNETLoader qwen_image_edit_2511_bf16) and the `__index_timestep_zero__` marker
-ComfyUI's model_detection keys 2511 on, and Phr00t's changelog says v20 onward is "100% Qwen Edit
-2511".
+THE GRAPH: UNETLoader -> ModelSamplingAuraFlow -> CFGNorm -> KSampler, conditioned by
+TextEncodeQwenImageEditPlus (the source as image1, positive and empty-prompt negative alike)
+through FluxKontextMultiReferenceLatentMethod. Every node is core ComfyUI. Topology is fixed;
+only values move.
+
+TWO GRAPHS, ONE MODEL. `build_workflow` is the Edit dialog's (an angle, an expression, free
+text, at the source's own size). `turnaround_workflow` is the character-sheet recipe
+(wanly-console#582): a face photo in, a 1088x1024 front/side/back turnaround out.
 
 THE HEAD-ANGLE RECIPE IS PROMPT-ONLY, chosen by the #548 spike (36 edits, 3 real portraits):
 image-space wording plus the framing pin reached three-quarter and full profile in the asked
@@ -34,10 +43,24 @@ from __future__ import annotations
 import math
 import os
 
-CHECKPOINT = os.environ.get("IMAGE_EDIT_CKPT", "Qwen-Rapid-AIO-NSFW-v23.safetensors")
-SAMPLER = os.environ.get("IMAGE_EDIT_SAMPLER", "euler_ancestral")
-SCHEDULER = os.environ.get("IMAGE_EDIT_SCHEDULER", "beta")
-STEPS = int(os.environ.get("IMAGE_EDIT_STEPS", "4"))
+#: The three files, relative to the model tree's folders (service.paths_yaml). They must match
+#: download_models.sh's --image-edit _WANTED; test_image_edit.py holds the two together.
+UNET = "qwen_image_edit_2511_fp8mixed.safetensors"
+TEXT_ENCODER = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+VAE = "qwen_image_vae.safetensors"
+#: folder in the model tree -> file. What the preflight checks and the graph loads.
+MODEL_FILES = {"base": UNET, "text_encoders": TEXT_ENCODER, "vae": VAE}
+#: What a result says it was made with (/health, every response, the sheet's provenance).
+MODEL = "Qwen-Image-Edit-2511 (Comfy-Org fp8mixed)"
+#: Kept under its old name: wanly-api records it per edit, and the console shows it.
+CHECKPOINT = UNET
+
+SAMPLER = os.environ.get("IMAGE_EDIT_SAMPLER", "euler")
+SCHEDULER = os.environ.get("IMAGE_EDIT_SCHEDULER", "simple")
+STEPS = int(os.environ.get("IMAGE_EDIT_STEPS", "40"))
+CFG = float(os.environ.get("IMAGE_EDIT_CFG", "4.0"))
+SHIFT = float(os.environ.get("IMAGE_EDIT_SHIFT", "3.1"))
+CFG_NORM = float(os.environ.get("IMAGE_EDIT_CFG_NORM", "1.0"))
 #: Output ceiling. Compute scales with pixels (keyframe-server: 0.39 MP ~6 s, 1.55 MP ~21 s,
 #: 7 MP ~186 s) and a phone photo fed in raw is 12 MP.
 MAX_MP = float(os.environ.get("IMAGE_EDIT_MAX_MP", "1.2"))
@@ -238,45 +261,130 @@ def compose_prompt(yaw: float = 0.0, pitch: float = 0.0, expression: str | None 
 # ------------------------------------------------------------------------------- graph
 
 
-def build_workflow(source_name: str, width: int, height: int, prompt: str, seed: int,
-                   steps: int = STEPS, denoise: float = 1.0,
-                   lora: str | None = None, lora_strength: float = 0.0) -> dict:
-    """ComfyUI API-format graph, keyframe-server's topology.
+def settings_note(steps: int = STEPS, cfg: float = CFG) -> str:
+    """The sampler settings in words, for a result's record."""
+    return (f"{steps} steps, cfg {cfg:g}, {SAMPLER}/{SCHEDULER}, AuraFlow shift {SHIFT:g}, "
+            f"CFGNorm {CFG_NORM:g}, index_timestep_zero")
 
-    `denoise` < 1 seeds the sampler with the SOURCE's latent instead of noise, so only part of
-    the picture is redrawn. It is for small adjustments; a head turn needs 1.0, because a
-    turned head is not a light repaint of a frontal one.
-    """
+
+def _qwen(wf: dict, image: list, prompt: str, latent: list, seed: int, steps: int, cfg: float,
+          denoise: float = 1.0, lora: str | None = None, lora_strength: float = 0.0) -> dict:
+    """The official 2511 graph around an image node and a latent node already in `wf`."""
+    wf["1"] = {"class_type": "UNETLoader",
+               "inputs": {"unet_name": UNET, "weight_dtype": "default"}}
+    wf["7"] = {"class_type": "CLIPLoader",
+               "inputs": {"clip_name": TEXT_ENCODER, "type": "qwen_image", "device": "default"}}
+    wf["8"] = {"class_type": "VAELoader", "inputs": {"vae_name": VAE}}
+    wf["3"] = {"class_type": "TextEncodeQwenImageEditPlus",
+               "inputs": {"prompt": prompt, "clip": ["7", 0], "vae": ["8", 0], "image1": image}}
+    wf["4"] = {"class_type": "TextEncodeQwenImageEditPlus",
+               "inputs": {"prompt": "", "clip": ["7", 0], "vae": ["8", 0], "image1": image}}
+    wf["31"] = {"class_type": "FluxKontextMultiReferenceLatentMethod",
+                "inputs": {"conditioning": ["3", 0],
+                           "reference_latents_method": "index_timestep_zero"}}
+    wf["41"] = {"class_type": "FluxKontextMultiReferenceLatentMethod",
+                "inputs": {"conditioning": ["4", 0],
+                           "reference_latents_method": "index_timestep_zero"}}
     model: list = ["1", 0]
-    wf: dict = {
-        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CHECKPOINT}},
-        "9": {"class_type": "EmptyLatentImage",
-              "inputs": {"width": width, "height": height, "batch_size": 1}},
-        "101": {"class_type": "LoadImage", "inputs": {"image": source_name}},
-        "4": {"class_type": "TextEncodeQwenImageEditPlus",
-              "inputs": {"prompt": "", "clip": ["1", 1], "vae": ["1", 2]}},
-        "3": {"class_type": "TextEncodeQwenImageEditPlus",
-              "inputs": {"prompt": prompt, "clip": ["1", 1], "vae": ["1", 2],
-                         "image1": ["101", 0]}},
-    }
     if lora and lora_strength:
         wf["20"] = {"class_type": "LoraLoaderModelOnly",
                     "inputs": {"model": model, "lora_name": lora,
                                "strength_model": float(lora_strength)}}
         model = ["20", 0]
+    wf["10"] = {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": model, "shift": SHIFT}}
+    wf["11"] = {"class_type": "CFGNorm", "inputs": {"model": ["10", 0], "strength": CFG_NORM}}
+    wf["2"] = {"class_type": "KSampler",
+               "inputs": {"model": ["11", 0], "positive": ["31", 0], "negative": ["41", 0],
+                          "latent_image": latent, "seed": int(seed), "steps": int(steps),
+                          "cfg": float(cfg), "sampler_name": SAMPLER, "scheduler": SCHEDULER,
+                          "denoise": float(denoise)}}
+    wf["5"] = {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0], "vae": ["8", 0]}}
+    return wf
+
+
+def build_workflow(source_name: str, width: int, height: int, prompt: str, seed: int,
+                   steps: int = STEPS, denoise: float = 1.0,
+                   lora: str | None = None, lora_strength: float = 0.0,
+                   cfg: float = CFG) -> dict:
+    """The Edit dialog's graph: the source at the latent's size, edited in place.
+
+    `denoise` < 1 seeds the sampler with the SOURCE's latent instead of noise, so only part of
+    the picture is redrawn. It is for small adjustments; a head turn needs 1.0, because a
+    turned head is not a light repaint of a frontal one.
+    """
+    wf: dict = {
+        "101": {"class_type": "LoadImage", "inputs": {"image": source_name}},
+        "9": {"class_type": "EmptySD3LatentImage",
+              "inputs": {"width": width, "height": height, "batch_size": 1}},
+    }
     latent: list = ["9", 0]
     if denoise < 1.0:
         # The encoder emits a latent at the image's own size, so the source must already be
         # the latent's size -- the caller resizes it before upload.
-        wf["110"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["101", 0], "vae": ["1", 2]}}
+        wf["110"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["101", 0], "vae": ["8", 0]}}
         latent = ["110", 0]
         del wf["9"]
-    wf["2"] = {"class_type": "KSampler",
-               "inputs": {"model": model, "positive": ["3", 0], "negative": ["4", 0],
-                          "latent_image": latent, "seed": int(seed), "steps": int(steps),
-                          "cfg": 1.0, "sampler_name": SAMPLER, "scheduler": SCHEDULER,
-                          "denoise": float(denoise)}}
-    wf["5"] = {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0], "vae": ["1", 2]}}
+    _qwen(wf, ["101", 0], prompt, latent, seed, steps, cfg, denoise, lora, lora_strength)
     wf["6"] = {"class_type": "SaveImage",
                "inputs": {"images": ["5", 0], "filename_prefix": "image-edit"}}
+    return wf
+
+
+# ---------------------------------------------------------------------------- turnaround
+#
+# THE CHARACTER-SHEET RECIPE (wanly-console#582), from loras/reftest-2026-09-30/sheets.py, where
+# it made the sheets phase 0 (wanly-gpu-docker#155) proved: a REAL face photo in, a photoreal
+# front / side / back full-body turnaround on white out, 1088x1024 -- the right-hand part of the
+# 1536x1024 sheet (sheet.py puts the real face beside it). The face goes through
+# FluxKontextImageScale (the model's own preferred size), not at its own size: the output is a
+# new picture, not an edit of this one, so there is no framing to pin.
+#
+# The wording is sheets.py's qwen_prompt, verbatim for a woman with hair and outfit given
+# (test_image_edit.py checks it against the recipe word for word). Two things are added:
+#   * BODY (the user's build control) is its own sentence, "She has <body>.", between the hair
+#     and the outfit -- never folded into the outfit, where it reads as clothing;
+#   * a man gets "he/his"; the recipe was written for two women.
+
+TURNAROUND_W, TURNAROUND_H = 1088, 1024
+
+
+def _clause(text: str | None) -> str:
+    return (text or "").strip().rstrip(".").strip()
+
+
+def turnaround_prompt(outfit: str, hair: str | None = None, body: str | None = None,
+                      gender: str = "female", subject: str | None = None) -> str:
+    """The turnaround instruction. ValueError (-> 422) without an outfit."""
+    outfit = _clause(outfit)
+    if not outfit:
+        raise ValueError("a turnaround needs an outfit")
+    he, his = ("he", "his") if gender == "male" else ("she", "her")
+    who = f"the {_clause(subject) or ('man' if gender == 'male' else 'woman')} in image 1"
+    hair = _clause(hair) or f"{his} hair exactly as in image 1"
+    body = _clause(body)
+    build = f"{he.capitalize()} has {body}. " if body else ""
+    return (f"Create a photorealistic full-body character turnaround of {who} on a plain pure "
+            f"white studio background. Three full-body views of the same person side by side, "
+            f"left to right: a front view facing the camera, a side view facing 90 degrees to "
+            f"the right, and a back view facing completely away from the camera. Each view "
+            f"shows {his} whole body from head to toe with no cropping, standing upright with "
+            f"arms relaxed at {his} sides, feet visible. Keep {his} exact face, facial "
+            f"features, skin tone, and {hair}. {build}{he.capitalize()} wears {outfit}, "
+            f"identical in all three views. Soft even studio lighting, equal white spacing "
+            f"between the views, no text, no labels, no borders.")
+
+
+def turnaround_workflow(face_name: str, prompt: str, seed: int, steps: int = STEPS,
+                        cfg: float = CFG) -> dict:
+    """sheets.py's qwen_graph: the face photo, scaled by FluxKontextImageScale, as image1; a
+    1088x1024 empty latent."""
+    wf: dict = {
+        "101": {"class_type": "LoadImage", "inputs": {"image": face_name}},
+        "102": {"class_type": "FluxKontextImageScale", "inputs": {"image": ["101", 0]}},
+        "9": {"class_type": "EmptySD3LatentImage",
+              "inputs": {"width": TURNAROUND_W, "height": TURNAROUND_H, "batch_size": 1}},
+    }
+    _qwen(wf, ["102", 0], prompt, ["9", 0], seed, steps, cfg)
+    wf["6"] = {"class_type": "SaveImage",
+               "inputs": {"images": ["5", 0], "filename_prefix": "turnaround"}}
     return wf

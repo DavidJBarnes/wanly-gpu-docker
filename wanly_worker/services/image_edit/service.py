@@ -6,14 +6,15 @@ render stack's because the two never run together -- edit mode stops the render 
 separate instance with its own extra_model_paths keeps the LTX tree's config untouched. Same
 install (/app/ComfyUI), no custom nodes: every node in the graph is core ComfyUI.
 
-MODE-ONLY (registry.MODE_ONLY). Qwen-Rapid-AIO is ~20 GB on the card with no CPU fallback worth
+MODE-ONLY (registry.MODE_ONLY). Qwen-Image-Edit-2511 is ~20 GB on the card with no CPU fallback worth
 the name, so it runs in edit mode and nowhere else. The supervisor builds it at boot and holds it
 stopped; POST /mode {"mode": "edit"} starts it once the render daemon has finished its segment.
 A box equipped with image-edit and nothing that renders (console#570: the second 3090) runs it
 in its default mode, full-time, with no switch -- registry.select_mode's edit-only rule.
 
 THE MODELS ARE MOUNTED, read-only, from the 3090's ~/models/qwen (run-worker.sh). The preflight
-runs `download_models.sh --image-edit`, which checks the checkpoint (and AuraFace) against
+runs `download_models.sh --image-edit`, which checks the three model files (graph.MODEL_FILES:
+the official 2511 transformer, its text encoder and VAE, wanly-console#574) and AuraFace against
 their safetensors headers (a truncated file is a valid header over missing data) and fetches
 them only where the tree is not a host mount.
 """
@@ -34,16 +35,18 @@ PATHS_YAML = os.path.join(edit_app.WORK_DIR, "extra_model_paths.yaml")
 
 
 def paths_yaml(models_dir: str = MODELS_DIR) -> str:
-    """ComfyUI's model paths for this instance: the checkpoint's version dir and the LoRAs.
+    """ComfyUI's model paths for this instance: the official 2511's three folders (the keys of
+    graph.MODEL_FILES) and the LoRAs.
 
     Written at start rather than baked, so IMAGE_EDIT_MODELS_DIR moves it without a rebuild.
+    The old Rapid-AIO folders (v23/, v19/) are no longer on any path: nothing loads them.
     """
     return (
         "qwen:\n"
         f"    base_path: {models_dir}\n"
-        "    checkpoints: |\n"
-        "        v23/\n"
-        "        v19/\n"
+        "    diffusion_models: base/\n"
+        "    text_encoders: text_encoders/\n"
+        "    vae: vae/\n"
         "    loras: loras/\n"
     )
 
