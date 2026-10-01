@@ -155,7 +155,7 @@ if [ "$WANT_IMAGE_EDIT" = "1" ]; then
     if [ -n "${IMAGE_EDIT_A1111_URL:-}" ]; then
         IMAGE_EDIT_ENV_ARGS+=(--add-host "host.docker.internal:host-gateway")
     fi
-    for v in IMAGE_EDIT_STEPS IMAGE_EDIT_MAX_MP EDIT_IDLE_RETURN_S IMAGE_EDIT_A1111_URL \
+    for v in IMAGE_EDIT_STEPS IMAGE_EDIT_CFG IMAGE_EDIT_MAX_MP EDIT_IDLE_RETURN_S IMAGE_EDIT_A1111_URL \
              IMAGE_EDIT_A1111_WAIT_S IMAGE_EDIT_MIN_FREE_MIB IMAGE_EDIT_UNLOAD_IDLE_S; do
         if [ -n "${!v:-}" ]; then IMAGE_EDIT_ENV_ARGS+=(-e "$v=${!v}"); fi
     done

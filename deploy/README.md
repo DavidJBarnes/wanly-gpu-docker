@@ -137,17 +137,44 @@ wanly-api waits while the trainer reports one.
 
 ```
 SERVICES=ltx-engine,lora-trainer,image-description,face-crop,image-edit
-IMAGE_EDIT_MODELS_HOST_DIR=/home/david/models/qwen   # read-only, holds v23/Qwen-Rapid-AIO-NSFW-v23.safetensors
+IMAGE_EDIT_MODELS_HOST_DIR=/home/david/models/qwen   # read-only: base/, text_encoders/, vae/ (below)
 IMAGE_EDIT_PORT=8086
 INSIGHTFACE_HOST_DIR=/home/david/.insightface       # AuraFace glintr100.onnx for the identity score
 ```
 
-`download_models.sh --image-edit` (run by the preflight on the first switch) checks the
-checkpoint's safetensors header against its size and fetches AuraFace into the insightface store
-if it is missing. `curl -s :8086/health` reports `idle_s`, the last edit's time and VRAM peak.
+**The model is the official Qwen-Image-Edit-2511** (wanly-console#574, #157), as Comfy-Org
+ships it: three files under the Qwen tree, the set the character-sheet recipe was proven with.
 
-Measured in the #548 spike: ~13 s per edit warm, ~23 s with the checkpoint load, ComfyUI's peak
-23.1-23.7 GB with the card to itself.
+| folder | file | HF repo (`split_files/...`) | size |
+|---|---|---|---|
+| `base/` | `qwen_image_edit_2511_fp8mixed.safetensors` | `Comfy-Org/Qwen-Image-Edit_ComfyUI` `diffusion_models/` | 20.5 GB |
+| `text_encoders/` | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | `Comfy-Org/Qwen-Image_ComfyUI` `text_encoders/` | 9.4 GB |
+| `vae/` | `qwen_image_vae.safetensors` | `Comfy-Org/Qwen-Image_ComfyUI` `vae/` | 0.25 GB |
+
+The tree is a read-only mount, so **stage them on the host before re-pinning**, or the
+preflight refuses the switch ("bind mount from the host, and it is incomplete"). The old
+Rapid-AIO `v23/` folder is no longer read; leave it or delete it. The `base/` folder may also
+hold `qwen_image_edit_2511_fp8_e4m3fn.safetensors` -- a third-party all-fp8 cast, not used.
+
+`download_models.sh --image-edit` (run by the preflight on the first switch) checks the
+three files' safetensors headers against their sizes and fetches AuraFace into the insightface
+store if it is missing. `curl -s :8086/health` reports `idle_s`, `model`, `settings`, the last
+edit's time and VRAM peak.
+
+**Settings changed with the model.** v23 had the Lightning accelerators baked in: 4 steps,
+cfg 1, euler_ancestral/beta, ~13 s per edit warm (#548 spike). The official model runs the
+template: **40 steps, CFG 4, euler/simple, AuraFlow shift 3.1, CFGNorm 1** -- ten times the
+steps at two passes each, so expect an edit in minutes, not seconds. `IMAGE_EDIT_STEPS` /
+`IMAGE_EDIT_CFG` in worker.env override them; **an old `IMAGE_EDIT_STEPS=4` line must go**, or
+the official model runs at 4 steps and comes out as noise.
+
+### Character sheets (console#582)
+
+`POST :8086/turnaround` is the sheet recipe (loras/reftest-2026-09-30/sheets.py): a real face
+photo plus outfit, hair and body words in; one seed's 1088x1024 front/side/back turnaround out,
+**and** the 1536x1024 sheet already composed from it -- the face-detected 448 px real-face panel
+beside the turnaround (`services/image_edit/sheet.py`). wanly-api asks once per seed, on the
+same queue and the same edit mode as the Edit dialog's edits.
 
 ### Faces and expressions (console#569)
 
@@ -189,9 +216,10 @@ forever" delay, which is the gap an edit starts in.
 
 1. Driver/CUDA/CDI check on the new card: `nvidia-smi` on the host, then
    `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`.
-2. Copy the checkpoint from the main 3090 (~28 GB): `rsync -a --info=progress2
-   3090.zero:/home/david/models/qwen/v23/ /home/david/models/qwen/v23/`. The preflight checks
-   its safetensors header against its size, so a truncated copy fails the boot loudly.
+2. Copy the official 2511 set from the main 3090 (~30 GB; the three files in the table above):
+   `for d in base text_encoders vae; do rsync -a --info=progress2
+   3090.zero:/home/david/models/qwen/$d/ /home/david/models/qwen/$d/; done`. The preflight
+   checks their safetensors headers against their sizes, so a truncated copy fails loudly.
 3. AuraFace: `download_models.sh --image-edit` fetches `glintr100.onnx` into the insightface
    store on first boot if missing, or copy `~/.insightface/models/auraface/` from the 3090.
    buffalo_l (face detection for `/faces`) is fetched on first use into the same store.

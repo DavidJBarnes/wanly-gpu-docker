@@ -54,7 +54,7 @@ if [ "$TARGET" = ltx ]; then
     mkdir -p "$LTX/diffusion_models" "$LTX/text_encoders" "$LTX/latent_upscale_models" \
              "$LTX/loras" "$MODELS/loras" 2>/dev/null || true
 else
-    mkdir -p "$MODELS/v23" "$MODELS/loras" 2>/dev/null || true
+    mkdir -p "$MODELS/base" "$MODELS/text_encoders" "$MODELS/vae" "$MODELS/loras" 2>/dev/null || true
 fi
 if [ ! -d "$MODELS" ]; then
     echo "!! FATAL: $MODELS does not exist and could not be created."
@@ -148,14 +148,24 @@ _WANTED=(
 # Character LoRAs are NOT here: the daemon syncs those per claim from S3, so a pod carries
 # only the ones its jobs actually name.
 
-# THE IMAGE-EDIT SET (wanly-console#548), relative to IMAGE_EDIT_MODELS_DIR (the 3090's
-# ~/models/qwen). One file: Phr00t's Rapid-AIO v23 (base Qwen-Image-Edit-2511, v20 onward),
-# the checkpoint keyframe-server ran. The 3090's copy matches HF by sha256
-# (fdb919fc81bea63f13759967fc92c9118142e5c70d4e6795199233a35eefa233). No LoRA: the head-angle
-# recipe is prompt-only; the #548 spike rejected the one community angle LoRA for this base.
+# THE IMAGE-EDIT SET, relative to IMAGE_EDIT_MODELS_DIR (the 3090's ~/models/qwen). Since
+# wanly-console#574 / wanly-gpu-docker#157 it is the OFFICIAL Qwen-Image-Edit-2511 as Comfy-Org
+# packages it for ComfyUI -- three files, the exact set the character-sheet recipe was proven
+# with (loras/phase0-2026-10-01/qwen_setup.sh). It replaced Phr00t's Rapid-AIO v23 merge, which
+# changed faces. Must match graph.MODEL_FILES (test_image_edit.py holds them together).
+#   base/           the transformer, fp8mixed (sensitive layers kept in bf16), 20.5 GB on HF.
+#                   NOT the qwen_image_edit_2511_fp8_e4m3fn already in ~/models/qwen/base: that
+#                   is a third-party all-fp8 cast of unknown origin, and the recipe's results
+#                   were made with this file.
+#   text_encoders/  Qwen2.5-VL 7B, fp8 scaled, 9.4 GB
+#   vae/            the Qwen-Image VAE, 0.25 GB
+# Paths match service.paths_yaml. No LoRA: the head-angle recipe is prompt-only; the #548 spike
+# rejected the one community angle LoRA for this base.
 if [ "$TARGET" = image-edit ]; then
     _WANTED=(
-      "v23|Qwen-Rapid-AIO-NSFW-v23.safetensors|Phr00t/Qwen-Image-Edit-Rapid-AIO|v23/Qwen-Rapid-AIO-NSFW-v23.safetensors|27"
+      "base|qwen_image_edit_2511_fp8mixed.safetensors|Comfy-Org/Qwen-Image-Edit_ComfyUI|split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors|20"
+      "text_encoders|qwen_2.5_vl_7b_fp8_scaled.safetensors|Comfy-Org/Qwen-Image_ComfyUI|split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors|9"
+      "vae|qwen_image_vae.safetensors|Comfy-Org/Qwen-Image_ComfyUI|split_files/vae/qwen_image_vae.safetensors|1"
     )
 fi
 
@@ -387,7 +397,7 @@ PYEOF
 
 echo "checking safetensors headers against actual byte counts..."
 if [ "$TARGET" = image-edit ]; then
-    # Only what the service loads: ~/models/qwen also holds v19 and unrelated LoRAs, and a
+    # Only what the service loads: ~/models/qwen also holds v23, v19 and unrelated LoRAs, and a
     # broken file there is not this service's to refuse a boot over.
     FILES=()
     for row in "${_WANTED[@]}"; do

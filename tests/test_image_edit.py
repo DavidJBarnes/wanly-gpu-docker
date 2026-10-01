@@ -143,18 +143,33 @@ class TestAngleWords:
 
 
 class TestTheGraph:
-    def test_keyframe_servers_topology(self):
+    def test_the_official_2511_topology(self):
+        """#574: three Comfy-Org files, the template's settings -- not v23's 4 steps at cfg 1."""
         wf = graph.build_workflow("src.png", 1024, 768, "turn", seed=7)
         assert {k: v["class_type"] for k, v in wf.items()} == {
-            "1": "CheckpointLoaderSimple", "9": "EmptyLatentImage", "101": "LoadImage",
+            "1": "UNETLoader", "7": "CLIPLoader", "8": "VAELoader",
+            "9": "EmptySD3LatentImage", "101": "LoadImage",
             "4": "TextEncodeQwenImageEditPlus", "3": "TextEncodeQwenImageEditPlus",
+            "31": "FluxKontextMultiReferenceLatentMethod",
+            "41": "FluxKontextMultiReferenceLatentMethod",
+            "10": "ModelSamplingAuraFlow", "11": "CFGNorm",
             "2": "KSampler", "5": "VAEDecode", "6": "SaveImage"}
         k = wf["2"]["inputs"]
         assert (k["steps"], k["cfg"], k["sampler_name"], k["scheduler"], k["seed"]) == \
-            (4, 1.0, "euler_ancestral", "beta", 7)
+            (40, 4.0, "euler", "simple", 7)
+        assert k["model"] == ["11", 0]
+        assert (k["positive"], k["negative"]) == (["31", 0], ["41", 0])
+        assert wf["10"]["inputs"]["shift"] == 3.1 and wf["11"]["inputs"]["strength"] == 1.0
+        assert wf["31"]["inputs"]["reference_latents_method"] == "index_timestep_zero"
         assert wf["3"]["inputs"]["image1"] == ["101", 0]
+        assert wf["4"]["inputs"]["image1"] == ["101", 0], "the negative sees the source too"
+        assert wf["4"]["inputs"]["prompt"] == ""
         assert wf["9"]["inputs"] == {"width": 1024, "height": 768, "batch_size": 1}
-        assert wf["1"]["inputs"]["ckpt_name"] == "Qwen-Rapid-AIO-NSFW-v23.safetensors"
+        assert wf["1"]["inputs"]["unet_name"] == "qwen_image_edit_2511_fp8mixed.safetensors"
+        assert wf["7"]["inputs"] == {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                                     "type": "qwen_image", "device": "default"}
+        assert wf["8"]["inputs"]["vae_name"] == "qwen_image_vae.safetensors"
+        assert not any("Checkpoint" in v["class_type"] for v in wf.values()), "no v23 AIO"
 
     def test_the_lora_is_spliced_in_only_with_a_strength(self):
         assert "20" not in graph.build_workflow("s.png", 64, 64, "p", 1, lora="x", lora_strength=0)
@@ -162,12 +177,13 @@ class TestTheGraph:
                                   lora_strength=0.9)
         assert wf["20"]["class_type"] == "LoraLoaderModelOnly"
         assert wf["20"]["inputs"]["model"] == ["1", 0]
-        assert wf["2"]["inputs"]["model"] == ["20", 0]
+        assert wf["10"]["inputs"]["model"] == ["20", 0]
 
     def test_a_partial_denoise_starts_from_the_source(self):
         wf = graph.build_workflow("s.png", 64, 64, "p", 1, denoise=0.4)
         assert "9" not in wf
         assert wf["110"]["inputs"]["pixels"] == ["101", 0]
+        assert wf["110"]["inputs"]["vae"] == ["8", 0]
         assert wf["2"]["inputs"]["latent_image"] == ["110", 0]
         assert wf["2"]["inputs"]["denoise"] == 0.4
 
@@ -753,7 +769,8 @@ def _safetensors(path, truncate=False):
 
 def _check(tmp_path, truncate=False):
     models = tmp_path / "qwen"
-    _safetensors(models / "v23" / "Qwen-Rapid-AIO-NSFW-v23.safetensors", truncate)
+    for i, (folder, name) in enumerate(graph.MODEL_FILES.items()):
+        _safetensors(models / folder / name, truncate and i == 0)
     aura = tmp_path / "if" / "models" / "auraface" / "glintr100.onnx"
     aura.parent.mkdir(parents=True)
     aura.write_bytes(b"onnx")
@@ -766,10 +783,226 @@ class TestModelCheck:
     def test_a_complete_set_passes(self, tmp_path):
         r = _check(tmp_path)
         assert r.returncode == 0, r.stdout + r.stderr
-        assert "1 file(s) OK" in r.stdout and "models OK" in r.stdout
+        assert "3 file(s) OK" in r.stdout and "models OK" in r.stdout
         assert "diffusion_models" not in r.stdout, "the LTX tree is not this target's"
 
     def test_a_truncated_checkpoint_fails_the_check(self, tmp_path):
         r = _check(tmp_path, truncate=True)
         assert r.returncode != 0
-        assert "TRUNCATED Qwen-Rapid-AIO-NSFW-v23.safetensors" in r.stdout
+        assert "TRUNCATED qwen_image_edit_2511_fp8mixed.safetensors" in r.stdout
+
+    @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                        reason="root ignores the read-only bit, and would start a real fetch")
+    def test_a_missing_text_encoder_on_a_host_mount_is_named(self, tmp_path):
+        """The 3090's tree had the transformer and no text encoder or VAE: the boot must say
+        which file is missing, not just fail."""
+        models = tmp_path / "qwen"
+        _safetensors(models / "base" / graph.UNET)
+        _safetensors(models / "vae" / graph.VAE)
+        (models / ".hf").mkdir()
+        # Read-only, like the 3090's mount: refused before any fetch is attempted.
+        models.chmod(0o555)
+        env = {**os.environ, "IMAGE_EDIT_MODELS_DIR": str(models),
+               "INSIGHTFACE_ROOT": str(tmp_path / "if")}
+        try:
+            r = subprocess.run(["bash", os.path.join(REPO, "download_models.sh"),
+                                "--image-edit"], capture_output=True, text=True, env=env,
+                               timeout=60)
+        finally:
+            models.chmod(0o755)
+        assert r.returncode != 0
+        assert "missing: text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors" in r.stdout
+
+
+class TestTheModelSetIsOneList:
+    def test_the_graph_loads_exactly_what_the_preflight_checks(self):
+        """graph.MODEL_FILES and download_models.sh's --image-edit _WANTED name the same files
+        in the same folders -- the daemon-side rule: a model in one and not the other either
+        never loads or never gets checked."""
+        script = open(os.path.join(REPO, "download_models.sh")).read()
+        block = script[script.index('if [ "$TARGET" = image-edit ]; then\n    _WANTED=('):]
+        block = block[:block.index("\n    )")]
+        rows = [ln.strip().strip('"') for ln in block.splitlines() if "|" in ln]
+        wanted = {r.split("|")[0]: r.split("|")[1] for r in rows}
+        assert wanted == graph.MODEL_FILES
+        for r in rows:
+            folder, name, repo, path, _gib = r.split("|")
+            assert repo.startswith("Comfy-Org/"), "the official files, as Comfy-Org ships them"
+            assert path.endswith("/" + name)
+
+    def test_comfy_is_pointed_at_those_folders(self):
+        from wanly_worker.services.image_edit import service
+        y = service.paths_yaml("/m")
+        assert "base_path: /m" in y
+        for key, folder in (("diffusion_models", "base"), ("text_encoders", "text_encoders"),
+                            ("vae", "vae")):
+            assert f"{key}: {folder}/" in y
+        assert set(graph.MODEL_FILES) == {"base", "text_encoders", "vae"}
+        assert "v23" not in y
+
+
+# ------------------------------------------------------------------ character sheets (#582)
+
+#: loras/reftest-2026-09-30/sheets.py qwen_prompt(PEOPLE["k2026"]), the approved recipe, verbatim.
+RECIPE_K2026 = (
+    "Create a photorealistic full-body character turnaround of the woman in image 1 on a plain "
+    "pure white studio background. Three full-body views of the same person side by side, left "
+    "to right: a front view facing the camera, a side view facing 90 degrees to the right, and a "
+    "back view facing completely away from the camera. Each view shows her whole body from head "
+    "to toe with no cropping, standing upright with arms relaxed at her sides, feet visible. "
+    "Keep her exact face, facial features, skin tone, and her ash-blonde hair pulled back into a "
+    "low bun. She wears the same light grey zip-neck fleece pullover over a turquoise t-shirt "
+    "that she wears in image 1, dark blue straight-leg jeans and white sneakers, identical in "
+    "all three views. Soft even studio lighting, equal white spacing between the views, no text, "
+    "no labels, no borders.")
+K2026_OUTFIT = ("the same light grey zip-neck fleece pullover over a turquoise t-shirt that she "
+                "wears in image 1, dark blue straight-leg jeans and white sneakers")
+K2026_HAIR = "her ash-blonde hair pulled back into a low bun"
+
+
+class TestTheTurnaroundPrompt:
+    def test_the_recipe_word_for_word(self):
+        assert graph.turnaround_prompt(K2026_OUTFIT, K2026_HAIR) == RECIPE_K2026
+
+    def test_body_is_its_own_sentence_between_hair_and_outfit(self):
+        p = graph.turnaround_prompt(K2026_OUTFIT, K2026_HAIR, "a slim, athletic build.")
+        assert "low bun. She has a slim, athletic build. She wears the same light grey" in p
+        assert K2026_OUTFIT + ", identical" in p, "the outfit is not touched"
+        assert p.replace("She has a slim, athletic build. ", "") == RECIPE_K2026
+
+    def test_a_man(self):
+        p = graph.turnaround_prompt("a navy suit", "short dark hair", "a broad build",
+                                    gender="male")
+        assert "of the man in image 1" in p and "his whole body" in p and "his sides" in p
+        assert "He has a broad build. He wears a navy suit" in p
+        assert " her " not in p and "She " not in p
+
+    def test_subject_and_default_hair(self):
+        p = graph.turnaround_prompt("jeans", subject="young woman")
+        assert "of the young woman in image 1" in p
+        assert "skin tone, and her hair exactly as in image 1." in p
+
+    def test_an_outfit_is_required(self):
+        with pytest.raises(ValueError, match="outfit"):
+            graph.turnaround_prompt("  . ")
+
+    def test_the_recipe_graph(self):
+        """sheets.py qwen_graph: FluxKontextImageScale on the face, 1088x1024, 40/4/euler."""
+        wf = graph.turnaround_workflow("face.png", "p", seed=11)
+        assert wf["102"] == {"class_type": "FluxKontextImageScale",
+                             "inputs": {"image": ["101", 0]}}
+        assert wf["3"]["inputs"]["image1"] == ["102", 0] == wf["4"]["inputs"]["image1"]
+        assert wf["9"]["inputs"] == {"width": 1088, "height": 1024, "batch_size": 1}
+        k = wf["2"]["inputs"]
+        assert (k["steps"], k["cfg"], k["sampler_name"], k["scheduler"], k["seed"],
+                k["denoise"]) == (40, 4.0, "euler", "simple", 11, 1.0)
+        assert wf["6"]["class_type"] == "SaveImage", "the node _run_graph reads"
+        assert "40 steps, cfg 4, euler/simple, AuraFlow shift 3.1, CFGNorm 1" in \
+            graph.settings_note()
+
+
+class TestTheSheetLayout:
+    def _photo(self, w, h):
+        from PIL import Image
+        im = Image.new("RGB", (w, h), (90, 90, 90))
+        return im
+
+    def test_a_face_that_fits_is_a_full_bleed_strip_centred_on_it(self):
+        from wanly_worker.services.image_edit import sheet
+        from PIL import Image
+        im = Image.new("RGB", (3000, 2000), (0, 0, 255))
+        im.paste((255, 0, 0), (2200, 0, 3000, 2000))      # red right of x=2200
+        # A face at x 2300-2500: the strip (875 px wide at full height) is clamped to the edge.
+        panel, mode = sheet.face_panel(im, [2300, 500, 2500, 760])
+        assert mode == "crop" and panel.size == (448, 1024)
+        assert panel.getpixel((440, 500)) == (255, 0, 0), "clamped to the photo's right edge"
+        assert panel.getpixel((5, 500)) == (0, 0, 255)
+
+    def test_a_tight_close_up_is_letterboxed_on_white_not_cut(self):
+        from wanly_worker.services.image_edit import sheet
+        im = self._photo(1024, 1024)
+        panel, mode = sheet.face_panel(im, [150, 200, 870, 900])   # face 720 wide
+        assert mode == "letterbox"
+        assert panel.getpixel((224, 2)) == (255, 255, 255), "white above"
+        assert panel.getpixel((224, 512)) == (90, 90, 90)
+
+    def test_no_face_is_centred(self):
+        from wanly_worker.services.image_edit import sheet
+        panel, mode = sheet.face_panel(self._photo(2000, 1500), None)
+        assert mode == "centre" and panel.size == (448, 1024)
+
+    def test_a_photo_too_narrow_for_a_strip_is_cropped_vertically(self):
+        from wanly_worker.services.image_edit import sheet
+        panel, mode = sheet.face_panel(self._photo(300, 2000), [100, 300, 200, 420])
+        assert mode == "crop" and panel.size == (448, 1024)
+
+    def test_the_sheet_is_1536x1024_real_face_left(self):
+        from wanly_worker.services.image_edit import sheet
+        from PIL import Image
+        face = Image.new("RGB", (1200, 1600), (0, 255, 0))
+        body = Image.new("RGB", (1088, 1024), (255, 0, 0))
+        out, mode = sheet.compose(face, body, [500, 400, 700, 650])
+        assert out.size == (1536, 1024) and mode == "crop"
+        assert out.getpixel((200, 500)) == (0, 255, 0)
+        assert out.getpixel((448, 500)) == (255, 0, 0) and out.getpixel((1535, 0)) == (255, 0, 0)
+
+    def test_the_largest_face_is_the_subject(self):
+        from wanly_worker.services.image_edit import sheet
+        assert sheet.largest([[0, 0, 10, 10], [5, 5, 50, 60], [0, 0, 20, 20]]) == [5, 5, 50, 60]
+        assert sheet.largest([]) is None
+
+
+class TestTheTurnaroundAPI:
+    def _req(self, **kw):
+        return {"image": base64.b64encode(_png(600, 800)).decode(), "outfit": "jeans",
+                "hair": "her red hair", "body": "a petite frame", "seed": 22, **kw}
+
+    def test_one_candidate_and_its_sheet(self, api, monkeypatch):
+        from PIL import Image
+        client, ran = api
+        monkeypatch.setattr(edit_app.identity, "face_boxes",
+                            lambda rgb: [[250.0, 200.0, 350.0, 330.0]])
+        r = client.post("/turnaround", json=self._req())
+        assert r.status_code == 200, r.text
+        body = r.json()
+        cand = Image.open(io.BytesIO(base64.b64decode(body["candidate"])))
+        sheet_im = Image.open(io.BytesIO(base64.b64decode(body["sheet"])))
+        assert cand.size == (1088, 1024) and sheet_im.size == (1536, 1024)
+        assert sheet_im.getpixel((1000, 500)) == (10, 20, 30), "the turnaround, right"
+        assert sheet_im.getpixel((200, 500)) == (200, 150, 120), "the real photo, left"
+        assert body["seed"] == 22 and body["steps"] == 40 and body["cfg"] == 4.0
+        assert "She has a petite frame. She wears jeans" in body["prompt"]
+        assert body["face_panel"]["mode"] == "crop"
+        assert body["model"] == graph.MODEL and body["files"] == graph.MODEL_FILES
+        assert body["identity"] == {"aura": 0.71, "reason": None}
+        assert base64.b64decode(body["sheet_preview"])[:2] == b"\xff\xd8"
+        assert ran[0]["9"]["inputs"]["width"] == 1088 and ran[0]["3"]["inputs"]["prompt"] == \
+            body["prompt"]
+
+    def test_a_photo_with_no_face_is_refused_before_the_card(self, api, monkeypatch):
+        client, ran = api
+        monkeypatch.setattr(edit_app.identity, "face_boxes", lambda rgb: [])
+        r = client.post("/turnaround", json=self._req())
+        assert r.status_code == 422 and "no face" in r.json()["detail"]
+        assert ran == []
+
+    def test_a_detector_that_will_not_load_still_makes_a_sheet(self, api, monkeypatch):
+        client, ran = api
+
+        def broken(rgb):
+            raise RuntimeError("no buffalo_l")
+        monkeypatch.setattr(edit_app.identity, "face_boxes", broken)
+        r = client.post("/turnaround", json=self._req())
+        assert r.status_code == 200, r.text
+        fp = r.json()["face_panel"]
+        assert fp["mode"] == "centre" and "unavailable" in fp["note"]
+
+    def test_no_outfit_is_a_422(self, api):
+        client, _ = api
+        assert client.post("/turnaround", json=self._req(outfit=" ")).status_code == 422
+
+    def test_health_advertises_it(self, api):
+        client, _ = api
+        body = client.get("/health").json()
+        assert {"turnaround", "official_2511"} <= set(body["features"])
+        assert body["model"] == graph.MODEL and body["checkpoint"] == graph.UNET
