@@ -127,6 +127,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && apt-get purge -y --auto-remove build-essential python3-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# ComfyUI-BFSNodes: LTXIdentityOverlapConditioning, the identity-reference node (#156). Proven
+# in phase 0 (#155) at exactly this commit, inside wanly's own recipe graph, beside the five
+# packs above. PINNED, unlike those: it is a model patch on the transformer's token sequence,
+# and an unpinned clone would change what every sheet render does between two builds with
+# nothing in the diff. If a workflow uses one of its classes, the daemon's node check names it.
+#
+# After the daemon-requirements layer on purpose: its requirements.txt lists insightface==0.7.3
+# (a compiled install, already done above), onnxruntime (pinned by wanly_worker/requirements.txt
+# below) and a bare torch/opencv-python. Those are filtered out and the rest installed under a
+# constraints file of what is already here, so nothing it lists can replace the cu128 torch or
+# the image's cv2 -- the swap pod_setup.sh had to guard against on the phase 0 pod. librosa is
+# filtered too: only BFS's AMV-guide node imports it (lazily), and it drags in numba/scipy for a
+# node no workflow here uses. The pack's module-level imports are torch, numpy, PIL and
+# safetensors; cv2 and insightface are imported lazily and are already in the image.
+ARG BFSNODES_COMMIT=bd23236bdde2daf10ec4d879364805c0e97a78eb
+RUN set -eux; \
+    git clone https://github.com/alisson-anjos/ComfyUI-BFSNodes.git /app/ComfyUI/custom_nodes/ComfyUI-BFSNodes \
+ && git -C /app/ComfyUI/custom_nodes/ComfyUI-BFSNodes checkout "$BFSNODES_COMMIT" \
+ && pip freeze | grep -iE '^(torch|torchvision|torchaudio|numpy|opencv-python|opencv-python-headless|insightface)==' \
+      > /tmp/bfs-constraints.txt \
+ && grep -viE '^\s*(torch|insightface|onnxruntime|opencv-python|librosa)\b' \
+      /app/ComfyUI/custom_nodes/ComfyUI-BFSNodes/requirements.txt > /tmp/bfs-requirements.txt \
+ && cat /tmp/bfs-constraints.txt /tmp/bfs-requirements.txt \
+ && pip install --no-cache-dir -c /tmp/bfs-constraints.txt -r /tmp/bfs-requirements.txt \
+ && python3 -c "import torch, numpy, PIL, safetensors; print('bfsnodes deps ok, torch', torch.__version__)"
+
 # Models are bind-mounted, never baked: the LTX-2.3 set alone is ~126 GB.
 ENV COMFY_PORT=8188 \
     API_PORT=8190 \
