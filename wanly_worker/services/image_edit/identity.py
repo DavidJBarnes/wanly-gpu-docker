@@ -26,7 +26,14 @@ AURA_PATH = os.environ.get("IMAGE_EDIT_AURAFACE",
 _lock = threading.Lock()
 _models: tuple | None = None
 _load_error: str | None = None
-_det = None
+_dets: dict[int, object] = {}
+#: The detector's input size. buffalo_l's SCRFD sees the photo shrunk to fit this square.
+DET_SIZE = 640
+#: The second look for a photo where DET_SIZE found nothing (console#585): a full-body shot's
+#: face is small, and shrinking a 4000 px frame to 640 leaves it too few pixels -- a 64 px face
+#: in a 4000x3000 frame is missed at 640 and found at 1280. Not the default: at 1280 a face
+#: filling a close-up is larger than SCRFD's biggest anchors.
+DET_SIZE_SMALL_FACES = 1280
 #: Faces narrower than this are not offered for a face choice (console#569): too small to
 #: edit on their own, and usually a background face or a detector guess.
 MIN_FACE_PX = 30
@@ -40,27 +47,26 @@ def cosine(a, b) -> float:
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def detector():
-    """buffalo_l detection alone, CPU. Separate from AuraFace so the face list (console#569)
-    works on a box whose AuraFace download failed -- a missing score is a reason, a missing
-    face picker would be a silently wrong edit."""
-    global _det
+def detector(det_size: int = DET_SIZE):
+    """buffalo_l detection alone, CPU, at `det_size`. Separate from AuraFace so the face list
+    (console#569) works on a box whose AuraFace download failed -- a missing score is a reason,
+    a missing face picker would be a silently wrong edit."""
     with _lock:
-        if _det is None:
+        if det_size not in _dets:
             from insightface.app import FaceAnalysis
 
             det = FaceAnalysis(name="buffalo_l", root=ROOT, providers=["CPUExecutionProvider"],
                                allowed_modules=["detection"])
-            det.prepare(ctx_id=-1, det_size=(640, 640))
-            _det = det
-        return _det
+            det.prepare(ctx_id=-1, det_size=(det_size, det_size))
+            _dets[det_size] = det
+        return _dets[det_size]
 
 
-def face_boxes(rgb) -> list[list[float]]:
+def face_boxes(rgb, det_size: int = DET_SIZE) -> list[list[float]]:
     """Every face's [x1, y1, x2, y2] in `rgb`'s pixels, LEFT TO RIGHT, narrow ones dropped."""
     import numpy as np
 
-    faces = detector().get(np.ascontiguousarray(np.asarray(rgb)[:, :, ::-1]))
+    faces = detector(det_size).get(np.ascontiguousarray(np.asarray(rgb)[:, :, ::-1]))
     boxes = [[round(float(v), 1) for v in f.bbox[:4]] for f in faces]
     boxes = [b for b in boxes if b[2] - b[0] >= MIN_FACE_PX]
     return sorted(boxes, key=lambda b: (b[0], b[2]))

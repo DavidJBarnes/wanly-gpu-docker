@@ -4,9 +4,11 @@
                     seed?, denoise?, ...}
                    -> {image: b64 png, width, height, prompt, identity: {aura, reason}, ...}
     POST /faces    {image: b64} -> {width, height, faces: [{index, box, width}], default_index}
-    POST /turnaround {image: b64 face photo, outfit, hair?, body?, gender?, subject?, seed?}
+    POST /turnaround {image: b64 photo of the person (face + body), outfit, hair?, seed?,
+                      crop_padding?, gender?, subject?}
                    -> {candidate: b64 png 1088x1024, sheet: b64 png 1536x1024, previews,
-                       prompt, seed, model, settings, face_panel, identity, ...}
+                       face_panel_preview, prompt, seed, model, settings, face_panel,
+                       identity, ...}
     GET  /health   comfy up, model loaded, busy, idle seconds, what an edit is waiting for,
                    last edit's timings and VRAM
 
@@ -26,12 +28,24 @@ wanly-api sends numbers and names. See graph.py for the graph and the framing pi
 WHICH FACE (console#569): `face_box` from POST /faces edits that face alone -- crop, edit, paste
 back feathered -- so nobody else in the picture is regenerated. See crop.py for why.
 
-CHARACTER SHEETS (console#582): /turnaround is the sheet recipe -- a real face photo plus outfit,
-hair and body words in, ONE candidate per call (one seed): the generated front/side/back
-turnaround AND the 1536x1024 sheet already composed from it (sheet.py). Composed here, at once,
+CHARACTER SHEETS (console#582, #585): /turnaround is the sheet recipe -- ONE photo of the person
+(full body or most of it, in the outfit) plus outfit and hair words in, ONE candidate per call
+(one seed): the generated front/side/back turnaround AND the 1536x1024 sheet already composed
+from it, its face panel auto-cropped from the same photo (sheet.py). Composed here, at once,
 because this is the only process with the face detector and an image library: wanly-api has
 neither, and approving a candidate later must not need the card back. The caller asks for N
 seeds as N calls, so each candidate is kept the moment it exists.
+
+THE FACE IS FOUND BY buffalo_l (SCRFD), THE DETECTOR THIS SERVICE ALREADY RUNS, NOT BY THE
+MEDIAPIPE NODES the tested UI workflow used. Both were weighed for #585; the deciding case is a
+small face in a wide shot (a full-body photo by a tent). ComfyUI's MediaPipeFaceLandmarker
+squeezes the whole frame into BlazeFace's 128 px (short range) or 192 px (full range) input, so
+a face 2% of a 4000 px frame's width arrives as about 4 px. SCRFD sees 640 px, and this service
+looks again at 1280 when 640 finds nothing (identity.DET_SIZE_SMALL_FACES): a 64 px face in a
+4000x3000 frame is found that way. It also runs on the CPU BEFORE the card is touched, so a
+photo with no findable face is a 422 in a second instead of minutes of GPU time followed by a
+useless sheet, and it needs no new model file, no new ComfyUI node and no change to the 3090's
+model tree. The crop itself is the workflow's (CropByBBoxes padding, white-padded panel).
 """
 from __future__ import annotations
 
@@ -71,7 +85,7 @@ _started_at = time.time()
 #: What this service can be asked for beyond #548's angle/instruction, so wanly-api can tell an
 #: image that predates them (it would silently ignore the fields) from one that has them.
 FEATURES = ["angle", "instruction", "expression", "face_box", "faces", "turnaround",
-            "official_2511"]
+            "official_2511", "one_photo"]
 
 
 @contextlib.asynccontextmanager
@@ -130,19 +144,22 @@ class FacesRequest(BaseModel):
 
 
 class TurnaroundRequest(BaseModel):
-    #: The REAL face photo. It is both the model's reference and the sheet's face panel.
+    #: ONE photo of the person, full body or most of it, in the outfit (console#585). It is
+    #: image 1 of the turnaround -- her body and build come from it -- and the sheet's face
+    #: panel is cropped from it. There is no body-words field: the model ignored it (graph.py).
     image: str = Field(min_length=1)
+    #: What she wears IN THE PHOTO, described: the turnaround keeps it in all three views.
     outfit: str = Field(min_length=1, max_length=600)
     hair: str | None = Field(None, max_length=300)
-    #: Body build, its own sentence in the prompt ("She has an athletic build.").
-    body: str | None = Field(None, max_length=300)
+    #: Source pixels around the detected face box for the face panel (CropByBBoxes' padding).
+    crop_padding: int = Field(sheets.DEFAULT_PADDING, ge=0, le=sheets.MAX_PADDING)
     gender: Literal["female", "male"] = "female"
     #: Who image 1 shows, e.g. "young woman". Default "woman" / "man".
     subject: str | None = Field(None, max_length=60)
     seed: int | None = Field(None, ge=0, le=2**48)
     steps: int | None = Field(None, ge=1, le=80)
     cfg: float | None = Field(None, ge=1.0, le=10.0)
-    #: AuraFace of the turnaround (its largest face: the front view) against the photo.
+    #: AuraFace of the turnaround (its largest face: the front view) against the face panel.
     score: bool = True
 
 
@@ -394,39 +411,56 @@ def _png_and_preview(im, edge: int = 1024) -> tuple[str, str]:
     return base64.b64encode(buf.getvalue()).decode(), base64.b64encode(pbuf.getvalue()).decode()
 
 
+def _sheet_face(photo) -> tuple[list[float] | None, int]:
+    """(the subject's face box, the detector size that found it). Looked for at the usual size
+    first, then again at DET_SIZE_SMALL_FACES -- a full-body photo's face is small. Raises
+    whatever the detector raises (the caller decides that is not fatal)."""
+    for size in (identity.DET_SIZE, identity.DET_SIZE_SMALL_FACES):
+        box = sheets.largest(identity.face_boxes(photo, det_size=size))
+        if box is not None:
+            return box, size
+    return None, identity.DET_SIZE_SMALL_FACES
+
+
 @app.post("/turnaround")
 async def turnaround(req: TurnaroundRequest):
-    """One character-sheet candidate (console#582): the turnaround for one seed, and the sheet
-    composed from it with the real face panel. See the module docstring and sheet.py."""
+    """One character-sheet candidate (console#582, #585): the turnaround for one seed from the
+    one photo, and the sheet composed from it with the face panel cropped from that photo. See
+    the module docstring and sheet.py."""
     from PIL import Image
     import numpy as np
 
     try:
-        prompt = graph.turnaround_prompt(req.outfit, req.hair, req.body, req.gender, req.subject)
+        prompt = graph.turnaround_prompt(req.outfit, req.hair, req.gender, req.subject)
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    face = await asyncio.to_thread(_decode, req.image)
+    photo = await asyncio.to_thread(_decode, req.image)
     # THE FACE FIRST, ON THE CPU: a photo with no face would make a sheet with no identity in
     # it, and finding that out costs a second here against minutes of card time.
+    det_size = None
     try:
-        boxes = await asyncio.to_thread(identity.face_boxes, face)
-        box, detect_note = sheets.largest(boxes), None
+        box, det_size = await asyncio.to_thread(_sheet_face, photo)
+        detect_note = None
         if box is None:
-            raise HTTPException(422, "no face found in the face photo: a character sheet is "
-                                     "built around one -- pick a photo where it is clear")
+            raise HTTPException(422, "no face found in the photo: the sheet's face panel is "
+                                     "cropped from it -- pick a photo where her face is clear "
+                                     "and reasonably large")
     except HTTPException:
         raise
     except Exception as e:                      # noqa: BLE001 -- the sheet still works
         box, detect_note = None, f"face detection unavailable ({e}); face panel centred"
         print(f"[image-edit] {detect_note}", flush=True)
+    # The panel does not depend on the seed: cut it before the card, so the preview is ready
+    # whatever the turnaround does.
+    panel, panel_info = await asyncio.to_thread(sheets.face_panel, photo, box, req.crop_padding)
     seed = req.seed if req.seed is not None else random.randrange(2**32)
     steps, cfg = req.steps or graph.STEPS, req.cfg or graph.CFG
     async with _card_turn() as turn:
         t0 = time.time()
         os.makedirs(os.path.join(WORK_DIR, "in"), exist_ok=True)
-        name = f"face_{uuid.uuid4().hex}.png"
+        name = f"photo_{uuid.uuid4().hex}.png"
         path = os.path.join(WORK_DIR, "in", name)
-        await asyncio.to_thread(face.save, path, "PNG")
+        await asyncio.to_thread(photo.save, path, "PNG")
         wf = graph.turnaround_workflow(name, prompt, seed, steps=steps, cfg=cfg)
         async with httpx.AsyncClient() as client:
             png = await _run_graph(client, wf)
@@ -436,11 +470,13 @@ async def turnaround(req: TurnaroundRequest):
         except OSError:
             pass
     body = Image.open(io.BytesIO(png)).convert("RGB")
-    composed, panel_mode = await asyncio.to_thread(sheets.compose, face, body, box)
+    composed, _, _ = await asyncio.to_thread(sheets.compose, photo, body, box, req.crop_padding)
     ident = {"aura": None, "reason": "not requested"}
     t1 = time.time()
     if req.score:
-        ident = await asyncio.to_thread(identity.score, np.asarray(face), np.asarray(body))
+        # Against the PANEL, not the whole photo: in a wide shot the face is too small for the
+        # scorer's 640 px detector, and the panel is exactly the face the sheet anchors on.
+        ident = await asyncio.to_thread(identity.score, np.asarray(panel), np.asarray(body))
     t_score = time.time() - t1
     _state.update(edits=_state["edits"] + 1,
                   last={"seconds": round(t_gen, 1), "vram_peak_mib": turn["peak"][0] or None,
@@ -449,15 +485,17 @@ async def turnaround(req: TurnaroundRequest):
     waited = turn["waited"]
     print(f"[image-edit] turnaround seed {seed} {steps} steps cfg {cfg:g} in {t_gen:.1f}s"
           f"{f' after {waited:.0f}s waiting for A1111' if waited >= 1 else ''},"
-          f" vram peak {turn['peak'][0]} MiB, face panel {panel_mode}, aura {ident['aura']}",
-          flush=True)
+          f" vram peak {turn['peak'][0]} MiB, face panel {panel_info['mode']}"
+          f" crop {panel_info['crop']} x{panel_info['scale']}, aura {ident['aura']}", flush=True)
     cand_png, cand_jpg = await asyncio.to_thread(_png_and_preview, body)
     sheet_png, sheet_jpg = await asyncio.to_thread(_png_and_preview, composed, 1536)
+    _, panel_jpg = await asyncio.to_thread(_png_and_preview, panel)
     return {
         "candidate": cand_png,
         "candidate_preview": cand_jpg,
         "sheet": sheet_png,
         "sheet_preview": sheet_jpg,
+        "face_panel_preview": panel_jpg,
         "format": "png",
         "width": body.width,
         "height": body.height,
@@ -470,7 +508,12 @@ async def turnaround(req: TurnaroundRequest):
         "model": graph.MODEL,
         "files": dict(graph.MODEL_FILES),
         "settings": graph.settings_note(steps, cfg),
-        "face_panel": {"mode": panel_mode, "box": box, "note": detect_note},
+        # The panel's provenance: cut from the SAME photo the turnaround was drawn from.
+        "face_panel": {"mode": panel_info["mode"], "source": "same_photo", "box": box,
+                       "crop": panel_info["crop"], "padding": req.crop_padding,
+                       "scale": panel_info["scale"], "detector": "buffalo_l",
+                       "det_size": det_size if box is not None else None,
+                       "photo_size": [photo.width, photo.height], "note": detect_note},
         "identity": ident,
         "timings_ms": {"generate": round(t_gen * 1000), "score": round(t_score * 1000),
                        "waited_for_a1111": round(turn["waited"] * 1000)},

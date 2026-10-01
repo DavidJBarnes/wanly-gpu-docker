@@ -21,7 +21,8 @@ only values move.
 
 TWO GRAPHS, ONE MODEL. `build_workflow` is the Edit dialog's (an angle, an expression, free
 text, at the source's own size). `turnaround_workflow` is the character-sheet recipe
-(wanly-console#582): a face photo in, a 1088x1024 front/side/back turnaround out.
+(wanly-console#582, #585): one photo of the person in, a 1088x1024 front/side/back turnaround
+out.
 
 THE HEAD-ANGLE RECIPE IS PROMPT-ONLY, chosen by the #548 spike (36 edits, 3 real portraits):
 image-space wording plus the framing pin reached three-quarter and full profile in the asked
@@ -332,18 +333,22 @@ def build_workflow(source_name: str, width: int, height: int, prompt: str, seed:
 
 # ---------------------------------------------------------------------------- turnaround
 #
-# THE CHARACTER-SHEET RECIPE (wanly-console#582), from loras/reftest-2026-09-30/sheets.py, where
-# it made the sheets phase 0 (wanly-gpu-docker#155) proved: a REAL face photo in, a photoreal
-# front / side / back full-body turnaround on white out, 1088x1024 -- the right-hand part of the
-# 1536x1024 sheet (sheet.py puts the real face beside it). The face goes through
+# THE CHARACTER-SHEET RECIPE, ONE-PHOTO FORM (wanly-console#582, #585). One photo of the person --
+# full body or most of it, in the outfit -- is image 1; a photoreal front / side / back
+# full-body turnaround on white comes out, 1088x1024: the right-hand part of the 1536x1024 sheet
+# (sheet.py puts a face panel cropped from the SAME photo beside it). The photo goes through
 # FluxKontextImageScale (the model's own preferred size), not at its own size: the output is a
 # new picture, not an edit of this one, so there is no framing to pin.
 #
-# The wording is sheets.py's qwen_prompt, verbatim for a woman with hair and outfit given
-# (test_image_edit.py checks it against the recipe word for word). Two things are added:
-#   * BODY (the user's build control) is its own sentence, "She has <body>.", between the hair
-#     and the outfit -- never folded into the outfit, where it reads as clothing;
-#   * a man gets "he/his"; the recipe was written for two women.
+# WHY ONE PHOTO, AND NO BODY WORDS (#585). Qwen-Image-Edit-2511 keeps image 1 faithfully and
+# mostly ignores everything else: a "She has an athletic build." sentence (#582's BODY field)
+# and a body photo given as image 2 both came back with the face photo's implied build. Build is
+# only controllable when image 1 IS the body -- so the photo is the whole person, and the prompt
+# asks to keep "body shape, build and proportions from image 1". There is no body field.
+#
+# The wording is loras/phase0-2026-10-01/character_sheet_one_input.json's, verbatim for a woman
+# with hair and outfit given (test_image_edit.py checks it word for word); a man gets "he/his",
+# and `subject` names who image 1 shows.
 
 TURNAROUND_W, TURNAROUND_H = 1088, 1024
 
@@ -352,8 +357,8 @@ def _clause(text: str | None) -> str:
     return (text or "").strip().rstrip(".").strip()
 
 
-def turnaround_prompt(outfit: str, hair: str | None = None, body: str | None = None,
-                      gender: str = "female", subject: str | None = None) -> str:
+def turnaround_prompt(outfit: str, hair: str | None = None, gender: str = "female",
+                      subject: str | None = None) -> str:
     """The turnaround instruction. ValueError (-> 422) without an outfit."""
     outfit = _clause(outfit)
     if not outfit:
@@ -361,25 +366,23 @@ def turnaround_prompt(outfit: str, hair: str | None = None, body: str | None = N
     he, his = ("he", "his") if gender == "male" else ("she", "her")
     who = f"the {_clause(subject) or ('man' if gender == 'male' else 'woman')} in image 1"
     hair = _clause(hair) or f"{his} hair exactly as in image 1"
-    body = _clause(body)
-    build = f"{he.capitalize()} has {body}. " if body else ""
     return (f"Create a photorealistic full-body character turnaround of {who} on a plain pure "
             f"white studio background. Three full-body views of the same person side by side, "
             f"left to right: a front view facing the camera, a side view facing 90 degrees to "
             f"the right, and a back view facing completely away from the camera. Each view "
             f"shows {his} whole body from head to toe with no cropping, standing upright with "
             f"arms relaxed at {his} sides, feet visible. Keep {his} exact face, facial "
-            f"features, skin tone, and {hair}. {build}{he.capitalize()} wears {outfit}, "
-            f"identical in all three views. Soft even studio lighting, equal white spacing "
-            f"between the views, no text, no labels, no borders.")
+            f"features, skin tone, body shape, build and proportions from image 1, and {hair}. "
+            f"{he.capitalize()} wears {outfit}, identical in all three views. Soft even studio "
+            f"lighting, equal white spacing between the views, no text, no labels, no borders.")
 
 
-def turnaround_workflow(face_name: str, prompt: str, seed: int, steps: int = STEPS,
+def turnaround_workflow(photo_name: str, prompt: str, seed: int, steps: int = STEPS,
                         cfg: float = CFG) -> dict:
-    """sheets.py's qwen_graph: the face photo, scaled by FluxKontextImageScale, as image1; a
-    1088x1024 empty latent."""
+    """The one-input workflow's graph: the photo, scaled by FluxKontextImageScale, as image1;
+    a 1088x1024 empty latent."""
     wf: dict = {
-        "101": {"class_type": "LoadImage", "inputs": {"image": face_name}},
+        "101": {"class_type": "LoadImage", "inputs": {"image": photo_name}},
         "102": {"class_type": "FluxKontextImageScale", "inputs": {"image": ["101", 0]}},
         "9": {"class_type": "EmptySD3LatentImage",
               "inputs": {"width": TURNAROUND_W, "height": TURNAROUND_H, "batch_size": 1}},
