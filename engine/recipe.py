@@ -289,3 +289,137 @@ def lora_stack_note(graph: dict) -> str:
         found = [pair("9601", "9602", "content")]
     parts.append(" · ".join(found) if found else "content none")
     return " · ".join(parts)
+
+
+# ---------------------------------------------------------------------------------------
+# Identity reference (wanly-gpu-docker#156, proven in phase 0 / #155)
+# ---------------------------------------------------------------------------------------
+#
+# An OPTIONAL reference image -- a 1536x1024 character sheet or a face close-up -- conditioned
+# into both stages through ComfyUI-BFSNodes' LTXIdentityOverlapConditioning, with the matching
+# Best-Face-ID LoRA. Phase 0 rendered 36 clips through exactly this patch on wanly's own graph:
+# LoRA + sheet held identity best on head turns and wide shots (k2026 mean clip median 0.587
+# LoRA-only -> 0.699 with the sheet), at +33% render time (+6% for a face). Results:
+# https://github.com/DavidJBarnes/wanly-gpu-docker/issues/155
+#
+# A SEPARATE STEP FROM resolve(), deliberately. resolve() patches values and never topology;
+# this adds nodes and rewires guiders, so folding it in would break that rule for every render.
+# Kept apart, a render with no reference never reaches this code at all and its graph -- and
+# so its graph_hash, the regression trail -- is byte-identical to what it was before this
+# existed. test_identity_ref.py pins that.
+
+#: mode -> the Best-Face-ID LoRA trained for it (Alissonerdx/LTX-Best-Face-ID). Both files are
+#: in download_models.sh's _WANTED; test_identity_ref.py holds the two lists together.
+IDENTITY_LORAS = {
+    "face": "Best_FaceID_v1.0_LoRA.safetensors",
+    "sheet": "Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors",
+}
+#: How the overlap node sizes the reference. The CharacterSheet LoRA was trained on 1536x1024
+#: sheets, so a sheet stays at its native size; a face ref follows the render's size.
+IDENTITY_RESIZE = {"face": "match_target", "sheet": "native_resolution"}
+#: The caption prefix both BFID LoRAs were trained with. It goes AHEAD of the character
+#: trigger, so the trigger still leads the caption proper.
+IDENTITY_PROMPT_PREFIX = "ref_t2v: "
+
+# Recipe graph ids (ltx23_recipe.api.json), per stage:
+#   (preview-override node the LoRA chain feeds, distill LoRA node, the stage's latent after
+#    the in-place i2v + AV concat, the sampler consuming that latent, the guiders that sample
+#    with this stage's model -- the first one's conditioning is what the overlap node reads)
+_IDENTITY_STAGES = {
+    "1": ("337", "361", ["109", 0], "113", ("383", "129")),
+    "2": ("372", "362", ["117", 0], "119", ("103",)),
+}
+_IDENTITY_PROMPT = "121"
+_IDENTITY_VAE = ["9500", 2]
+#: 9641/9642 identity LoRA, 9643/9644 overlap conditioning, 9645 LoadImage, 9646 face resize.
+#: Content uses 9601.., characters 9621/9622 and 9631/9632, so nothing collides.
+IDENTITY_NODE_IDS = ("9641", "9642", "9643", "9644", "9645", "9646")
+
+
+def add_identity_ref(graph: dict, ref_image: str, mode: str) -> dict:
+    """Return a copy of a RESOLVED recipe graph with an identity reference patched in.
+
+    Called from app.run_job() right after resolve(), and only when the request carries both
+    `identity_ref` and `identity_mode`. `ref_image` is the name ComfyUI stored the upload
+    under. On both stages:
+
+      * the BFID (face) or CharacterSheet (sheet) LoRA at 1.0, spliced AFTER the character
+        LoRA(s) and BEFORE the preview-override + sulphur distill:
+        301 -> content* -> char* -> IDENTITY -> 337|372 -> 361|362. LoRA deltas are additive,
+        so the order is cosmetic; this position leaves resolve()'s 96xx ids and
+        lora_stack_note() untouched. With no character LoRA (a sheet-only character) it
+        simply follows the content chain, or the checkpoint.
+      * LTXIdentityOverlapConditioning fed the post-distill model and the post-i2v latent.
+        It is a model patch -- the ref is VAE-encoded inside, appended as clean tokens and
+        trimmed before unpatchify -- so conditioning and latent pass through unchanged and no
+        LTXVCropGuides is needed. Its MODEL feeds every guider that samples with the stage's
+        model (383 and 129 on stage 1, 103 on stage 2); its LATENT feeds the sampler. The
+        scheduler's ModelSamplingSD3 (368) stays on the plain model: it only reads the shift.
+        source_id=2, layout=overlap, temporal offset 0, ref-CFG off -- phase 0's settings.
+      * the prompt is prefixed `ref_t2v: `.
+
+    A face ref is resized to 512x512 first, as the model card does; a sheet is passed at its
+    native 1536x1024.
+    """
+    if mode not in IDENTITY_LORAS:
+        raise ValueError(f"identity mode {mode!r}; expected one of {sorted(IDENTITY_LORAS)}")
+    if not ref_image:
+        raise ValueError("identity reference image name is empty")
+    g = json.loads(json.dumps(graph))
+
+    g["9645"] = {"class_type": "LoadImage", "inputs": {"image": ref_image},
+                 "_meta": {"title": "identity ref"}}
+    if mode == "face":
+        g["9646"] = {"class_type": "ImageScale", "inputs": {
+            "image": ["9645", 0], "upscale_method": "lanczos", "width": 512, "height": 512,
+            "crop": "center"}, "_meta": {"title": "identity ref 512"}}
+        ref = ["9646", 0]
+    else:
+        ref = ["9645", 0]
+
+    for tag, (preview, distill, latent, sampler, guiders) in _IDENTITY_STAGES.items():
+        lid = f"964{tag}"            # 9641 / 9642
+        g[lid] = {"class_type": "LoraLoaderModelOnly",
+                  "inputs": {"lora_name": IDENTITY_LORAS[mode], "strength_model": 1.0,
+                             "model": g[preview]["inputs"]["model"]},
+                  "_meta": {"title": f"identity {mode} stage {tag}"}}
+        g[preview]["inputs"]["model"] = [lid, 0]
+
+        cid = f"964{2 + int(tag)}"   # 9643 / 9644
+        first = g[guiders[0]]["inputs"]
+        g[cid] = {"class_type": "LTXIdentityOverlapConditioning", "inputs": {
+            "model": [distill, 0], "positive": first["positive"], "negative": first["negative"],
+            "vae": _IDENTITY_VAE, "latent": latent, "reference_image": ref,
+            "source_id": 2.0, "phase_scale": 1.0, "ref_resize_mode": IDENTITY_RESIZE[mode],
+            "debug_log": False, "crop_anchor": "center", "layout": "overlap",
+            "reference_guidance_scale": 1.0, "reference_temporal_offset_latents": 0},
+            "_meta": {"title": f"identity overlap stage {tag}"}}
+        rewired = 0
+        for gid in guiders:
+            if gid in g and g[gid]["inputs"].get("model") == [distill, 0]:
+                g[gid]["inputs"]["model"] = [cid, 0]
+                rewired += 1
+        # A template re-export that moved a guider off the distill LoRA would otherwise leave
+        # the reference conditioning NOTHING, and the render would look entirely normal.
+        if not rewired:
+            raise ValueError(f"identity ref: no stage-{tag} guider samples from {distill}; "
+                             f"the recipe graph has changed shape")
+        g[sampler]["inputs"]["latent_image"] = [cid, 3]
+
+    t = g[_IDENTITY_PROMPT]["inputs"]["text"]
+    if not t.startswith(IDENTITY_PROMPT_PREFIX.strip()):
+        g[_IDENTITY_PROMPT]["inputs"]["text"] = IDENTITY_PROMPT_PREFIX + t
+    return g
+
+
+def identity_note(graph: dict) -> str:
+    """Which identity reference this graph conditions on, beside lora_stack_note().
+
+    Read off the RESOLVED graph like the LoRA line, so it is evidence of what will render.
+    Absence is stated ("identity none"), never implied.
+    """
+    a, c = graph.get("9641"), graph.get("9643")
+    if not a or not c:
+        return "identity none"
+    return (f"identity {a['inputs']['lora_name']} @{a['inputs']['strength_model']} "
+            f"ref={graph['9645']['inputs']['image']} ({c['inputs']['ref_resize_mode']})")

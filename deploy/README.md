@@ -259,6 +259,31 @@ claiming "parked"** if it cannot read the engine.
 `caption` mode is for a long captioning stretch where you would rather not have the render
 stack resident at all; `pause` is for everything else.
 
+## Identity references: stage the two LoRAs BEFORE re-pinning (#156)
+
+Images from #156 onward stage `Best_FaceID_v1.0_LoRA.safetensors` (2.47 GB) and
+`Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors` (1.31 GB) as part of the required model set.
+On a pod that is a download. **On the 3090 the model root is a read-only bind mount**, so
+`download_models.sh` will not fetch them -- it refuses to boot with "is a bind mount from the
+host, and it is incomplete". Put them in the host tree first, then re-pin:
+
+```bash
+cd /home/david/LTX-2/models/loras
+for f in Best_FaceID_v1.0_LoRA.safetensors Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors; do
+  curl -fL --retry 3 -o "$f.part" "https://huggingface.co/Alissonerdx/LTX-Best-Face-ID/resolve/main/$f" \
+    && mv "$f.part" "$f"
+done
+sha256sum Best_FaceID_*.safetensors
+# 7aaab2f1bff2af121e0751120ad16a3e443b4223a04b78c51740029d25f17994  Best_FaceID_v1.0_LoRA.safetensors
+# 4c7804265c5e8a284c0613fb6fd63d114f029429e9837e3ea289521d7ef93ffa  Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors
+```
+
+The image also carries ComfyUI-BFSNodes pinned at bd23236 (the node the reference runs
+through), and ltx-engine's `/health` lists `identity_ref` under `features`. The daemon refuses a
+reference rather than sending it to an engine without that feature, so a worker still on an
+older image fails sheet renders with a message saying to re-pin -- it never renders them
+without the sheet.
+
 ## Rollback
 
 `run-worker.sh` honours `IMAGE`, so pinning an older build is:

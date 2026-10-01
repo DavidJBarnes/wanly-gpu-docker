@@ -35,6 +35,7 @@ than the two bespoke schemes it replaces.
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -51,6 +52,8 @@ import uvicorn
 from PIL import Image
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 import comfy
@@ -316,6 +319,14 @@ class JobRequest(BaseModel):
     # job and `strict_grid` opts into refusing it.
     strict_grid: bool = False
     snap_indices: bool = False
+    # IDENTITY REFERENCE (#156): a character sheet or a face close-up, conditioned into both
+    # stages through BFSNodes' LTXIdentityOverlapConditioning with the matching Best-Face-ID
+    # LoRA (recipe.add_identity_ref). Same transport as a keyframe image: a data URI or an
+    # http(s) URL. Recipe path only, and both or neither -- a reference with no mode would
+    # have to guess which LoRA and which resize it was made for. Absent, the graph is
+    # byte-identical to a render from before this field existed.
+    identity_ref: str | None = None
+    identity_mode: Literal["sheet", "face"] | None = None
 
 
 @dataclass
@@ -681,6 +692,37 @@ def blank_frame(width: int, height: int) -> bytes:
     return buf.getvalue()
 
 
+def _upload_identity_ref(cf, job: Job, workdir: Path) -> str:
+    """Fetch the identity reference, prove its LoRA is here, and hand it to ComfyUI.
+
+    Named by CONTENT HASH, not by job: the same sheet is the same file in ComfyUI's input
+    folder however many renders use it, rather than one more copy per job.
+
+    The LoRA is checked before anything is submitted, as content LoRAs are: a missing file
+    should be a clear failure in the first second naming what to fetch, not a node error from
+    ComfyUI. download_models.sh fetches both on a pod; on the 3090 they live in the host
+    model tree.
+    """
+    resolve_lora(recipe_mod.IDENTITY_LORAS[job.req.identity_mode])
+    dest = workdir / "identity_ref.png"
+    decode_image(job.req.identity_ref, dest)
+    data = dest.read_bytes()
+    try:
+        with Image.open(dest) as im:
+            size = im.size
+    except Exception as e:
+        raise RuntimeError(f"identity_ref is not a readable image ({type(e).__name__}: {e})")
+    if job.req.identity_mode == "sheet" and size != (1536, 1024):
+        # Not refused: phase 0 only ever rendered 1536x1024 sheets, but a different layout is
+        # a quality question, not a crash. Said where the segment log will show it.
+        job.notes.append(f"character sheet is {size[0]}x{size[1]}, not the 1536x1024 the "
+                         f"CharacterSheet LoRA was trained on")
+    name = cf.upload_image(data, f"idref_{hashlib.sha256(data).hexdigest()[:16]}.png")
+    print(f"[{job.id}] identity ref ({job.req.identity_mode}) {size[0]}x{size[1]} "
+          f"-> {name}", flush=True)
+    return name
+
+
 def run_job(job: Job):
     workdir = JOBS_DIR / job.id
     workdir.mkdir(parents=True, exist_ok=True)
@@ -844,6 +886,12 @@ def run_job(job: Job):
                 img_compression=job.req.img_compression,
                 text_to_video=t2v,
             )
+            # IDENTITY REFERENCE (#156), right after resolve() and only when asked for. A
+            # render without one never reaches add_identity_ref, so its graph -- and graph
+            # hash -- is exactly what it was before this existed.
+            if job.req.identity_ref and job.req.identity_mode:
+                graph = recipe_mod.add_identity_ref(
+                    graph, _upload_identity_ref(cf, job, workdir), job.req.identity_mode)
             if job.req.num_frames:
                 comfy.set_frames(graph, job.req.num_frames)
             # A recipe pins the configuration, not the draw. Without this the
@@ -882,7 +930,8 @@ def run_job(job: Job):
             job.notes.append(
                 f"recipe {job.req.recipe!r} · {mode} · "
                 f"base {recipe_mod.base_model_note(graph)} · "
-                f"{recipe_mod.lora_stack_note(graph)} · graph {gh[:12]}"
+                f"{recipe_mod.lora_stack_note(graph)} · "
+                f"{recipe_mod.identity_note(graph)} · graph {gh[:12]}"
             )
             # base_model_note(graph), NOT the local `ck`. `ck` is assigned inside the
             # `for lo in job.req.loras` loop above, so a render with NO character LoRA never
@@ -899,7 +948,8 @@ def run_job(job: Job):
             # or not one of its uses has been corrected.
             print(f"[{job.id}] recipe {job.req.recipe!r} ({mode}) -> {w}x{h}, "
                   f"base {recipe_mod.base_model_note(graph)}, "
-                  f"{recipe_mod.lora_stack_note(graph)}, graph {gh}", flush=True)
+                  f"{recipe_mod.lora_stack_note(graph)}, {recipe_mod.identity_note(graph)}, "
+                  f"graph {gh}", flush=True)
             (workdir / "graph.json").write_text(json.dumps(graph, indent=1))
             job.stages = comfy.describe_stages(graph)
             job.prompt_id = cf.submit(graph)
@@ -1043,6 +1093,16 @@ def submit(req: JobRequest):
         raise HTTPException(422,
             f"{len(req.loras)} character LoRAs; a recipe render takes at most "
             f"{len(recipe_mod.CHAR_NODE_IDS)}")
+    # Both or neither, and only where add_identity_ref has a graph to patch. Refused here, in
+    # the first second, rather than rendered without the reference -- a sheet-only character
+    # rendered without its sheet is simply somebody else, and nothing in the clip says so.
+    if bool(req.identity_ref) != bool(req.identity_mode):
+        raise HTTPException(422,
+            "identity_ref and identity_mode go together: send both (mode 'sheet' or 'face') "
+            "or neither")
+    if req.identity_ref and not req.recipe:
+        raise HTTPException(422,
+            "identity_ref is only supported on the recipe path (set `recipe`)")
     placement = plan(req)
     job = Job(id=uuid.uuid4().hex[:12], req=req, placement=placement)
     with _LOCK:
@@ -1175,6 +1235,10 @@ def purge_all_jobs(keep_recent: int = 5):
     return r
 
 
+#: See health(). "identity_ref": add_identity_ref (#156).
+FEATURES = {"identity_ref"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "models_root": str(MODELS_ROOT),
@@ -1183,7 +1247,11 @@ def health():
             "comfy": COMFY_URL,
             "models_present": MODELS.exists(),
             "queue_depth": QUEUE.qsize(),
-            "running": sum(1 for j in JOBS.values() if j.status == "Processing")}
+            "running": sum(1 for j in JOBS.values() if j.status == "Processing"),
+            # What this engine can do beyond the base request, so a caller can refuse rather
+            # than send a field an older engine would silently ignore (this model has no
+            # extra="forbid"). The daemon checks it before sending an identity reference.
+            "features": sorted(FEATURES)}
 
 
 PUBLIC_BASE = ""

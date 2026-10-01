@@ -138,6 +138,12 @@ _WANTED=(
   "ltx-2.3/text_encoders|gemma_3_12B_it_fp8_scaled.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors|13"
   "ltx-2.3/latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3||1"
   "loras|sulphur_distill_lora_condsafe.safetensors|SulphurAI/Sulphur-2-base|distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors|1"
+  # The identity-reference LoRAs (#156): face mode and character-sheet mode. Loaded only when a
+  # render carries an identity reference, but staged on every worker -- a claim does not know in
+  # advance whether its character has a sheet. Must match engine/recipe.py IDENTITY_LORAS
+  # (test_identity_ref.py holds them together). 2.47 GB + 1.31 GB on HF.
+  "loras|Best_FaceID_v1.0_LoRA.safetensors|Alissonerdx/LTX-Best-Face-ID||3"
+  "loras|Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors|Alissonerdx/LTX-Best-Face-ID||2"
 )
 # Character LoRAs are NOT here: the daemon syncs those per claim from S3, so a pod carries
 # only the ones its jobs actually name.
