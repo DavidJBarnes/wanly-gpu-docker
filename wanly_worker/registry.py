@@ -26,7 +26,7 @@ from wanly_worker.services.image_description import ImageDescription
 from wanly_worker.services.image_edit import image_edit_group
 from wanly_worker.services.lora_trainer import LoraTrainer
 from wanly_worker.services.ltx_engine import ltx_engine_group
-from wanly_worker.services.scene_caption import scene_caption_group
+from wanly_worker.services.scene_caption.service import scene_caption_group
 
 #: Every service the image can run, by the name the SERVICES flag uses. A value is a factory
 #: returning the ordered list of processes that name stands for (or one Service). Adding one

@@ -359,3 +359,20 @@ class TestImageEditAsksForTheCard:
         asyncio.run(run())
         assert calls[:2] == ["unload", "resume"]
         assert edit_app._state["model_loaded"] is False
+
+
+class TestTheStoreCheckNeedsOnlyTheStdlib:
+    def test_it_imports_without_httpx_or_fastapi(self, tmp_path):
+        """It runs on the host (download_models.sh --scene-caption), where neither is
+        installed. 3090b's first run of it died on `import httpx` via the package __init__."""
+        code = ("import sys\n"
+                "class _Block:\n"
+                "    def find_spec(self, name, path=None, target=None):\n"
+                "        if name.split('.')[0] in ('httpx', 'fastapi', 'uvicorn'):\n"
+                "            raise ImportError('blocked: ' + name)\n"
+                "sys.meta_path.insert(0, _Block())\n"
+                "from wanly_worker.services.scene_caption import store\n"
+                f"print(store.present({str(tmp_path)!r})[0])\n")
+        r = subprocess.run(["python3", "-c", code], capture_output=True, text=True, cwd=REPO)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "False"
