@@ -26,6 +26,7 @@ from wanly_worker.services.image_description import ImageDescription
 from wanly_worker.services.image_edit import image_edit_group
 from wanly_worker.services.lora_trainer import LoraTrainer
 from wanly_worker.services.ltx_engine import ltx_engine_group
+from wanly_worker.services.scene_caption import scene_caption_group
 
 #: Every service the image can run, by the name the SERVICES flag uses. A value is a factory
 #: returning the ordered list of processes that name stands for (or one Service). Adding one
@@ -37,6 +38,10 @@ KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
     "face-crop": FaceCrop,
     "face-edit": FaceEdit,
     "image-edit": image_edit_group,
+    # JoyCaption for the <SCENE> half, always resident (wanly-console#572). Called, claims
+    # nothing, adds no kind, and runs in every mode: on a card it shares with image-edit it
+    # yields per edit (SCENE_CAPTION_SHARED) rather than being stopped by a mode.
+    "scene-caption": scene_caption_group,
 }
 
 #: Services whose presence changes what KIND of worker this box is. The API's claim gates key
@@ -118,8 +123,14 @@ def select_mode(names: list[str], raw: str | None) -> list[str]:
     # A service tied to another mode never runs here. Render mode is otherwise everything.
     mine = [n for n in names if MODE_ONLY.get(n, mode) == mode]
     if mode == "ltx-engine":
-        # A box equipped ONLY with mode-bound services (an edit-only box) has nothing else to
-        # run in render mode; running what it has beats a boot that refuses on a technicality.
+        # A STANDING box -- nothing on it claims work (no render stack, no trainer) -- runs
+        # everything it is equipped with in its default mode, mode-bound services included:
+        # there is no render for image-edit to collide with, and nothing to switch to.
+        # 3090b is SERVICES=image-edit,scene-caption (wanly-console#572); the old rule
+        # ("only if nothing else is left") dropped image-edit the moment a second service
+        # joined it.
+        if not any(n in KIND_BY_SERVICE for n in names):
+            return list(names)
         return mine or list(names)
     excluded = _MODE_EXCLUDES.get(mode, set())
     kept = [n for n in mine if n not in KIND_BY_SERVICE and n not in excluded]

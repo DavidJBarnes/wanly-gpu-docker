@@ -34,6 +34,7 @@ WHY THE STORE IS WRITTEN DIRECTLY RATHER THAN THROUGH `ollama create`
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -60,6 +61,22 @@ BASE_URL = os.environ.get(
 MANIFEST_PATH = "manifests/registry.ollama.ai/library/joycaption/beta-one"
 
 LAYERS_DIR = Path(__file__).parent / "layers"
+
+
+def limit_rate(raw: str | None = None) -> float:
+    """MODEL_LIMIT_RATE as bytes/second, in curl's --limit-rate spelling ("3M", "500K", "0").
+
+    The same knob download_models.sh passes to curl, so a box on the shared home link can be
+    rebuilt without starving the captions and renders on the same uplink. 0/unset = no limit.
+    """
+    v = (os.environ.get("MODEL_LIMIT_RATE", "") if raw is None else raw).strip().upper()
+    if not v:
+        return 0.0
+    mult = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}.get(v[-1], 1)
+    try:
+        return float(v[:-1] if v[-1] in "KMG" else v) * mult
+    except ValueError:
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -220,11 +237,17 @@ async def _fetch(blob: Blob, store: str, client, log) -> None:
             raise ProvisionError(
                 f"{blob.filename} is {declared} bytes upstream, expected {blob.size}. "
                 f"The source has changed; do not trust it.")
+        rate = limit_rate()
         with part.open("wb") as fh:
-            async for chunk in resp.aiter_bytes(8 * 1024 * 1024):
+            async for chunk in resp.aiter_bytes(1024 * 1024 if rate else 8 * 1024 * 1024):
                 fh.write(chunk)
                 h.update(chunk)
                 done += len(chunk)
+                if rate:
+                    # Throttle: never get ahead of `rate` bytes/second since the start.
+                    ahead = done / rate - (time.time() - t0)
+                    if ahead > 0:
+                        await asyncio.sleep(ahead)
                 # Progress on a clock, not per chunk. 5.8 GB of silence is indistinguishable
                 # from a hang, and that ambiguity has cost this project whole evenings.
                 if time.time() - last >= 15:

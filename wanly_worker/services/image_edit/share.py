@@ -61,6 +61,99 @@ UNLOAD_IDLE_S = float(os.environ.get("IMAGE_EDIT_UNLOAD_IDLE_S", "0"))
 WATCH_S = float(os.environ.get("IMAGE_EDIT_WATCH_S", "2"))
 
 
+# ------------------------------------------------------------------ the scene captioner
+#
+# THE OTHER TENANT ON 3090b (wanly-console#572 phase 1, interim). scene-caption keeps
+# JoyCaption (~6 GB) resident on this card, and Qwen's ~23.5 GB peak cannot sit beside it. So,
+# per edit: the scene captioner YIELDS FIRST (unloads through ollama keep_alive:0 and holds new
+# captions back), and once edits stop -- SCENE_RESUME_IDLE_S without one -- Qwen leaves the card
+# and the captioner is RESUMED. A run of edits pays for one yield, not one each; every edit
+# renews the yield's lease, and the lease lets the captioner take the card back by itself if this
+# process dies mid-run.
+#
+# Set by SCENE_CAPTION_SHARED=1 with scene-caption on this box's SERVICES (its loopback front),
+# or by IMAGE_EDIT_SCENE_CAPTION_URL explicitly. Off everywhere else -- the future dedicated 2070
+# shares its card with nobody.
+
+
+def _scene_url_from_env() -> str:
+    explicit = os.environ.get("IMAGE_EDIT_SCENE_CAPTION_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    services = {n.strip().lower() for n in os.environ.get("SERVICES", "").split(",")}
+    if os.environ.get("SCENE_CAPTION_SHARED", "0").strip() == "1" and "scene-caption" in services:
+        return f"http://127.0.0.1:{os.environ.get('SCENE_CAPTION_PORT', '11436')}"
+    return ""
+
+
+SCENE_CAPTION_URL = _scene_url_from_env()
+#: Seconds without an edit before Qwen is unloaded and the scene captioner gets the card back.
+SCENE_RESUME_IDLE_S = float(os.environ.get("IMAGE_EDIT_SCENE_RESUME_IDLE_S", "60"))
+#: The yield's lease: longer than an edit's timeout, so only a dead image-edit ever hits it.
+SCENE_YIELD_HOLD_S = float(os.environ.get("IMAGE_EDIT_SCENE_YIELD_HOLD_S", "1800"))
+
+
+def shares_with_scene() -> bool:
+    return bool(SCENE_CAPTION_URL)
+
+
+async def yield_scene(state: dict, client: httpx.AsyncClient | None = None) -> str | None:
+    """Ask the scene captioner for the card before an edit. What happened, for the log.
+
+    Never fatal: a scene captioner that does not answer is not holding the card either (or is
+    about to fall over on its own), and the edit is the thing a person is waiting for.
+    """
+    if not SCENE_CAPTION_URL:
+        return None
+    payload = {"reason": "an image edit", "hold_s": SCENE_YIELD_HOLD_S}
+    try:
+        if client is None:
+            async with httpx.AsyncClient() as c:
+                r = await c.post(f"{SCENE_CAPTION_URL}/yield", json=payload, timeout=120)
+        else:
+            r = await client.post(f"{SCENE_CAPTION_URL}/yield", json=payload, timeout=120)
+        body = r.json() if r.status_code == 200 else {}
+    except Exception as e:                      # noqa: BLE001
+        state["scene_yielded"] = False
+        return f"scene-caption did not answer /yield ({e}); editing anyway"
+    first = not state.get("scene_yielded")
+    state["scene_yielded"] = bool(body.get("yielded"))
+    if not first:
+        return None
+    return (f"scene-caption yielded the card (unloaded={body.get('unloaded')}, "
+            f"waited {body.get('waited_s')}s)" if body.get("yielded")
+            else f"scene-caption did not yield: {body.get('note') or r.status_code}")
+
+
+async def resume_scene(state: dict, client: httpx.AsyncClient | None = None) -> bool:
+    """Give the scene captioner the card back. False on failure (retried next tick; the
+    lease is the backstop)."""
+    if not SCENE_CAPTION_URL:
+        return False
+    try:
+        if client is None:
+            async with httpx.AsyncClient() as c:
+                r = await c.post(f"{SCENE_CAPTION_URL}/resume", timeout=30)
+        else:
+            r = await client.post(f"{SCENE_CAPTION_URL}/resume", timeout=30)
+    except Exception as e:                      # noqa: BLE001
+        log.warning("could not resume scene-caption: %s", e)
+        return False
+    if r.status_code == 200:
+        state["scene_yielded"] = False
+        return True
+    return False
+
+
+def scene_resume_reason(*, scene_yielded: bool, busy: bool, idle_s: float) -> str | None:
+    """Why the scene captioner should get the card back now, or None."""
+    if not scene_yielded or busy:
+        return None
+    if idle_s >= SCENE_RESUME_IDLE_S:
+        return f"no edit for {idle_s:.0f}s"
+    return None
+
+
 class A1111Busy(RuntimeError):
     """A1111 kept generating for the whole wait. Becomes a 503 that says so."""
 
@@ -142,4 +235,4 @@ def unload_reason(*, resident: bool, busy: bool, idle_s: float,
 
 def watching() -> bool:
     """Whether the watcher has anything to do on this box."""
-    return bool(A1111_URL) or UNLOAD_IDLE_S > 0
+    return bool(A1111_URL) or UNLOAD_IDLE_S > 0 or shares_with_scene()
