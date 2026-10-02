@@ -59,6 +59,7 @@ case ",$SERVICES," in *,face-crop,*)          WANT_FACE_CROP=1 ;; *) WANT_FACE_C
 case ",$SERVICES," in *,face-edit,*)          WANT_FACE_EDIT=1 ;; *) WANT_FACE_EDIT=0 ;; esac
 case ",$SERVICES," in *,ltx-engine,*)         WANT_ENGINE=1 ;;    *) WANT_ENGINE=0 ;;    esac
 case ",$SERVICES," in *,image-edit,*)         WANT_IMAGE_EDIT=1 ;; *) WANT_IMAGE_EDIT=0 ;; esac
+case ",$SERVICES," in *,scene-caption,*)      WANT_SCENE=1 ;;     *) WANT_SCENE=0 ;;     esac
 
 # THE RENDER STACK'S MOUNTS AND PORTS ARE THE RENDER STACK'S (console#547). They used to be
 # unconditional, which made a box that renders nothing -- the 2070, running face-edit beside
@@ -81,13 +82,14 @@ fi
 MOUNTS=()
 PORTS=()
 TRAINER_ENV_ARGS=()
-if [ "$WANT_TRAINER" = "1" ] || [ "$WANT_OLLAMA" = "1" ] || [ "$WANT_FACE_EDIT" = "1" ]; then
+if [ "$WANT_TRAINER" = "1" ] || [ "$WANT_OLLAMA" = "1" ] || [ "$WANT_FACE_EDIT" = "1" ] \
+   || [ "$WANT_SCENE" = "1" ]; then
     # All three live in the :full layer. The lean tag fails in the trainer's preflight after a
     # pull, which is a slow way to learn a one-line mistake -- refuse by name, and BEFORE
     # anything is removed, so a wrong IMAGE never costs the running container.
     case "$IMAGE" in
         *:latest|*:next|*:"${IMAGE##*:}" ) case "$IMAGE" in *full*) ;; *)
-            echo "!! SERVICES includes lora-trainer/image-description/face-edit but IMAGE=$IMAGE is built WITHOUT them."
+            echo "!! SERVICES includes lora-trainer/image-description/face-edit/scene-caption but IMAGE=$IMAGE is built WITHOUT them."
             echo "!! Use IMAGE=davidjbarnes/wanly-gpu-docker:full (or :next-full) in $ENV_FILE"
             exit 1 ;; esac ;;
     esac
@@ -124,6 +126,32 @@ if [ "$WANT_OLLAMA" = "1" ]; then
         echo "!! If it is the host ollama service: sudo systemctl disable --now ollama"
         exit 1
     fi
+fi
+SCENE_ENV_ARGS=()
+if [ "$WANT_SCENE" = "1" ]; then
+    # scene-caption (wanly-console#572): JoyCaption on its own ollama, always resident. Same
+    # host store as image-description -- mounted once even when both run -- because the model
+    # is already there on every box that ever captioned, and a rebuild is 5.8 GB of download.
+    : "${OLLAMA_HOST_STORE:?scene-caption is enabled — set OLLAMA_HOST_STORE in $ENV_FILE}"
+    [ -d "$OLLAMA_HOST_STORE" ] || {
+        echo "!! $OLLAMA_HOST_STORE does not exist — refusing to create a container whose model"
+        echo "!! store would be container-local and lost on the next recreate."
+        exit 1
+    }
+    if [ "$WANT_OLLAMA" != "1" ]; then
+        MOUNTS+=(-v "$OLLAMA_HOST_STORE:/root/.ollama")
+    fi
+    PORTS+=(-p "${SCENE_CAPTION_PORT:-11436}:11436")
+    if ss -tlnp 2>/dev/null | grep -q ":${SCENE_CAPTION_PORT:-11436} " \
+       && ! docker port "$NAME" 2>/dev/null | grep -q ":${SCENE_CAPTION_PORT:-11436}$"; then
+        echo "!! something already listens on ${SCENE_CAPTION_PORT:-11436}, and it is not $NAME."
+        exit 1
+    fi
+    # SCENE_CAPTION_SHARED=1 only where the card is shared with image-edit (3090b, interim):
+    # each edit then asks JoyCaption to unload first, and hands the card back after.
+    for v in SCENE_CAPTION_SHARED SCENE_CAPTION_YIELD_WAIT_S IMAGE_EDIT_SCENE_RESUME_IDLE_S MODEL_LIMIT_RATE; do
+        if [ -n "${!v:-}" ]; then SCENE_ENV_ARGS+=(-e "$v=${!v}"); fi
+    done
 fi
 if [ "$WANT_FACE_CROP" = "1" ] || [ "$WANT_IMAGE_EDIT" = "1" ]; then
     # buffalo_l is ~300 MB and insightface fetches it on first use. On a mount it survives a
@@ -255,6 +283,7 @@ docker run -d \
     "${MOUNTS[@]}" \
     "${FACE_EDIT_ENV_ARGS[@]}" \
     "${IMAGE_EDIT_ENV_ARGS[@]}" \
+    "${SCENE_ENV_ARGS[@]}" \
     "${DEV_MOUNT_ARGS[@]}" \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
     -e "SERVICES=$SERVICES" \

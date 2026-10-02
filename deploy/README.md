@@ -238,6 +238,64 @@ forever" delay, which is the gap an edit starts in.
    defaults to `http://2070.zero:8086` and is simply skipped while nothing healthy answers
    there. If the box is renamed, set `IMAGE_EDIT_STANDING_URL` in the API's env.
 
+## scene-caption: JoyCaption, always on (wanly-console#572)
+
+One captioner used to make both halves of a video prompt -- the static scene and the motion
+paragraph -- from one URL and one model setting, so a 3090 loaded and unloaded two vision
+models per image (30 images = 60 swaps across ZeroTier; the likeliest cause of 3090a hanging
+on 2026-10-02). The halves are now separate services:
+
+| half | service | model | where |
+|---|---|---|---|
+| scene | `scene-caption` (`:11436`) | `joycaption:beta-one`, ~6 GB, always resident | 3090b now (interim, shared card); the dedicated 2070 in 3090a's box later |
+| motion | `image-description` | Qwen3-VL 32B | a 3090 (3090a today) |
+
+wanly-api's `scene_caption_url` points at the first (default `http://3090b.zero:11436`); the
+motion half keeps using `image_description_url`. When the scene service is down the API falls
+back to the motion captioner for scenes and logs `Scene captioner ... is DOWN`.
+
+What it is: its own ollama (loopback `:11437`, `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_NOPRUNE=1`) behind
+a small front on `:11436` that speaks ollama's `/api/generate` (one model only, keep_alive always
+-1) and adds `/health`, `/yield` and `/resume`. It claims nothing, adds no worker kind, and runs in
+every mode.
+
+**The model** is the store's `joycaption:beta-one`, used as it is when the store's own manifest is
+complete (a hand-imported copy is never rewritten). On a box without it, the boot rebuilds it
+from the two public GGUFs pinned in `services/image_description/model.py` (~5.8 GB), or do it
+ahead of time, rate-limited for the shared home link:
+
+    OLLAMA_STORE=/usr/share/ollama/.ollama MODEL_LIMIT_RATE=3M ./download_models.sh --scene-caption
+
+(run as a user that can write the store). `MODEL_LIMIT_RATE` in `worker.env` throttles the
+boot-time rebuild the same way.
+
+**Sharing a card with image-edit (`SCENE_CAPTION_SHARED=1`, 3090b only).** Qwen-Image-Edit
+peaks at ~23.5 GB, so it cannot load beside JoyCaption. Mirroring image-edit's A1111 rule
+(`services/image_edit/share.py`):
+
+1. Before every edit image-edit calls the scene service's `/yield`: a caption in flight finishes,
+   JoyCaption is unloaded (`keep_alive: 0`), and new captions **wait** (up to
+   `SCENE_CAPTION_YIELD_WAIT_S`, 600 s) instead of loading it back. Past that they get a 503 and
+   wanly-api falls back to the motion captioner.
+2. After `IMAGE_EDIT_SCENE_RESUME_IDLE_S` (60 s) without an edit, image-edit unloads Qwen
+   (ComfyUI `/free`) and calls `/resume`; JoyCaption reloads (a few seconds). A run of edits
+   pays for one yield.
+3. The yield is a lease (30 min, renewed by every edit), so a crashed image-edit cannot strand
+   the captioner.
+
+On a dedicated card (the 2070, phase 2) leave the flag off: `/yield` then does nothing.
+
+**3090b's `worker.env`** (interim):
+
+    SERVICES=image-edit,scene-caption
+    OLLAMA_HOST_STORE=/usr/share/ollama/.ollama
+    SCENE_CAPTION_SHARED=1
+    PRUNE_IMAGES=0
+
+then `PRUNE_IMAGES=0 ./deploy/run-worker.sh` and check `curl -s :11436/health` (`ollama_up`,
+`resident: true`, `shared: true`) and `curl -s :8086/health` (`shares_with_scene_caption: true`).
+`select_mode` runs both: a box where nothing claims work runs everything it is equipped with.
+
 ## Render or caption, one command (#131)
 
 The 3090 runs every service in one container, which is right — one box, one row, one GPU. But

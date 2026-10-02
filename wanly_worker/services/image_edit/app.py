@@ -80,7 +80,7 @@ MAX_EDGE = int(os.environ.get("IMAGE_EDIT_MAX_EDGE", "8000"))
 
 _turn = asyncio.Lock()
 _state: dict = {"last_edit_at": None, "last": None, "model_loaded": False, "edits": 0,
-                "waiting": None, "unloads": 0, "last_unload": None}
+                "waiting": None, "unloads": 0, "last_unload": None, "scene_yielded": False}
 _started_at = time.time()
 #: What this service can be asked for beyond #548's angle/instruction, so wanly-api can tell an
 #: image that predates them (it would silently ignore the fields) from one that has them.
@@ -241,6 +241,11 @@ async def _card_turn():
             info["waited"] = await share.wait_for_a1111(_state)
         except share.A1111Busy as e:
             raise HTTPException(503, str(e)) from e
+        # The scene captioner on this card, if any (wanly-console#572): JoyCaption off the card
+        # before Qwen loads. Renews the yield on every edit; resumed by _watch once edits stop.
+        scene = await share.yield_scene(_state)
+        if scene:
+            print(f"[image-edit] {scene}", flush=True)
         room = await share.make_room(_state["model_loaded"])
         if room:
             print(f"[image-edit] {room}", flush=True)
@@ -528,7 +533,27 @@ async def _watch() -> None:
         while True:
             await asyncio.sleep(share.WATCH_S)
             try:
-                if not _state["model_loaded"] or _turn.locked():
+                if _turn.locked():
+                    continue
+                idle = time.time() - (_state["last_edit_at"] or _started_at)
+                why_scene = share.scene_resume_reason(scene_yielded=_state.get("scene_yielded", False),
+                                                      busy=_turn.locked(), idle_s=idle)
+                if why_scene:
+                    # Qwen off the card first: JoyCaption reloading beside a resident Qwen is
+                    # the overlap the yield exists to prevent. Asked even when model_loaded
+                    # says no -- an edit that failed part-way may have left weights behind --
+                    # and the card is handed back only once ComfyUI confirms.
+                    if await share.unload_qwen(COMFY, client):
+                        if _state["model_loaded"]:
+                            _state.update(unloads=_state.get("unloads", 0) + 1,
+                                          last_unload={"at": round(time.time()),
+                                                       "why": f"scene-caption's turn ({why_scene})"})
+                        _state["model_loaded"] = False
+                        if await share.resume_scene(_state, client):
+                            print(f"[image-edit] Qwen unloaded; handed the card back to "
+                                  f"scene-caption ({why_scene})", flush=True)
+                    continue
+                if not _state["model_loaded"]:
                     continue
                 gen = await share.a1111_generating()
                 why = share.unload_reason(resident=_state["model_loaded"], busy=_turn.locked(),
@@ -574,4 +599,7 @@ async def health():
         "waiting": _state.get("waiting"),
         "unload_idle_s": share.UNLOAD_IDLE_S,
         "last_unload": _state.get("last_unload"),
+        # The scene captioner on this card (wanly-console#572): whether it is lent to us now.
+        "shares_with_scene_caption": share.shares_with_scene(),
+        "scene_yielded": _state.get("scene_yielded", False),
     }

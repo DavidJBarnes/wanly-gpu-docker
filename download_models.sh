@@ -39,6 +39,58 @@ set -uo pipefail
 TARGET=ltx
 [ "${1:-}" = "--image-edit" ] && TARGET=image-edit
 
+# `--scene-caption` checks (and, if absent, fetches) joycaption:beta-one in an ollama store for
+# the scene-caption service (wanly-console#572). Not safetensors and not a models tree, so it
+# is its own short path and exits here. The model is CHECKED AGAINST THE STORE'S OWN MANIFEST
+# (a hand-imported joycaption is used as it is, never rewritten) and, when missing, rebuilt from
+# the two public GGUFs pinned in wanly_worker/services/image_description/model.py -- ~5.8 GB.
+#
+#   OLLAMA_STORE=/usr/share/ollama/.ollama MODEL_LIMIT_RATE=3M ./download_models.sh --scene-caption
+#
+# MODEL_LIMIT_RATE is curl's --limit-rate: a box on the shared home link must not starve the
+# captions and renders that use the same uplink (big downloads have slowed captions before).
+# Run it as a user that can write the store (on a host: sudo -u ollama, or root).
+if [ "${1:-}" = "--scene-caption" ]; then
+    STORE="${OLLAMA_STORE:-/root/.ollama}"
+    HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PYROOT="$HERE"; [ -d "$HERE/wanly_worker" ] || PYROOT=/app
+    store_py() { PYTHONPATH="$PYROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m wanly_worker.services.scene_caption.store "$@"; }
+    echo "ollama store: $STORE"
+    [ -d "$STORE" ] || { echo "!! FATAL: $STORE does not exist"; exit 1; }
+    if WANT=$(store_py check "$STORE"); then
+        echo "scene-caption model OK"
+        exit 0
+    fi
+    [ "${SCENE_CAPTION_AUTO_BUILD:-1}" = "1" ] || {
+        echo "!! FATAL: joycaption:beta-one is missing and SCENE_CAPTION_AUTO_BUILD=0"; exit 1; }
+    mkdir -p "$STORE/models/blobs" || exit 1
+    RATE=()
+    [ -n "${MODEL_LIMIT_RATE:-}" ] && RATE=(--limit-rate "$MODEL_LIMIT_RATE")
+    while read -r digest size url; do
+        [ -n "$digest" ] || continue
+        dest="$STORE/models/blobs/sha256-$digest"
+        echo "  fetching $(basename "$url") ($((size / 1048576)) MiB)${MODEL_LIMIT_RATE:+ at --limit-rate $MODEL_LIMIT_RATE}"
+        t0=$(date +%s)
+        # -C - resumes a .part left by an interrupted run; the digest check below is the guard.
+        curl -fL --retry 5 --retry-delay 10 -C - "${RATE[@]}" -o "$dest.part" "$url" || {
+            echo "!! FATAL: download failed: $url (the .part is kept; re-run to resume)"; exit 1; }
+        got=$(stat -c %s "$dest.part")
+        [ "$got" = "$size" ] || { echo "!! FATAL: $url is $got bytes, expected $size"; exit 1; }
+        echo "  verifying sha256..."
+        sum=$(sha256sum "$dest.part" | cut -d' ' -f1)
+        [ "$sum" = "$digest" ] || {
+            rm -f "$dest.part"
+            echo "!! FATAL: $(basename "$url") hashed to ${sum:0:16}…, expected ${digest:0:16}… — refused"
+            exit 1; }
+        mv "$dest.part" "$dest"
+        echo "  ok in $(( $(date +%s) - t0 ))s"
+    done <<< "$WANT"
+    store_py finish "$STORE" || exit 1
+    store_py check "$STORE" >/dev/null || { echo "!! FATAL: still incomplete after the fetch"; exit 1; }
+    echo "scene-caption model OK"
+    exit 0
+fi
+
 if [ "$TARGET" = image-edit ]; then
     MODELS="${IMAGE_EDIT_MODELS_DIR:-/workspace/qwen}"
     LTX="$MODELS"
