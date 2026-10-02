@@ -272,8 +272,21 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 # boot-time pull on a box that never chose it is the class of drift this repo keeps ticketing.
 # The 3090 gets joycaption from this default today (its worker.env does not set the var); a
 # box that wants the Qwen captioner sets IMAGE_DESCRIPTION_MODEL explicitly.
+# MEMORY CAP (wanly-gpu-docker#166). 3090a hung for ~5 h on 2026-10-02: from 05:05 the host logged
+# "Under memory pressure" every minute, systemd-oomd only killed desktop processes (the worker
+# lives outside the user slice), and 38 GB of swap let the box thrash until sshd, journald and
+# the container's own start.sh were blocked for minutes -- reachable by ping, dead otherwise,
+# until a power cycle. With a cap and NO extra swap, a runaway inside the container is OOM-killed
+# INSIDE the container (one render fails, --restart brings the worker back) and the host stays up.
+# Leave ~6-8 GB for the host. Unset = no cap (the old behaviour).
+#   WORKER_MEMORY_LIMIT=54g      # 3090a (61 GB RAM); 3090b at 30 GB: ~24g
+MEM_ARGS=()
+if [ -n "${WORKER_MEMORY_LIMIT:-}" ]; then
+    MEM_ARGS=(--memory "$WORKER_MEMORY_LIMIT" --memory-swap "$WORKER_MEMORY_LIMIT")
+fi
 docker run -d \
     --name "$NAME" \
+    "${MEM_ARGS[@]}" \
     --restart unless-stopped \
     --device nvidia.com/gpu=all \
     --shm-size "$SHM_SIZE" \
