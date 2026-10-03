@@ -728,6 +728,9 @@ def run_job(job: Job):
     workdir.mkdir(parents=True, exist_ok=True)
     job.status = "Processing"
     job.started = time.time()
+    # Snapshotted so a ComfyUI that vanishes mid-render can be blamed on the container's
+    # memory cap or cleared of it (#166) -- the count is lifetime, only the delta means this job.
+    oom_kills_before = failure_mod.oom_kills()
     try:
         for i, kf in enumerate(job.req.keyframes):
             dest = workdir / f"kf{i + 1}.png"
@@ -1033,8 +1036,10 @@ def run_job(job: Job):
     except Exception as e:
         # An OOM is rewritten into advice -- but "0 bytes allocated" is not an OOM, it is
         # the container having lost the GPU, and the advice must say so (#95).
+        # A refused connection to ComfyUI is explained by whether the cgroup OOM-killed it (#166).
         msg = failure_mod.explain_failure(f"{type(e).__name__}: {e}", job.req.width,
-                                          job.req.height, job.req.num_frames)
+                                          job.req.height, job.req.num_frames,
+                                          oom_kills_before=oom_kills_before)
         job.status, job.error = "Failed", msg
         print(f"[{job.id}] FAILED: {job.error}", flush=True)
     finally:
