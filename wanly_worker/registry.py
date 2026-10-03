@@ -131,7 +131,15 @@ def select_mode(names: list[str], raw: str | None) -> list[str]:
         # joined it.
         if not any(n in KIND_BY_SERVICE for n in names):
             return list(names)
-        return mine or list(names)
+        # NO CAPTIONER BESIDE THE RENDER STACK (wanly-gpu-docker#173). On 2026-10-03 a caption
+        # landing mid-render loaded qwen3-vl 32B (~21.5 GB anon RAM, UseMmap:false) next to
+        # ComfyUI (~33 GB); the container hit its 54 GiB memory cap and the kernel OOM-killed
+        # ComfyUI, failing the render. Render and the 32B captioner cannot share one box's RAM
+        # or its 24 GB card, so on a box that renders, the captioner runs in caption mode only.
+        # The API-side guard (refuse captions while rendering) stays, but it matched boxes by
+        # hostname and let this one through; the box itself is the authority now.
+        rendering = [n for n in mine if n != "image-description"]
+        return rendering or mine or list(names)
     excluded = _MODE_EXCLUDES.get(mode, set())
     kept = [n for n in mine if n not in KIND_BY_SERVICE and n not in excluded]
     if mode == "edit" and "image-edit" not in kept:
