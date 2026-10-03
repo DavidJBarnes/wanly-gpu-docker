@@ -207,9 +207,11 @@ def test_a_failed_switch_is_reported_not_swallowed(sup, monkeypatch):
 
 
 def test_going_back_starts_the_whole_capability_line_again(sup, monkeypatch):
+    """Everything the box renders with -- minus the 32B captioner, which never sits beside the
+    render stack (#173): it is what the switch back to render mode unloads."""
     monkeypatch.setattr(control, "_mode", "caption")
     _, mode, pending = _post_and_settle("ltx-engine")
-    assert sup.applied == [["ltx-engine", "lora-trainer", "image-description", "face-crop"]]
+    assert sup.applied == [["ltx-engine", "lora-trainer", "face-crop"]]
     assert mode == "ltx-engine" and pending is None
 
 

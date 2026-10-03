@@ -213,15 +213,26 @@ from wanly_worker.registry import select_mode
 FULL = ["ltx-engine", "lora-trainer", "image-description", "face-crop"]
 
 
-def test_no_mode_runs_everything():
-    assert select_mode(FULL, None) == FULL
-    assert select_mode(FULL, "") == FULL
-    assert select_mode(FULL, "   ") == FULL
+RENDER = ["ltx-engine", "lora-trainer", "face-crop"]
 
 
-def test_ltx_engine_runs_everything():
-    """It is the normal state, not a narrowing: the box does what it is equipped to do."""
-    assert select_mode(FULL, "ltx-engine") == FULL
+def test_no_mode_runs_everything_but_the_captioner():
+    """#173: the 32B captioner never runs beside the render stack -- a caption mid-render
+    OOM-killed ComfyUI under the container's memory cap. It runs in caption mode only."""
+    assert select_mode(FULL, None) == RENDER
+    assert select_mode(FULL, "") == RENDER
+    assert select_mode(FULL, "   ") == RENDER
+
+
+def test_ltx_engine_runs_everything_but_the_captioner():
+    """It is the normal state: the box does what it is equipped to do, minus the one tenant
+    that cannot share its RAM or card with a render."""
+    assert select_mode(FULL, "ltx-engine") == RENDER
+
+
+def test_a_captioner_only_box_still_runs_it_in_render_mode():
+    """No render stack, nothing to collide with: a captioner box keeps its captioner."""
+    assert select_mode(["image-description", "face-crop"], None) == ["image-description", "face-crop"]
 
 
 def test_caption_keeps_only_what_claims_no_work():
@@ -252,7 +263,7 @@ def test_case_and_whitespace_are_forgiven():
 
 @pytest.mark.parametrize("alias", ["render", "engine"])
 def test_render_aliases_mean_ltx_engine(alias):
-    assert select_mode(FULL, alias) == FULL
+    assert select_mode(FULL, alias) == RENDER
 
 
 @pytest.mark.parametrize("alias", ["image-caption", "image-description"])
