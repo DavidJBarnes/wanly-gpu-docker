@@ -43,6 +43,9 @@ class Job:
     #: (#145). Recorded because it is the first thing to check about a LoRA that came out
     #: wrong, and the config only holds the name that was asked for.
     base_checkpoint: str = ""
+    #: `ltx` or `sdxl` (#175), from config.arch. Persisted with a default so every state file
+    #: written before it existed still loads -- as the LTX run it was.
+    arch: str = "ltx"
     #: pending | staging | training | collecting | completed | failed | cancelled
     phase: str = "pending"
     step: int = 0
@@ -70,7 +73,8 @@ class Job:
         uniform estimate every job before #145 was reported with."""
         if self.samples_per_epoch:
             return self.samples_per_epoch
-        return max(1, self.images * (self.effective_repeats or recipe.DEFAULTS["num_repeats"]))
+        return max(1, self.images * (self.effective_repeats
+                                     or recipe.defaults_for(self.arch)["num_repeats"]))
 
     @property
     def done(self) -> bool:

@@ -99,13 +99,18 @@ DEFAULTS = {
 }
 
 
-def run_dir(character: str, version: int) -> Path:
+def run_dir(character: str, version: int, arch: str = "ltx") -> Path:
     """One directory per VERSION. Never per character.
 
     Sharing one meant a v2 with fewer images training on v1's leftovers while the console
     reported the new count, reusing v1's latent cache, and overwriting the first few of v1's
     checkpoints while leaving the rest beside them, indistinguishable.
+
+    And one per ARCH (#175): an LTX v1 and an SDXL v1 of the same character are different
+    runs, and the stage step's rmtree would otherwise delete one to start the other.
     """
+    if arch == "sdxl":
+        return Path(RUNS_DIR) / character / f"sdxl-v{version}"
     return Path(RUNS_DIR) / character / f"ltx23b-v{version}"
 
 
@@ -225,3 +230,163 @@ def estimated_epochs(image_count: int, steps: int, repeats: int | None = None, *
     if not per_epoch:
         per_epoch = image_count * (repeats or DEFAULTS["num_repeats"])
     return max(1, steps // max(1, per_epoch))
+
+
+# ------------------------------------------------------------------------------------------ SDXL
+#
+# SDXL CHARACTER LoRAs (#175), for the START IMAGES. David generates those in SDXL, and the start
+# image is where identity mostly comes from, so this is the same trainer pointed at a second
+# architecture -- not a second trainer. `config.arch == "sdxl"` selects it; anything else is LTX,
+# which is what every job before #175 is.
+#
+# THE RECIPE IS THE "aio" RUNS, UNCHANGED (k3lly_aio-1_e8 / k3lly_aio-2_e12, 2026-03-31 and
+# 04-02, trained by hand with ~/projects/loras/train_character.sh on 3090a). Every number below
+# was read back out of those files' own ss_* metadata, not from the script, because the
+# metadata is what actually ran:
+#
+#     base          BigaspV2Lustify   sha256 a23c0f4f... (ss_new_sd_model_hash)
+#     sd-scripts    1a3ec9e           (ss_sd_scripts_commit_hash)
+#     rank/alpha    128/64
+#     LR            unet 8e-5, text encoder 2e-5, AdamW8bit, cosine_with_restarts x1, warmup 100
+#     repeats       8
+#     noise         min_snr_gamma 5, noise_offset 0.0357
+#     resolution    1024 buckets, bucket_no_upscale -- a ceiling, as on the LTX side
+#     clip_skip     1 (Lustify; it would be 2 on a Pony base)
+#
+# NO MUSUBI. kohya sd-scripts in its own venv, pinned to the versions that trained aio (torch
+# 2.5.1+cu124, xformers 0.0.29.post1). It caches latents itself, so the two cache stages the
+# LTX path runs do not exist here.
+SDXL_DIR = os.environ.get("SDXL_TRAINER_DIR", "/opt/sd-scripts")
+SDXL_PYTHON = os.environ.get("SDXL_TRAINER_PYTHON", f"{SDXL_DIR}/venv/bin/python")
+SDXL_ACCELERATE = os.environ.get("SDXL_TRAINER_ACCELERATE", f"{SDXL_DIR}/venv/bin/accelerate")
+#: Under the same read-only models mount: <host models>/sdxl/<name>.safetensors.
+SDXL_MODELS_DIR = f"{MODELS_DIR}/sdxl"
+SDXL_DEFAULT_BASE_CHECKPOINT = "BigaspV2Lustify"
+#: The WD14 ConvNext v2 tagger (SmilingWolf/wd-v1-4-convnext-tagger-v2): model.onnx and
+#: selected_tags.csv. On the mount, not in the image -- it is 390 MB of weights.
+WD14_DIR = os.environ.get("WD14_DIR", f"{SDXL_MODELS_DIR}/wd14")
+
+SDXL_DEFAULTS = {
+    "network_dim": 128,
+    "network_alpha": 64,
+    "learning_rate": 8e-5,
+    "text_encoder_lr": 2e-5,
+    "num_repeats": 8,
+    "seed": 42,
+    "resolution": 1024,
+    "noise_offset": 0.0357,
+    "min_snr_gamma": 5.0,
+    "clip_skip": 1,
+    "lr_warmup_steps": 100,
+}
+
+#: Per epoch, for the disk gate. aio's rank-128 files are 1.82 GB in fp32; saved fp16 (see
+#: sdxl_train_cmd) that halves. No resume state is written. Rounded up.
+SDXL_GB_PER_EPOCH = 1.0
+
+
+def arch_of(config: dict | None) -> str:
+    """`sdxl` or `ltx`. Absent, or anything unrecognised, is LTX: that is what every job before
+    #175 was, and a retried legacy row must train exactly as it was created to."""
+    return "sdxl" if (config or {}).get("arch") == "sdxl" else "ltx"
+
+
+def defaults_for(arch: str) -> dict:
+    return SDXL_DEFAULTS if arch == "sdxl" else DEFAULTS
+
+
+def sdxl_checkpoint_path(name: str | None) -> str:
+    """`checkpoint_path`, for SDXL: a bare name, resolved under the mount's sdxl/ and nowhere
+    else. The same refusal of anything path-shaped, for the same reason -- the name arrives
+    from the queue."""
+    n = (name or "").strip() or SDXL_DEFAULT_BASE_CHECKPOINT
+    if n.endswith(".safetensors"):
+        n = n[: -len(".safetensors")]
+    if "/" in n or "\\" in n or n.startswith(".") or not n:
+        raise ValueError(f"base_checkpoint {name!r} is not a bare checkpoint name")
+    return f"{SDXL_MODELS_DIR}/{n}.safetensors"
+
+
+def base_checkpoint_for(config: dict | None) -> str:
+    """The base FILE a job trains against, whichever arch it is."""
+    name = (config or {}).get("base_checkpoint")
+    if arch_of(config) == "sdxl":
+        return sdxl_checkpoint_path(name)
+    return checkpoint_path(name)
+
+
+def sdxl_dataset_toml(run: Path, num_repeats: int, keep_tokens: int = 1) -> str:
+    """kohya's dataset config. ONE subset: SDXL is single-identity (no joint runs, no
+    regularization group -- the aio runs had neither).
+
+    shuffle_caption off and keep_tokens 1, as aio: the trigger is the first tag and stays
+    there. caption_dropout 0."""
+    return f"""[general]
+enable_bucket = true
+bucket_no_upscale = true
+resolution = {SDXL_DEFAULTS['resolution']}
+caption_extension = ".txt"
+batch_size = 1
+flip_aug = false
+color_aug = false
+keep_tokens = {keep_tokens}
+shuffle_caption = false
+caption_dropout_rate = 0.0
+
+[[datasets]]
+  [[datasets.subsets]]
+    image_dir = "{run}/data"
+    num_repeats = {num_repeats}
+"""
+
+
+def sdxl_train_cmd(run: Path, character: str, version: int, config: dict,
+                   ckpt: str | None = None) -> list[str]:
+    """The aio invocation, from train_character.sh, with the step count the job asked for.
+
+    --max_train_steps rather than --max_train_epochs: the API sends steps (epochs x samples per
+    epoch, so they come out whole), and the progress reader anchors on the step total. The last
+    epoch is written WITHOUT a number -- kohya skips the numbered save on the final epoch -- and
+    that unnumbered file is the `final` checkpoint, as on the LTX side."""
+    c = {**SDXL_DEFAULTS, **(config or {})}
+    ckpt = ckpt or sdxl_checkpoint_path(c.get("base_checkpoint"))
+    return [
+        SDXL_ACCELERATE, "launch",
+        "--num_cpu_threads_per_process", "4", "--mixed_precision", "bf16",
+        f"{SDXL_DIR}/sdxl_train_network.py",
+        f"--pretrained_model_name_or_path={ckpt}",
+        f"--dataset_config={run}/dataset.toml",
+        f"--output_dir={run}/output",
+        # The REAL version, as on the LTX side.
+        f"--output_name={character}_v{version}",
+        "--save_model_as=safetensors",
+        # fp16 ON DISK -- the one departure from aio, and not a training one. aio saved fp32
+        # (1.8 GB a file), which at this box's ~0.6 MB/s uplink is ~50 min per checkpoint to S3.
+        # Training math is unchanged (bf16 either way) and A1111 casts on load.
+        "--save_precision=fp16",
+        "--save_every_n_epochs=1",
+        f"--max_train_steps={c['steps']}",
+        f"--learning_rate={c['learning_rate']}",
+        f"--unet_lr={c['learning_rate']}",
+        f"--text_encoder_lr={c['text_encoder_lr']}",
+        "--lr_scheduler=cosine_with_restarts",
+        f"--lr_warmup_steps={c['lr_warmup_steps']}",
+        "--lr_scheduler_num_cycles=1",
+        "--network_module=networks.lora",
+        f"--network_dim={c['network_dim']}",
+        f"--network_alpha={c['network_alpha']}",
+        "--optimizer_type=AdamW8bit",
+        "--mixed_precision=bf16",
+        "--cache_latents",
+        "--cache_latents_to_disk",
+        "--gradient_checkpointing",
+        "--max_data_loader_n_workers=2",
+        f"--seed={c['seed']}",
+        "--max_token_length=225",
+        "--xformers",
+        "--bucket_no_upscale",
+        f"--clip_skip={c['clip_skip']}",
+        f"--min_snr_gamma={c['min_snr_gamma']}",
+        f"--noise_offset={c['noise_offset']}",
+        f"--logging_dir={run}/logs/tb",
+    ]

@@ -19,7 +19,7 @@ from pathlib import Path
 import httpx
 
 from wanly_worker.services.lora_trainer import app as trainer_app
-from wanly_worker.services.lora_trainer import recipe
+from wanly_worker.services.lora_trainer import pipeline, recipe
 from wanly_worker.services.lora_trainer.jobs import Job
 
 QUEUE_URL = os.environ.get("QUEUE_URL", "").rstrip("/")
@@ -35,7 +35,8 @@ CHECKPOINT_SETTLE_S = int(os.environ.get("CHECKPOINT_SETTLE_S", "45"))
 #: failure should cost one retry, not the epoch.
 UPLOAD_ATTEMPTS = 3
 UPLOAD_CHUNK = 8 * 1024 * 1024
-EPOCH_RE = re.compile(r"-(\d+)\.comfy\.safetensors$")
+#: `.comfy` is LTX's; an SDXL checkpoint (#175) is plain `NAME_v1-000003.safetensors`.
+EPOCH_RE = re.compile(r"-(\d+)(?:\.comfy)?\.safetensors$")
 #: How far back a finished run is still watched for publish requests. The run directory is
 #: what makes a request satisfiable, and those are not cleaned up, but polling every job
 #: this box ever trained on every tick is not free either.
@@ -173,7 +174,8 @@ class Poller:
             remote_id=row["id"],
         )
         job = Job(id=row["id"][:12], character=req.character, trigger=req.trigger,
-                  version=req.version, steps=req.steps, remote_id=row["id"])
+                  version=req.version, steps=req.steps, remote_id=row["id"],
+                  arch=recipe.arch_of(req.config))
         self._policy[job.id] = (row.get("config") or {}).get("publish") or "final"
         trainer_app.STORE.add(job)
         asyncio.create_task(trainer_app._run(job, req, on_progress=self._report))
@@ -231,15 +233,16 @@ class Poller:
     # ------------------------------------------------------------- checkpoints
 
     def _local_checkpoints(self, job: Job) -> list[Path]:
-        """The .comfy checkpoints on disk right now, in epoch order, final last.
+        """The checkpoints on disk right now, in epoch order, final last.
 
-        The .comfy variant is the one the engine loads. Every epoch is kept because choosing
+        For LTX the .comfy variant, the one the engine loads; for SDXL the plain file
+        (`pipeline.checkpoint_glob`). Every epoch is kept because choosing
         between them is a judgement made by eye at a fixed seed -- loss does not rank them.
         """
-        out = recipe.run_dir(job.character, job.version) / "output"
+        out = recipe.run_dir(job.character, job.version, job.arch) / "output"
         if not out.is_dir():
             return []
-        files = sorted(out.glob("*.comfy.safetensors"))
+        files = sorted(out.glob(pipeline.checkpoint_glob(job.arch)))
         # The unnumbered file is the one written when the steps ran out. It sorts before the
         # numbered ones alphabetically and must not: it has the most training in it.
         return [f for f in files if EPOCH_RE.search(f.name)] + \
@@ -527,7 +530,7 @@ class Poller:
                 body["error_message"] = (
                     f"trained, but {len(missing) or 'all'} checkpoint(s) could not be uploaded: "
                     + ", ".join(Path(p).name for p in missing)
-                    + f". They are on the trainer under {recipe.run_dir(job.character, job.version)}/output")
+                    + f". They are on the trainer under {recipe.run_dir(job.character, job.version, job.arch)}/output")
                 body["progress_log"] = body["error_message"]
             else:
                 body["progress_log"] = f"{len(published)} checkpoint(s) published"

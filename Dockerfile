@@ -273,6 +273,37 @@ RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
       echo "built without face-edit (WITH_TRAINER=0) — the lean :latest tag"; \
     fi
 
+# ---------------------------------------------------------------- SDXL trainer (#175)
+#
+# kohya sd-scripts for SDXL character LoRAs -- the start-image side. Its OWN venv, not
+# musubi's: this reproduces the 3090a venv that trained the aio LoRAs, and those versions
+# (python 3.10, torch 2.5.1+cu124, xformers 0.0.29.post1, bitsandbytes 0.49.2) are read off
+# that venv, with the commit read out of the LoRAs' own ss_sd_scripts_commit_hash. "Reproduce
+# what works", as the musubi layer does. cu124 matches this image's CUDA base.
+#
+# onnxruntime (CPU) is for the WD14 tagger (wanly_worker/services/lora_trainer/wd14.py), run
+# in this venv. CPU on purpose: 50 images, and the GPU belongs to the render worker until the
+# drain lands, which is after staging.
+#
+# Its own RUN, after face-edit, so adding it invalidated no earlier layer. :full only.
+ARG SDXL_TRAINER_COMMIT=1a3ec9ea745fe9883551dfca5c947ea3d6aa68c7
+ENV SDXL_TRAINER_DIR=/opt/sd-scripts
+RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
+      git clone https://github.com/kohya-ss/sd-scripts.git "$SDXL_TRAINER_DIR" \
+      && git -C "$SDXL_TRAINER_DIR" checkout "$SDXL_TRAINER_COMMIT" \
+      && python3 -m venv "$SDXL_TRAINER_DIR/venv" \
+      && "$SDXL_TRAINER_DIR/venv/bin/pip" install -q --upgrade pip setuptools wheel \
+      && "$SDXL_TRAINER_DIR/venv/bin/pip" install -q \
+           torch==2.5.1 torchvision==0.20.1 xformers==0.0.29.post1 \
+           --index-url https://download.pytorch.org/whl/cu124 \
+      && cd "$SDXL_TRAINER_DIR" \
+      && venv/bin/pip install -q -r requirements.txt \
+      && venv/bin/pip install -q bitsandbytes==0.49.2 onnxruntime==1.23.2 \
+      && venv/bin/python -c "import torch, xformers, bitsandbytes, onnxruntime, library.sdxl_train_util; assert torch.__version__.startswith('2.5.1'), torch.__version__; print('sd-scripts:', torch.__version__, xformers.__version__)"; \
+    else \
+      echo "built without the SDXL trainer (WITH_TRAINER=0) — the lean :latest tag"; \
+    fi
+
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
