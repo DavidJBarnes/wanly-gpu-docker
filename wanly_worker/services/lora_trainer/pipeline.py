@@ -22,6 +22,9 @@ from wanly_worker.services.lora_trainer.jobs import Job
 #: The trainer emits "  45%|####  | 540/1200 [..., 2.35s/it]".
 STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 RATE_RE = re.compile(r"([\d.]+)s/it")
+#: kohya (the SDXL path, #175) is fast enough that tqdm flips to "1.30it/s". Both forms end up
+#: as seconds per iteration, which is what the job and the console carry.
+IT_RATE_RE = re.compile(r"([\d.]+)it/s")
 #: The bar's postfix: "..., avr_loss=0.734, loss_a=n/a, loss_v=0.562]". avr_loss is the running
 #: average the trainer itself reports; it is the number a person watching a run reads.
 LOSS_RE = re.compile(r"avr_loss=([\d.]+)")
@@ -46,6 +49,8 @@ class Cancelled(PipelineError):
 
 def preflight(job: Job) -> None:
     """Everything knowable before an hour of GPU is spent. All of it has bitten someone."""
+    if job.arch == "sdxl":
+        return _preflight_sdxl(job)
     # THE JOB'S base, not the boot-time default (#145). The service preflight proved the
     # default is mounted; a job naming a checkpoint this box does not hold must fail HERE,
     # before the drain and the hour, and must say which name it was and where it looked --
@@ -68,6 +73,33 @@ def preflight(job: Job) -> None:
 
     epochs = recipe.estimated_epochs(job.images, job.steps, per_epoch=job.per_epoch)
     need = epochs * GB_PER_EPOCH
+    free = shutil.disk_usage(recipe.RUNS_DIR).free / 1024 ** 3
+    if free < need + 5:
+        raise PipelineError(
+            f"~{need:.0f} GB of checkpoints expected ({epochs} epochs) and only {free:.0f} GB "
+            f"free under {recipe.RUNS_DIR}")
+
+
+def _preflight_sdxl(job: Job) -> None:
+    """The SDXL half of `preflight` (#175). Checked per job rather than at service boot: the
+    trainer's first job is LTX, and a box without the SDXL base must still train those."""
+    ckpt = job.base_checkpoint or recipe.sdxl_checkpoint_path(None)
+    if not Path(ckpt).exists():
+        raise PipelineError(
+            f"SDXL base checkpoint {Path(ckpt).stem!r} is not at {ckpt}. SDXL bases live under "
+            f"{recipe.SDXL_MODELS_DIR} on the models mount: either this box does not hold that "
+            f"checkpoint or the mount is missing.")
+    for f in ("model.onnx", "selected_tags.csv"):
+        if not (Path(recipe.WD14_DIR) / f).exists():
+            raise PipelineError(
+                f"the WD14 tagger is not at {recipe.WD14_DIR}/{f}. SDXL runs caption with it "
+                f"(SmilingWolf/wd-v1-4-convnext-tagger-v2), from the models mount.")
+    if not Path(recipe.SDXL_PYTHON).exists():
+        raise PipelineError(
+            f"no sd-scripts at {recipe.SDXL_PYTHON} — this image was built without the SDXL "
+            f"trainer (WITH_TRAINER=1)")
+    epochs = recipe.estimated_epochs(job.images, job.steps, per_epoch=job.per_epoch)
+    need = epochs * recipe.SDXL_GB_PER_EPOCH
     free = shutil.disk_usage(recipe.RUNS_DIR).free / 1024 ** 3
     if free < need + 5:
         raise PipelineError(
@@ -128,6 +160,8 @@ async def stage(job: Job, groups: list[dict]) -> Path:
     previous version's leftover images while reporting the new count -- the failure
     new_character.sh had until it grew a version argument.
     """
+    if job.arch == "sdxl":
+        return await _stage_sdxl(job, groups)
     # Before the rmtree below: a refused job must not also destroy the run directory a retry
     # of the previous attempt could still be read from.
     check_captions(groups)
@@ -180,12 +214,51 @@ async def stage(job: Job, groups: list[dict]) -> Path:
     return run
 
 
-async def _stage_cmd(job: Job, run: Path, label: str, argv: list[str], logfile: str) -> None:
+async def _stage_sdxl(job: Job, groups: list[dict]) -> Path:
+    """Stage an SDXL run (#175): one group, images only, then WD14 tags them.
+
+    ONE GROUP. The aio recipe is single-identity; a joint run's composition and regularization
+    groups are an LTX experiment with no SDXL counterpart, and silently training only group 0
+    would hand back a LoRA that is not what was asked for.
+
+    THE INCOMING CAPTIONS ARE NOT USED. They are qwen sentences written for LTX; this base was
+    trained, and is prompted, in booru tags. The tagger writes each image's .txt instead, with
+    the trigger first -- which is also why there is no length check to make here.
+    """
+    if len(groups) != 1:
+        raise PipelineError(
+            f"an SDXL run takes one identity group; this job has {len(groups)}. Joint, "
+            f"composition and regularization groups are LTX-only.")
+    g = groups[0]
+    if not isinstance(g["num_repeats"], int) or g["num_repeats"] < 1:
+        raise PipelineError(f"num_repeats={g['num_repeats']!r}; it must be >= 1")
+
+    run = recipe.run_dir(job.character, job.version, "sdxl")
+    if run.exists():
+        shutil.rmtree(run)
+    for sub in ("data", "output", "logs"):
+        (run / sub).mkdir(parents=True, exist_ok=True)
+
+    _log(job, f"staging {len(g['images'])} images ({g['num_repeats']} repeats, WD14 tags)")
+    for i, (name, blob) in enumerate(g["images"]):
+        ext = Path(name).suffix.lower() or ".jpg"
+        (run / "data" / f"sel_{i:03d}{ext}").write_bytes(blob)
+
+    await _stage_cmd(job, run, "tagging (WD14)",
+                     [recipe.SDXL_PYTHON, str(Path(__file__).with_name("wd14.py")),
+                      str(run / "data"), job.trigger, recipe.WD14_DIR],
+                     "00_tag.log", cwd=str(run))
+    (run / "dataset.toml").write_text(recipe.sdxl_dataset_toml(run, g["num_repeats"]))
+    return run
+
+
+async def _stage_cmd(job: Job, run: Path, label: str, argv: list[str], logfile: str,
+                     cwd: str | None = None) -> None:
     _log(job, label)
     t0 = time.time()
     with (run / "logs" / logfile).open("wb") as out:
         proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=recipe.TRAINER_DIR, stdout=out, stderr=asyncio.subprocess.STDOUT)
+            *argv, cwd=cwd or recipe.TRAINER_DIR, stdout=out, stderr=asyncio.subprocess.STDOUT)
         rc = await proc.wait()
     if rc != 0:
         tail = (run / "logs" / logfile).read_bytes()[-1500:].decode("utf8", "replace")
@@ -222,7 +295,13 @@ def read_progress(run: Path, expect_total: int = 0) -> tuple[int, int, float, fl
                 done, total = a, b
         elif b >= 50:
             done, total = a, b
-    rate = float(m.group(1)) if (m := RATE_RE.search(tail)) else 0.0
+    rates = RATE_RE.findall(tail)
+    it_rates = IT_RATE_RE.findall(tail)
+    # The LAST rate either way: a bar that crossed from s/it to it/s mid-tail has both.
+    if it_rates and (not rates or tail.rfind("it/s") > tail.rfind("s/it")):
+        rate = 1 / float(it_rates[-1]) if float(it_rates[-1]) else 0.0
+    else:
+        rate = float(rates[-1]) if rates else 0.0
     losses = LOSS_RE.findall(tail)
     loss = float(losses[-1]) if losses else None
     return done, total, rate, loss
@@ -233,20 +312,27 @@ async def train(job: Job, run: Path, config: dict, on_progress=None) -> None:
 
     ONE base for all three (#145): resolved once, from the job, and handed to each command.
     Latents cached against one checkpoint and trained against another is a run that finishes
-    cleanly and learns the wrong thing."""
-    ckpt = job.base_checkpoint or recipe.checkpoint_path((config or {}).get("base_checkpoint"))
-    await _stage_cmd(job, run, "caching latents",
-                     recipe.cache_latents_cmd(run, ckpt), "01_cache_latents.log")
-    await _stage_cmd(job, run, "caching text encoder",
-                     recipe.cache_text_cmd(run, ckpt), "02_cache_text.log")
+    cleanly and learns the wrong thing.
+
+    SDXL (#175) has no cache stages: kohya caches latents itself, inside the one command."""
+    ckpt = job.base_checkpoint or recipe.base_checkpoint_for(config)
+    if job.arch == "sdxl":
+        argv = recipe.sdxl_train_cmd(run, job.character, job.version, config, ckpt)
+        cwd = recipe.SDXL_DIR
+    else:
+        await _stage_cmd(job, run, "caching latents",
+                         recipe.cache_latents_cmd(run, ckpt), "01_cache_latents.log")
+        await _stage_cmd(job, run, "caching text encoder",
+                         recipe.cache_text_cmd(run, ckpt), "02_cache_text.log")
+        argv = recipe.train_cmd(run, job.character, job.version, config, ckpt)
+        cwd = recipe.TRAINER_DIR
 
     _log(job, "training")
     t0 = time.time()
     logfile = run / "logs" / "03_train.log"
     with logfile.open("wb") as out:
         proc = await asyncio.create_subprocess_exec(
-            *recipe.train_cmd(run, job.character, job.version, config, ckpt),
-            cwd=recipe.TRAINER_DIR, stdout=out, stderr=asyncio.subprocess.STDOUT)
+            *argv, cwd=cwd, stdout=out, stderr=asyncio.subprocess.STDOUT)
         while proc.returncode is None:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=20)
@@ -288,14 +374,21 @@ async def train(job: Job, run: Path, config: dict, on_progress=None) -> None:
     _log(job, f"training finished in {(time.time() - t0) / 60:.0f} min")
 
 
-def collect(job: Job, run: Path) -> list[str]:
-    """The .comfy checkpoints, in epoch order.
+def checkpoint_glob(arch: str) -> str:
+    """What a checkpoint is called in a run's output/. LTX: the .comfy variant, the one the
+    engine loads (musubi writes a plain twin beside it). SDXL: kohya writes one plain
+    .safetensors per epoch and that IS the A1111/ComfyUI format -- there is no twin."""
+    return "*.safetensors" if arch == "sdxl" else "*.comfy.safetensors"
 
-    The .comfy variant is the one the engine loads. Every epoch is kept because choosing between
-    them is a judgement made by eye at a fixed seed -- loss does not rank them, and a confident
-    "later epochs overfit" call read off a loss curve was refuted outright on d0ggyff.
+
+def collect(job: Job, run: Path) -> list[str]:
+    """The checkpoints, in epoch order.
+
+    Every epoch is kept because choosing between them is a judgement made by eye at a fixed
+    seed -- loss does not rank them, and a confident "later epochs overfit" call read off a
+    loss curve was refuted outright on d0ggyff.
     """
-    out = sorted((run / "output").glob("*.comfy.safetensors"))
+    out = sorted((run / "output").glob(checkpoint_glob(job.arch)))
     job.checkpoints = [str(p) for p in out]
     _log(job, f"{len(out)} checkpoint(s)")
     return job.checkpoints

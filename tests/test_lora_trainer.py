@@ -1581,3 +1581,144 @@ class TestRepeatsArePerGroup:
         job = Job(**old)
         assert job.per_epoch == 500
         assert Job(**{**old, "effective_repeats": 5}).per_epoch == 250
+
+
+class TestSDXL:
+    """#175: SDXL character LoRAs for the START IMAGES, through the same trainer. The recipe is
+    the aio runs (k3lly_aio-1_e8 / k3lly_aio-2_e12), read back out of those files' ss_*
+    metadata -- if a number here drifts, the LoRAs stop being comparable to the ones David
+    already trusts, and nothing else would say so."""
+
+    def _job(self, **kw):
+        from wanly_worker.services.lora_trainer.jobs import Job
+        return Job(id="s", character="k3lly", trigger="k3lly", version=3, steps=6528,
+                   arch="sdxl", **kw)
+
+    def test_the_aio_numbers(self):
+        from wanly_worker.services.lora_trainer.recipe import SDXL_DEFAULTS as d
+        assert (d["network_dim"], d["network_alpha"]) == (128, 64)
+        assert (d["learning_rate"], d["text_encoder_lr"]) == (8e-5, 2e-5)
+        assert d["num_repeats"] == 8
+        assert (d["min_snr_gamma"], d["noise_offset"]) == (5.0, 0.0357)
+        assert d["clip_skip"] == 1, "Lustify; 2 is a Pony base"
+        assert d["seed"] == 42
+
+    def test_the_command_is_the_aio_invocation(self, tmp_path):
+        from wanly_worker.services.lora_trainer import recipe
+        argv = recipe.sdxl_train_cmd(tmp_path, "k3lly", 3, {"steps": 6528})
+        assert any(a.endswith("/sdxl_train_network.py") for a in argv)
+        for flag in ("--network_module=networks.lora", "--network_dim=128",
+                     "--network_alpha=64", "--unet_lr=8e-05", "--text_encoder_lr=2e-05",
+                     "--optimizer_type=AdamW8bit", "--lr_scheduler=cosine_with_restarts",
+                     "--lr_scheduler_num_cycles=1", "--lr_warmup_steps=100",
+                     "--max_train_steps=6528", "--save_every_n_epochs=1", "--xformers",
+                     "--bucket_no_upscale", "--clip_skip=1", "--min_snr_gamma=5.0",
+                     "--noise_offset=0.0357", "--max_token_length=225", "--seed=42",
+                     "--output_name=k3lly_v3", "--save_precision=fp16"):
+            assert flag in argv, flag
+        assert f"--pretrained_model_name_or_path={recipe.SDXL_MODELS_DIR}/BigaspV2Lustify" \
+               ".safetensors" in argv
+
+    def test_absent_arch_is_ltx(self):
+        """Every job before #175 has no arch. A retried one must train exactly as it was
+        created to."""
+        from wanly_worker.services.lora_trainer import recipe
+        assert recipe.arch_of({}) == recipe.arch_of(None) == "ltx"
+        assert recipe.arch_of({"arch": "nonsense"}) == "ltx"
+        assert recipe.arch_of({"arch": "sdxl"}) == "sdxl"
+        assert recipe.base_checkpoint_for({}) == recipe.CKPT
+
+    def test_the_base_resolves_under_sdxl_and_nowhere_else(self):
+        from wanly_worker.services.lora_trainer import recipe
+        assert recipe.base_checkpoint_for({"arch": "sdxl", "base_checkpoint": "bigaspV2_v2"}) \
+            == f"{recipe.SDXL_MODELS_DIR}/bigaspV2_v2.safetensors"
+        with pytest.raises(ValueError):
+            recipe.sdxl_checkpoint_path("../ltx-2.3/diffusion_models/x")
+
+    def test_an_ltx_and_an_sdxl_v1_do_not_share_a_directory(self):
+        """stage() rmtree's the run directory. Shared, starting one would delete the other."""
+        from wanly_worker.services.lora_trainer import recipe
+        assert recipe.run_dir("k3lly", 1, "sdxl") != recipe.run_dir("k3lly", 1)
+        assert str(recipe.run_dir("k3lly", 1, "sdxl")).endswith("/k3lly/sdxl-v1")
+
+    def test_staging_tags_the_images_and_ignores_the_qwen_captions(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import pipeline, recipe
+        calls = []
+
+        async def fake_cmd(job, run, label, argv, logfile, cwd=None):
+            calls.append(argv)
+            for img in sorted((run / "data").iterdir()):
+                img.with_suffix(".txt").write_text(f"{job.trigger}, smile\n")
+        monkeypatch.setattr(pipeline, "_stage_cmd", fake_cmd)
+
+        run = _run(pipeline.stage(self._job(), [
+            {"images": [("a.png", b"x"), ("b.jpg", b"y")], "num_repeats": 8,
+             "captions": ["k3lly, woman, a sentence about a kitchen", "another sentence"]}]))
+        assert run == recipe.run_dir("k3lly", 3, "sdxl")
+        assert len(calls) == 1 and calls[0][1].endswith("wd14.py")
+        assert calls[0][2:] == [str(run / "data"), "k3lly", recipe.WD14_DIR]
+        assert (run / "data" / "sel_000.txt").read_text() == "k3lly, smile\n"
+        toml = (run / "dataset.toml").read_text()
+        assert "num_repeats = 8" in toml and "keep_tokens = 1" in toml
+        assert "shuffle_caption = false" in toml and "bucket_no_upscale = true" in toml
+
+    def test_a_joint_sdxl_run_is_refused(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        with pytest.raises(pipeline.PipelineError, match="one identity group"):
+            _run(pipeline.stage(self._job(), [
+                {"images": [("a.png", b"x")], "num_repeats": 8},
+                {"images": [("b.png", b"y")], "num_repeats": 1, "kind": "regularization"}]))
+
+    def test_kohyas_it_per_second_is_read_as_seconds_per_it(self, tmp_path):
+        from wanly_worker.services.lora_trainer.pipeline import read_progress
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "logs" / "03_train.log").write_bytes(
+            b"\rsteps:  12%|#  | 783/6528 [10:02<1:13:40,  1.25it/s, avr_loss=0.0912]")
+        done, total, rate, loss = read_progress(tmp_path, expect_total=6528)
+        assert (done, total, loss) == (783, 6528, 0.0912)
+        assert rate == pytest.approx(0.8)
+
+    def test_sdxl_checkpoints_are_the_plain_files_final_last(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import poller as mod, recipe
+        monkeypatch.setattr(mod, "QUEUE_URL", "http://api")
+        p, job = mod.Poller(client=None, worker_id_getter=lambda: "w"), self._job()
+        out = recipe.run_dir(job.character, job.version, "sdxl") / "output"
+        out.mkdir(parents=True)
+        for n in ("k3lly_v3.safetensors", "k3lly_v3-000002.safetensors",
+                  "k3lly_v3-000001.safetensors"):
+            (out / n).write_bytes(b"x")
+        names = [f.name for f in p._local_checkpoints(job)]
+        assert names == ["k3lly_v3-000001.safetensors", "k3lly_v3-000002.safetensors",
+                         "k3lly_v3.safetensors"]
+        assert [mod._label(out / n) for n in names] == ["e01", "e02", "final"]
+
+    def test_a_missing_sdxl_base_names_the_sdxl_directory(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import pipeline, recipe
+        job = self._job(base_checkpoint="/nope/BigaspV2Lustify.safetensors")
+        with pytest.raises(pipeline.PipelineError, match="SDXL base checkpoint"):
+            pipeline.preflight(job)
+
+    def test_a_state_file_from_before_arch_loads_as_ltx(self):
+        from wanly_worker.services.lora_trainer.jobs import Job
+        j = Job(**{"id": "x", "character": "p@y", "trigger": "p@y", "version": 1,
+                   "steps": 1200})
+        assert j.arch == "ltx"
+
+
+class TestWD14Captions:
+    """The caption rules the aio datasets were built with (training-how-to.md §4-5)."""
+
+    def test_trigger_first_and_identity_tags_stripped(self):
+        from wanly_worker.services.lora_trainer.wd14 import caption
+        got = caption("k3lly", ["1girl", "solo", "blonde_hair", "smile", "breasts",
+                                "breast_hold", "hair_over_shoulder", "lips", "parted_lips",
+                                "explicit"])
+        assert got == "k3lly, solo, smile, breast_hold, hair_over_shoulder, parted_lips"
+
+    def test_broken_preprocessing_is_recognised(self):
+        from wanly_worker.services.lora_trainer.wd14 import looks_broken
+        assert looks_broken(["k3lly, solo, simple_background, black_background",
+                             "k3lly, solo, dark, negative_space"])
+        assert not looks_broken(["k3lly, solo, simple_background",
+                                 "k3lly, solo, smile, upper_body"])
+        assert not looks_broken([])

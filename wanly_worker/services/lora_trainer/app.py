@@ -160,7 +160,7 @@ async def job_log(job_id: str, tail: int = 4000):
     job = STORE.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="no such job")
-    log = recipe.run_dir(job.character, job.version) / "logs" / "03_train.log"
+    log = recipe.run_dir(job.character, job.version, job.arch) / "logs" / "03_train.log"
     if not log.exists():
         return "training has not started yet"
     with log.open("rb") as fh:
@@ -184,6 +184,10 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
     async with httpx.AsyncClient() as client:
         try:
             job.phase = "staging"
+            # FIRST, before anything can fail: the run directory, the log endpoint and the
+            # checkpoint sweep all key on it (#175).
+            job.arch = recipe.arch_of(req.config)
+            defaults = recipe.defaults_for(job.arch)
             STORE.persist(job)
 
             if req.image_urls:
@@ -204,7 +208,7 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
             groups = [{"images": images, "caption": req.caption, "captions": req.captions,
                        "kind": "identity",
                        "num_repeats": int((req.config or {}).get("num_repeats")
-                                          or recipe.DEFAULTS["num_repeats"])}]
+                                          or defaults["num_repeats"])}]
             for gi, g in enumerate(req.identities):
                 g_urls = g.get("image_urls") or []
                 if not g_urls and g.get("image_dir"):
@@ -222,7 +226,7 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
                     "captions": g.get("captions"),
                     "kind": g.get("kind"),
                     "num_repeats": int(g.get("num_repeats")
-                                       or recipe.DEFAULTS["num_repeats"]),
+                                       or defaults["num_repeats"]),
                 })
                 job.images += len(g_images)
             # THE REAL EPOCH, per group (#145). A regularization pool rides at its own repeats,
@@ -236,9 +240,8 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
             # THE BASE THIS RUN TRAINS AGAINST (#145), from the job, said out loud. It used to
             # be one constant for every run; now two runs on the same box can differ, and a
             # LoRA that came out wrong has to be traceable to the base it was trained on.
-            job.base_checkpoint = recipe.checkpoint_path(
-                (req.config or {}).get("base_checkpoint"))
-            pipeline._log(job, f"base checkpoint {job.base_checkpoint}"
+            job.base_checkpoint = recipe.base_checkpoint_for(req.config)
+            pipeline._log(job, f"{job.arch} base checkpoint {job.base_checkpoint}"
                                + ("" if (req.config or {}).get("base_checkpoint")
                                   else " (the job names none; the default applies)"))
             pipeline.preflight(job)
