@@ -11,8 +11,10 @@ run looks hung. That has cost real evenings.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
+import signal
 import time
 from pathlib import Path
 
@@ -276,7 +278,8 @@ async def _stage_cmd(job: Job, run: Path, label: str, argv: list[str], logfile: 
     t0 = time.time()
     with (run / "logs" / logfile).open("wb") as out:
         proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=cwd or recipe.TRAINER_DIR, stdout=out, stderr=asyncio.subprocess.STDOUT)
+            *argv, cwd=cwd or recipe.TRAINER_DIR, stdout=out, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True)
         rc = await proc.wait()
     if rc != 0:
         tail = (run / "logs" / logfile).read_bytes()[-1500:].decode("utf8", "replace")
@@ -349,8 +352,11 @@ async def train(job: Job, run: Path, config: dict, on_progress=None) -> None:
     t0 = time.time()
     logfile = run / "logs" / "03_train.log"
     with logfile.open("wb") as out:
+        # ITS OWN PROCESS GROUP (#182): what this spawns is `accelerate launch`, and the
+        # training itself is its CHILD. Only a group can be stopped as a whole.
         proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=cwd, stdout=out, stderr=asyncio.subprocess.STDOUT)
+            *argv, cwd=cwd, stdout=out, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True)
         while proc.returncode is None:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=20)
@@ -374,22 +380,57 @@ async def train(job: Job, run: Path, config: dict, on_progress=None) -> None:
                 # check, or every cancel waits an extra tick.
                 await on_progress(job)
             if job.cancel_requested:
-                # TERMINATE, NOT KILL. accelerate cleans up its child processes and the CUDA
-                # context on SIGTERM; SIGKILL leaves them holding the card, and the next run
-                # then OOMs against a GPU that looks free. Escalate only if it will not go.
                 _log(job, "cancelled — stopping the trainer")
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=60)
-                except asyncio.TimeoutError:
-                    _log(job, "trainer did not stop in 60s — killing it")
-                    proc.kill()
-                    await proc.wait()
+                await stop_process_group(job, proc)
                 raise Cancelled("cancelled")
     if proc.returncode != 0:
         tail = logfile.read_bytes()[-1500:].decode("utf8", "replace")
         raise PipelineError(f"training failed (rc={proc.returncode}). Last output:\n{tail}")
     _log(job, f"training finished in {(time.time() - t0) / 60:.0f} min")
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:   # exists, owned by someone else -- still alive
+        return True
+
+
+async def stop_process_group(job: Job, proc, grace_s: float = 60.0) -> None:
+    """Stop a trainer subprocess AND EVERYTHING IT STARTED, and return only once it is gone.
+
+    SIGNALLING THE PROCESS ALONE IS NOT ENOUGH (#182). It is `accelerate launch`; the training
+    is its child, with dataloader workers under that. On 2026-10-05 a cancel terminated the
+    launcher, proc.wait() returned, the run said "cancelled" and released the drain -- and three
+    sdxl_train processes kept 23.8 GB of the card at 100% while a render was claimed beside
+    them. So the subprocess is started as its own group (start_new_session) and the GROUP is
+    stopped: SIGTERM first -- the trainer releases its CUDA context cleanly on it -- then SIGKILL
+    for anything still there after `grace_s`. The caller releases the drain only after this
+    returns, i.e. only once nothing of the run is left on the card.
+    """
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        await proc.wait()
+        return
+    deadline = time.time() + grace_s
+    while _group_alive(pgid) and time.time() < deadline:
+        await asyncio.sleep(1)
+    if _group_alive(pgid):
+        _log(job, f"trainer group did not stop in {grace_s:.0f}s — killing it")
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for _ in range(30):
+            if not _group_alive(pgid):
+                break
+            await asyncio.sleep(1)
+    await proc.wait()
 
 
 def checkpoint_glob(arch: str) -> str:
