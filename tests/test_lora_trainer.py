@@ -1722,3 +1722,87 @@ class TestWD14Captions:
         assert not looks_broken(["k3lly, solo, simple_background",
                                  "k3lly, solo, smile, upper_body"])
         assert not looks_broken([])
+
+
+class TestAFinishedRunIsNeverRetrainedOrWiped:
+    """#180, 2026-10-05: the worker was recreated while Me v1's checkpoints uploaded; the row
+    was reclaimed, claimed again, retrained -- and staging deleted six finished checkpoints."""
+
+    def test_a_run_dir_with_checkpoints_is_kept_aside_not_deleted(self):
+        from wanly_worker.services.lora_trainer import pipeline, recipe
+        run = recipe.run_dir("Me", 1, "sdxl")
+        (run / "output").mkdir(parents=True)
+        (run / "output" / "Me_v1-000003.safetensors").write_bytes(b"precious")
+        pipeline._clear_run_dir(run)
+        assert not run.exists()
+        kept = [p for p in run.parent.iterdir() if p.name.startswith("sdxl-v1.replaced-")]
+        assert len(kept) == 1
+        assert (kept[0] / "output" / "Me_v1-000003.safetensors").read_bytes() == b"precious"
+
+    def test_a_run_dir_without_checkpoints_is_simply_removed(self):
+        from wanly_worker.services.lora_trainer import pipeline, recipe
+        run = recipe.run_dir("Me", 1, "sdxl")
+        (run / "data").mkdir(parents=True)
+        pipeline._clear_run_dir(run)
+        assert not run.exists() and list(run.parent.iterdir()) == []
+
+    def test_staging_goes_through_the_guard_on_both_paths(self):
+        import inspect
+        from wanly_worker.services.lora_trainer import pipeline
+        assert "shutil.rmtree(run)" not in inspect.getsource(pipeline.stage)
+        assert "shutil.rmtree(run)" not in inspect.getsource(pipeline._stage_sdxl)
+
+    def test_a_reclaimed_finished_run_resumes_uploads_instead_of_training(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import app as app_mod, poller as mod, recipe
+        from wanly_worker.services.lora_trainer.jobs import Job
+        monkeypatch.setattr(mod, "QUEUE_URL", "http://q")
+        monkeypatch.setattr(mod, "QUEUE_API_KEY", "k")
+        monkeypatch.setattr(mod, "_log", lambda m: None)
+        done = Job(id="4812349f-50e", character="Me", trigger="m3", version=1, steps=1920,
+                   arch="sdxl", phase="completed", remote_id="4812349f-50e-full")
+        out = recipe.run_dir("Me", 1, "sdxl") / "output"
+        out.mkdir(parents=True)
+        (out / "Me_v1.safetensors").write_bytes(b"x")
+        row = {"id": "4812349f-50e-full", "character": "Me", "trigger": "m3", "version": 1,
+               "download_urls": ["u"], "config": {"arch": "sdxl", "publish": "all"}}
+        patched = []
+
+        class R:
+            status_code = 200
+
+            def __init__(self, b):
+                self._b = b
+
+            def json(self):
+                return self._b
+
+        class C:
+            async def get(self, *a, **k):
+                return R(row)
+
+            async def patch(self, url, json=None, **k):
+                patched.append(json)
+                return R({})
+
+        class S:
+            def claim_slot(self):
+                return True
+
+            def all(self):
+                return [done]
+
+            def add(self, job):
+                raise AssertionError("must not start a new run")
+        ran = []
+
+        async def fake_run(*a, **k):
+            ran.append(a)
+        monkeypatch.setattr(app_mod, "STORE", S())
+        monkeypatch.setattr(app_mod, "_run", fake_run)
+        p = mod.Poller(client=C(), worker_id_getter=lambda: "w")
+        monkeypatch.setattr(p, "check_publish_requests", lambda: asyncio.sleep(0))
+        _run(p.tick())
+        assert ran == []
+        assert patched and patched[-1]["status"] == "running"
+        assert "resuming the checkpoint uploads" in patched[-1]["progress_log"]
+        assert p._policy[done.id] == "all"

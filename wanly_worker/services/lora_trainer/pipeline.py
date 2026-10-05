@@ -107,6 +107,26 @@ def _preflight_sdxl(job: Job) -> None:
             f"free under {recipe.RUNS_DIR}")
 
 
+def _clear_run_dir(run: Path) -> None:
+    """Make way for a fresh run directory -- WITHOUT destroying finished checkpoints (#180).
+
+    A run directory is rebuilt rather than added to (see stage). But on 2026-10-05 a run that
+    had FINISHED training -- its row reclaimed after the worker was recreated mid-upload --
+    was claimed again, and the rmtree here deleted six checkpoints that existed nowhere else.
+    So a directory holding any checkpoint is renamed aside, not removed: a mistake now costs
+    disk, never training. One with no checkpoints (a staging attempt that died) is removed.
+    """
+    if not run.exists():
+        return
+    out = run / "output"
+    if out.is_dir() and any(out.glob("*.safetensors")):
+        aside = run.with_name(f"{run.name}.replaced-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
+        run.rename(aside)
+        print(f"[trainer] {run} held checkpoints — kept as {aside.name}, not deleted", flush=True)
+        return
+    shutil.rmtree(run)
+
+
 def check_captions(groups: list[dict]) -> None:
     """Refuse a caption list that does not line up with its images, before anything is staged.
 
@@ -170,8 +190,7 @@ async def stage(job: Job, groups: list[dict]) -> Path:
             raise PipelineError(f"group {gi} num_repeats={g['num_repeats']!r}; it must be >= 1")
 
     run = recipe.run_dir(job.character, job.version)
-    if run.exists():
-        shutil.rmtree(run)
+    _clear_run_dir(run)
     for sub in ("data", "cache", "output", "logs"):
         (run / sub).mkdir(parents=True, exist_ok=True)
 
@@ -234,8 +253,7 @@ async def _stage_sdxl(job: Job, groups: list[dict]) -> Path:
         raise PipelineError(f"num_repeats={g['num_repeats']!r}; it must be >= 1")
 
     run = recipe.run_dir(job.character, job.version, "sdxl")
-    if run.exists():
-        shutil.rmtree(run)
+    _clear_run_dir(run)
     for sub in ("data", "output", "logs"):
         (run / sub).mkdir(parents=True, exist_ok=True)
 

@@ -203,6 +203,30 @@ if [ "$training" != "no" ]; then
     log "the trainer in this container reports training=$training — leaving the worker alone, will retry next run"
     exit 0
 fi
+
+# AND THE API'S VIEW OF THE TRAINING RUN (#180). `training` above is null the moment the
+# training STEPS end, but a run keeps going for minutes after: the checkpoints upload. On
+# 2026-10-05 this script recreated the container at "idle" while Me v1 was uploading e03 of 8;
+# the row was still `running`, the orphan reclaim queued it again, and the new trainer retrained
+# it -- deleting the finished checkpoints. A training row this box claimed that is still
+# claimed or running is busy, whatever the container says. Unreadable counts as busy.
+live_training=$(curl -sf --max-time 15 -H "X-API-Key: ${QUEUE_API_KEY:-}" \
+                  "${QUEUE_URL:-}/training?limit=50" 2>/dev/null \
+                | FRIENDLY_NAME="${FRIENDLY_NAME:-}" python3 -c '
+import json, os, sys
+name = os.environ.get("FRIENDLY_NAME", "")
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    print("unknown"); raise SystemExit
+live = [r for r in rows if isinstance(r, dict) and r.get("status") in ("claimed", "running")
+        and r.get("worker_name") == name]
+print(",".join("%s v%s" % (r.get("character"), r.get("version")) for r in live) or "none")
+' 2>/dev/null || echo unknown)
+if [ "$live_training" != "none" ]; then
+    log "the API has training on this box still live ($live_training) — training or uploading; leaving the worker alone, will retry next run"
+    exit 0
+fi
 log "worker is idle — recreating on the new image"
 "$HERE/run-worker.sh"
 log "done"
