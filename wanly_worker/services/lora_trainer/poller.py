@@ -142,6 +142,23 @@ class Poller:
         if not row:
             return
 
+        # A RUN THIS BOX ALREADY FINISHED, CLAIMED AGAIN (#180). If the container went away
+        # while the checkpoints were still uploading, the row stayed `running`, the orphan
+        # reclaim queued it again, and the next claim retrained it from scratch -- staging
+        # deleted the finished checkpoints on the way. If this store has the run completed and
+        # its checkpoints are still on disk, do NOT train: say so on the row and let the
+        # interrupted-upload path in check_publish_requests send what is missing and complete it.
+        done = next((j for j in trainer_app.STORE.all()
+                     if j.remote_id == row["id"] and j.phase == "completed"), None)
+        if done is not None and self._local_checkpoints(done):
+            _log(f"claimed {row['character']} v{row['version']} again, but this box finished "
+                 f"training it — resuming its uploads instead of retraining")
+            self._policy[done.id] = (row.get("config") or {}).get("publish") or "final"
+            await self._patch(done, {"status": "running",
+                                     "progress_log": "training finished before a restart; "
+                                                     "resuming the checkpoint uploads"})
+            return
+
         _log(f"claimed {row['character']} v{row['version']} ({len(row['download_urls'])} images)")
         # THE EXTRA GROUPS (#102, #106). `identities` rides the claim response only for a
         # joint run; ABSENT for every single-identity job, so this maps to [] and the
