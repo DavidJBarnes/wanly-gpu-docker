@@ -521,15 +521,17 @@ class TestCancellingActuallyStopsTheRun:
         from wanly_worker.services.lora_trainer import pipeline as mod
         src = inspect.getsource(mod.train)
         assert "job.cancel_requested" in src
-        assert "proc.terminate()" in src
+        # The GROUP, not the launcher alone (#182): proc.terminate() reached only
+        # `accelerate launch` and left the training running on the card.
+        assert "stop_process_group" in src
 
     def test_it_terminates_before_it_kills(self):
-        """SIGKILL leaves accelerate's children holding the CUDA context, and the next run OOMs
-        against a card that looks free."""
+        """SIGKILL first would leave the CUDA context half torn down; SIGTERM the group, and
+        escalate only for whatever is still there after the grace period."""
         import inspect
         from wanly_worker.services.lora_trainer import pipeline as mod
-        src = inspect.getsource(mod.train)
-        assert src.index("proc.terminate()") < src.index("proc.kill()")
+        src = inspect.getsource(mod.stop_process_group)
+        assert src.index("signal.SIGTERM") < src.index("signal.SIGKILL")
 
     def test_a_cancelled_run_is_not_reported_as_failed(self):
         import inspect
@@ -1806,3 +1808,49 @@ class TestAFinishedRunIsNeverRetrainedOrWiped:
         assert patched and patched[-1]["status"] == "running"
         assert "resuming the checkpoint uploads" in patched[-1]["progress_log"]
         assert p._policy[done.id] == "all"
+
+
+class TestCancelStopsTheWholeProcessGroup:
+    """#182: cancel terminated `accelerate launch` and left its child -- the actual training --
+    on the GPU. A real parent-with-children tree, the shape accelerate makes."""
+
+    def test_the_children_die_too_not_just_the_launcher(self):
+        import os
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+        job = Job(id="c", character="Me", trigger="m", version=1, steps=10)
+
+        async def go():
+            # The parent starts two long-lived children and waits, like accelerate launch.
+            proc = await asyncio.create_subprocess_exec(
+                "sh", "-c", "sleep 300 & sleep 300 & wait", start_new_session=True)
+            await asyncio.sleep(0.5)
+            assert pipeline._group_alive(proc.pid)
+            await pipeline.stop_process_group(job, proc, grace_s=5)
+            return proc.pid
+        pgid = _run(go())
+        assert not pipeline._group_alive(pgid), "a child of the launcher survived the cancel"
+        # And nothing is left under that group id at all.
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)
+
+    def test_a_child_that_ignores_sigterm_is_killed(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+        job = Job(id="c", character="Me", trigger="m", version=1, steps=10)
+
+        async def go():
+            proc = await asyncio.create_subprocess_exec(
+                "sh", "-c", "trap '' TERM; sleep 300 & wait", start_new_session=True)
+            await asyncio.sleep(0.5)
+            await pipeline.stop_process_group(job, proc, grace_s=1)
+            return proc.pid
+        assert not pipeline._group_alive(_run(go()))
+
+    def test_every_trainer_subprocess_gets_its_own_group(self):
+        import inspect
+        from wanly_worker.services.lora_trainer import pipeline
+        assert "start_new_session=True" in inspect.getsource(pipeline.train)
+        assert "start_new_session=True" in inspect.getsource(pipeline._stage_cmd)
+        src = inspect.getsource(pipeline.train)
+        assert "proc.terminate()" not in src and "stop_process_group" in src
