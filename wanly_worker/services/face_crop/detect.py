@@ -43,6 +43,13 @@ MAX_EDGE = int(os.environ.get("FACE_CROP_MAX_EDGE", "1024"))
 #: and PNG on photographic content is an order of magnitude larger for no gain a trainer can
 #: use.
 JPEG_QUALITY = int(os.environ.get("FACE_CROP_JPEG_QUALITY", "95"))
+#: THE RETRY BORDER (#178), as a fraction of the longest edge, used ONLY when the plain image
+#: yields no face. SCRFD at 640 misses some faces that fill the frame: on Joana v3 a 440x440
+#: face crop scored det 0.00 as-is and 0.89 with this border, and its embedding then matched
+#: the anchor at 0.74 (her set's median was 0.63). Only as a fallback, because padding MOVES
+#: embeddings of faces that were already found -- raw vs padded cosine had a median of 0.975
+#: but a minimum of 0.48 over the same set -- so padding everything would shift every score.
+RETRY_PAD = float(os.environ.get("FACE_DETECT_RETRY_PAD", "0.5"))
 
 _app = None
 
@@ -93,13 +100,23 @@ def detect(image_bytes: bytes) -> list[Face]:
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         return []
+    h, w = img.shape[:2]
     faces = [f for f in _analyser().get(img) if float(f.det_score) >= MIN_DET_SCORE]
+    # A FACE THAT FILLS THE FRAME (#178): nothing found, so look again with a border round it.
+    # Only here -- see RETRY_PAD for why an image that already works must not be padded. The
+    # boxes come back in the padded frame and are shifted into this one below; the crop itself
+    # is still cut from the original, so the border never reaches a training image.
+    offset = 0
+    if not faces and RETRY_PAD > 0:
+        offset = int(max(h, w) * RETRY_PAD)
+        padded = cv2.copyMakeBorder(img, offset, offset, offset, offset,
+                                    cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        faces = [f for f in _analyser().get(padded) if float(f.det_score) >= MIN_DET_SCORE]
     faces.sort(key=lambda f: -( (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]) ))
 
     out: list[Face] = []
-    h, w = img.shape[:2]
     for i, f in enumerate(faces):
-        x1, y1, x2, y2 = [float(v) for v in f.bbox]
+        x1, y1, x2, y2 = [float(v) - offset for v in f.bbox]
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         # SQUARE, because a training crop with a varying aspect ratio buckets unpredictably and
         # bucket_no_upscale means the bucket is whatever the image already is.
