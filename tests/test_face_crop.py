@@ -188,3 +188,58 @@ class TestACropHasToFitThroughTheWire:
         from wanly_worker.services.face_crop.app import CropFace
         f = CropFace(source_index=0, face_index=0, png_b64="x", width=1, det_score=1.0, yaw=0.0)
         assert f.format == "jpeg"
+
+
+class TestATightCropIsRetriedPadded:
+    """#178: SCRFD missed a 440x440 face crop (det 0.00) that it found at 0.89 with a border.
+    The retry happens ONLY when nothing was found -- padding moves embeddings of faces that
+    already detect (raw vs padded cosine down to 0.48), so a working image must not be padded."""
+
+    class _Face:
+        def __init__(self, bbox, score=0.9):
+            import numpy as np
+            self.bbox = np.array(bbox, dtype=float)
+            self.det_score = score
+            self.normed_embedding = np.array([0.6, 0.8])
+            self.pose = None
+
+    def _img(self, w=440, h=440):
+        import cv2
+        import numpy as np
+        ok, buf = cv2.imencode(".jpg", np.full((h, w, 3), 128, np.uint8))
+        return buf.tobytes()
+
+    def _fake(self, monkeypatch, found_plain):
+        calls = []
+        face = self._Face
+
+        class App:
+            def get(self, img):
+                calls.append(img.shape[:2])
+                padded = img.shape[0] > 440
+                if found_plain and not padded:
+                    return [face([40, 40, 400, 400])]
+                # In the padded frame (220 px border) the face sits 220 px further in.
+                return [face([260, 260, 620, 620])] if padded else []
+        monkeypatch.setattr(fd, "_analyser", lambda: App())
+        return calls
+
+    def test_no_face_plain_is_found_padded_and_mapped_back(self, monkeypatch):
+        calls = self._fake(monkeypatch, found_plain=False)
+        faces = fd.detect(self._img())
+        assert len(faces) == 1
+        assert calls == [(440, 440), (880, 880)]   # plain, then one padded retry
+        # The crop is cut from the ORIGINAL: no wider than the 440 px image, no border.
+        assert faces[0].width <= 440
+        assert faces[0].embedding == [0.6, 0.8]
+
+    def test_an_image_that_already_works_is_never_padded(self, monkeypatch):
+        calls = self._fake(monkeypatch, found_plain=True)
+        assert len(fd.detect(self._img())) == 1
+        assert calls == [(440, 440)]
+
+    def test_the_retry_can_be_turned_off(self, monkeypatch):
+        calls = self._fake(monkeypatch, found_plain=False)
+        monkeypatch.setattr(fd, "RETRY_PAD", 0.0)
+        assert fd.detect(self._img()) == []
+        assert calls == [(440, 440)]
