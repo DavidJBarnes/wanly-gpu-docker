@@ -1700,10 +1700,12 @@ class TestSDXL:
         # Separate logs: one shared file would keep only the last group's tags.
         assert [c[1] for c in calls] == ["00_tag.log", "00_tag1.log", "00_tag2.log"]
         assert sorted(p.name for p in (run / "data2").iterdir()) == ["sel_000.png", "sel_001.png"]
-        import tomllib
-        subsets = tomllib.loads((run / "dataset.toml").read_text())["datasets"][0]["subsets"]
-        assert [(s["image_dir"], s["num_repeats"], s["keep_tokens"]) for s in subsets] == [
-            (str(run / "data"), 8, 2), (str(run / "data1"), 8, 2), (str(run / "data2"), 8, 4)]
+        # Text, not tomllib: CI's Python predates 3.11.
+        toml = (run / "dataset.toml").read_text()
+        assert toml.count("[[datasets.subsets]]") == 3
+        for d, keep in (("data", 2), ("data1", 2), ("data2", 4)):
+            assert (f'    image_dir = "{run / d}"\n    num_repeats = 8\n'
+                    f'    keep_tokens = {keep}\n') in toml
 
     def test_a_pair_group_without_one_prefix_is_refused(self, monkeypatch):
         """The captions ARE the prefix. Two different ones (or a qwen sentence per image) is
