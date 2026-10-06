@@ -1593,8 +1593,8 @@ class TestSDXL:
 
     def _job(self, **kw):
         from wanly_worker.services.lora_trainer.jobs import Job
-        return Job(id="s", character="k3lly", trigger="k3lly", version=3, steps=6528,
-                   arch="sdxl", **kw)
+        return Job(**{"id": "s", "character": "k3lly", "trigger": "k3lly", "version": 3,
+                      "steps": 6528, "arch": "sdxl", **kw})
 
     def test_the_aio_numbers(self):
         from wanly_worker.services.lora_trainer.recipe import SDXL_DEFAULTS as d
@@ -1664,12 +1664,64 @@ class TestSDXL:
         assert "num_repeats = 8" in toml and "keep_tokens = 1" in toml
         assert "shuffle_caption = false" in toml and "bucket_no_upscale = true" in toml
 
-    def test_a_joint_sdxl_run_is_refused(self):
+    def test_a_regularization_group_is_refused(self):
         from wanly_worker.services.lora_trainer import pipeline
-        with pytest.raises(pipeline.PipelineError, match="one identity group"):
+        with pytest.raises(pipeline.PipelineError, match="no regularization group"):
             _run(pipeline.stage(self._job(), [
                 {"images": [("a.png", b"x")], "num_repeats": 8},
                 {"images": [("b.png", b"y")], "num_repeats": 1, "kind": "regularization"}]))
+
+    def _pair_groups(self, comp_captions=None):
+        return [
+            {"images": [("a.png", b"x"), ("b.png", b"y")], "num_repeats": 8,
+             "kind": "identity", "captions": ["k3lly, 1girl"] * 2},
+            {"images": [("c.png", b"z")], "num_repeats": 8, "kind": "identity",
+             "captions": ["d@vid, 1boy"]},
+            {"images": [("d.png", b"w"), ("e.png", b"v")], "num_repeats": 8,
+             "kind": "composition",
+             "captions": comp_captions or ["k3lly, d@vid, 1girl, 1boy"] * 2}]
+
+    def test_a_pair_tags_each_group_after_its_own_prefix(self, monkeypatch):
+        """#184: member A, member B and the both-in-frame set, each in its own dir, each
+        WD14-tagged after the prefix the API sent -- so each trigger binds to its class tag."""
+        from wanly_worker.services.lora_trainer import pipeline, recipe
+        calls = []
+
+        async def fake_cmd(job, run, label, argv, logfile, cwd=None):
+            calls.append((argv, logfile))
+        monkeypatch.setattr(pipeline, "_stage_cmd", fake_cmd)
+
+        job = self._job(character="KellyDavid")
+        run = _run(pipeline.stage(job, self._pair_groups()))
+        assert [c[0][2:4] for c in calls] == [
+            [str(run / "data"), "k3lly, 1girl"],
+            [str(run / "data1"), "d@vid, 1boy"],
+            [str(run / "data2"), "k3lly, d@vid, 1girl, 1boy"]]
+        # Separate logs: one shared file would keep only the last group's tags.
+        assert [c[1] for c in calls] == ["00_tag.log", "00_tag1.log", "00_tag2.log"]
+        assert sorted(p.name for p in (run / "data2").iterdir()) == ["sel_000.png", "sel_001.png"]
+        # Text, not tomllib: CI's Python predates 3.11.
+        toml = (run / "dataset.toml").read_text()
+        assert toml.count("[[datasets.subsets]]") == 3
+        for d, keep in (("data", 2), ("data1", 2), ("data2", 4)):
+            assert (f'    image_dir = "{run / d}"\n    num_repeats = 8\n'
+                    f'    keep_tokens = {keep}\n') in toml
+
+    def test_a_pair_group_without_one_prefix_is_refused(self, monkeypatch):
+        """The captions ARE the prefix. Two different ones (or a qwen sentence per image) is
+        an API that does not speak this contract -- tagging under either would be a guess."""
+        from wanly_worker.services.lora_trainer import pipeline
+        monkeypatch.setattr(pipeline, "_stage_cmd", lambda *a, **k: None)
+        with pytest.raises(pipeline.PipelineError, match="one tag prefix"):
+            _run(pipeline.stage(self._job(), self._pair_groups(
+                comp_captions=["k3lly, d@vid, 1girl, 1boy", "a sentence"])))
+
+    def test_a_solo_toml_is_unchanged(self, tmp_path):
+        """Every SDXL LoRA so far trained on this exact file. A pair must not move a byte of it."""
+        from wanly_worker.services.lora_trainer import recipe
+        assert recipe.sdxl_dataset_toml(tmp_path, 8).endswith(
+            f'[[datasets]]\n  [[datasets.subsets]]\n    image_dir = "{tmp_path}/data"\n'
+            f'    num_repeats = 8\n')
 
     def test_kohyas_it_per_second_is_read_as_seconds_per_it(self, tmp_path):
         from wanly_worker.services.lora_trainer.pipeline import read_progress
