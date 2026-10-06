@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -37,10 +38,14 @@ UPLOAD_ATTEMPTS = 3
 UPLOAD_CHUNK = 8 * 1024 * 1024
 #: `.comfy` is LTX's; an SDXL checkpoint (#175) is plain `NAME_v1-000003.safetensors`.
 EPOCH_RE = re.compile(r"-(\d+)(?:\.comfy)?\.safetensors$")
-#: How far back a finished run is still watched for publish requests. The run directory is
-#: what makes a request satisfiable, and those are not cleaned up, but polling every job
-#: this box ever trained on every tick is not free either.
-PUBLISH_WATCH_DAYS = int(os.environ.get("PUBLISH_WATCH_DAYS", "14"))
+#: A checkpoint label as the API spells it: `e01`.. or `final`. Anything else in a delete
+#: request is refused before it gets near a path.
+LABEL_RE = re.compile(r"e(\d{2,})|final")
+#: A checkpoint whose upload failed is tried again after this, then twice as long, and so on
+#: up to the cap (#191). It used to sit in `_failed` until the container restarted -- a
+#: transient S3 or uplink failure at 3 a.m. cost the checkpoint until somebody noticed.
+UPLOAD_RETRY_S = int(os.environ.get("UPLOAD_RETRY_S", "600"))
+UPLOAD_RETRY_MAX_S = int(os.environ.get("UPLOAD_RETRY_MAX_S", str(4 * 3600)))
 #: How often the no-worker-id warning repeats. A tick with no id must SAY SO -- a silent
 #: return is invisible behind an entirely healthy-looking box, which is how Payton v1 sat in
 #: the queue for an hour on its first night. Repeating because docker logs are not
@@ -66,8 +71,14 @@ class Poller:
         #: Checkpoints already in the bucket, per job -- local path -> s3 uri. Uploads run
         #: WHILE training does, so this is what stops the same epoch going up twice.
         self._published: dict[str, dict[str, str]] = {}
-        #: Checkpoints that failed every attempt, per job. Reported at the end, loudly.
-        self._failed: dict[str, list[str]] = {}
+        #: Checkpoints that failed every attempt, per job: path -> (failures, retry_at).
+        #: Reported at the end, loudly, and tried again once retry_at has passed (#191) --
+        #: never given up on while the file is still on disk and still wanted.
+        self._failed: dict[str, dict[str, tuple[int, float]]] = {}
+        #: Labels the console deleted, per job (#191). Never uploaded, whatever the policy says:
+        #: the API has already dropped them from the row, and a late upload would resurrect a
+        #: checkpoint the user threw away.
+        self._deleted: dict[str, set[str]] = {}
         #: Sizes seen last tick, so "settled" can be judged. path -> (size, first_seen_at).
         self._seen: dict[str, tuple[int, float]] = {}
         #: Waiting to go up, per job, and the one task per job that sends them ONE AT A TIME.
@@ -153,7 +164,7 @@ class Poller:
         if done is not None and self._local_checkpoints(done):
             _log(f"claimed {row['character']} v{row['version']} again, but this box finished "
                  f"training it — resuming its uploads instead of retraining")
-            self._policy[done.id] = (row.get("config") or {}).get("publish") or "final"
+            self._policy[done.id] = _policy_of(row)
             await self._patch(done, {"status": "running",
                                      "progress_log": "training finished before a restart; "
                                                      "resuming the checkpoint uploads"})
@@ -195,23 +206,33 @@ class Poller:
         job = Job(id=row["id"][:12], character=req.character, trigger=req.trigger,
                   version=req.version, steps=req.steps, remote_id=row["id"],
                   arch=recipe.arch_of(req.config))
-        self._policy[job.id] = (row.get("config") or {}).get("publish") or "final"
+        self._policy[job.id] = _policy_of(row)
         trainer_app.STORE.add(job)
         asyncio.create_task(trainer_app._run(job, req, on_progress=self._report))
         await self._report(job)
 
     async def check_publish_requests(self) -> None:
-        """Upload, after the fact, the epochs the console asked for.
+        """Upload, after the fact, the checkpoints the console asked for -- and delete the ones
+        it threw away (#191).
 
-        Only the final checkpoint goes up by default; the others sit in the run directory.
-        The console records a request on the API row, and this -- run from the poll loop --
-        is what notices. Pull, like everything else: the API never calls this box.
+        What goes up on its own depends on the run's `publish` ("none" uploads nothing, "final"
+        the final, "all" every epoch); the rest sit in the run directory. The console records a
+        request on the API row -- `publish_requests` to upload one, `delete_requests` to delete
+        one -- and this, run from the poll loop, is what notices. Pull, like everything else:
+        the API never calls this box.
+
+        NO TIME WINDOW. A request is honoured for any finished run whose checkpoints are still
+        on disk. There used to be a 14-day cutoff, and a checkpoint David had been testing for
+        three weeks could then be neither uploaded nor deleted from the console -- it was on
+        disk, the button worked, and nothing ever happened. "Still has checkpoints on disk" is
+        what bounds the polling instead: a run whose last checkpoint is deleted drops out.
+        That is one GET per such run per tick; fine for the tens of runs a box holds, and the
+        thing to revisit if it ever holds hundreds.
         """
         if not enabled():
             return
-        cutoff = time.time() - PUBLISH_WATCH_DAYS * 86400
         for job in trainer_app.STORE.all():
-            if not (job.done and job.remote_id and job.finished_at > cutoff):
+            if not (job.done and job.remote_id):
                 continue
             if not self._local_checkpoints(job):
                 continue
@@ -224,13 +245,22 @@ class Poller:
                 row = r.json()
             except Exception:
                 continue
-            self._policy.setdefault(job.id, (row.get("config") or {}).get("publish") or "final")
+            self._policy.setdefault(job.id, _policy_of(row))
+            # DELETES FIRST, so a label that is both asked for and deleted is never queued.
+            # The API removes the label from publish_requests when it is deleted, but the two
+            # lists are read here at one instant and a deleted label must lose regardless.
+            deleted = {str(l) for l in (row.get("delete_requests") or [])}
+            self._deleted[job.id] = deleted
+            for label in sorted(deleted):
+                self._delete_checkpoint(job, label)
+            if not self._local_checkpoints(job):
+                continue
             # What the bucket already has, by label, so a restart does not re-upload.
             have = {_label_of_uri(u) for u in (row.get("checkpoints") or [])}
             for path in self._local_checkpoints(job):
                 if _label(path) in have:
                     self._published.setdefault(job.id, {})[str(path)] = "(in bucket)"
-            asked = set(row.get("publish_requests") or []) - have
+            asked = set(row.get("publish_requests") or []) - have - deleted
             if asked - self._requested.get(job.id, set()):
                 _log(f"{job.character} v{job.version}: asked to publish {sorted(asked)}")
             self._requested[job.id] = asked
@@ -240,14 +270,93 @@ class Poller:
             # row still says running with "0 of 1 in the bucket" and nothing will ever
             # finish it. Once everything wanted is up -- the sweep above queues what is
             # missing -- say so. Me v2 sat like that after the 15:25 reboot on 2026-09-08.
-            if (job.phase == "completed" and row.get("status") in ("running", "claimed")
-                    and not self._unpublished(job)
+            #
+            # AND A RUN WHOSE UPLOAD FAILED (#191). The end-of-run report said failed because a
+            # checkpoint could not be uploaded; the retry above has since sent it, so the row
+            # is wrong now in the other direction. Only a run that trained to completion HERE
+            # is flipped -- a run whose training failed never reaches this.
+            if (job.phase == "completed" and row.get("status") in ("running", "claimed", "failed")
+                    and not self._unpublished(job) and self._enough_published(job)
                     and not (self._uploader.get(job.id) and not self._uploader[job.id].done())):
-                published = len(self._published.get(job.id, {}))
                 _log(f"{job.character} v{job.version}: every wanted checkpoint is in the "
                      f"bucket; telling the API it is completed")
                 await self._patch(job, {"status": "completed",
-                                        "progress_log": f"{published} checkpoint(s) published"})
+                                        "progress_log": self._completed_line(job),
+                                        **({"error_message": ""}
+                                           if row.get("status") == "failed" else {})})
+
+    def _delete_checkpoint(self, job: Job, label: str) -> None:
+        """Delete one checkpoint's files from the run directory, for good (#191).
+
+        THE FILES OF ONE LABEL AND NOTHING ELSE. For LTX a checkpoint is three things beside
+        each other -- the `.comfy.safetensors` the engine loads, musubi's plain twin, and the
+        save-state directory that resumes from it -- and the final is the un-numbered set:
+
+            Brandy_v1-000002.comfy.safetensors   Brandy_v1.comfy.safetensors
+            Brandy_v1-000002.safetensors         Brandy_v1.safetensors
+            Brandy_v1-000002-state/              Brandy_v1-state/
+
+        SDXL (kohya) writes only `NAME_v1-000002.safetensors` / `NAME_v1.safetensors`. The
+        names are matched exactly against this run's output stem, one directory deep, so a
+        label can only ever reach its own files: an unknown label is refused, a label that
+        matches nothing is a no-op (which is what makes this idempotent -- the request stays on
+        the row and is seen again every tick), and another epoch's files never match.
+
+        The `.comfy` file goes LAST. It is what `_local_checkpoints` sees, so a delete that dies
+        half way leaves the label visible and the next tick finishes it, rather than leaving an
+        orphaned twin that nothing would ever look at again.
+        """
+        m = LABEL_RE.fullmatch(label or "")
+        if not m:
+            _log(f"!! {job.character} v{job.version}: refusing to delete checkpoint "
+                 f"{label!r} — not a checkpoint label")
+            return
+        out = recipe.run_dir(job.character, job.version, job.arch) / "output"
+        if not out.is_dir():
+            return
+        epoch = int(m.group(1)) if m.group(1) else None
+        name_re = re.compile(re.escape(f"{job.character}_v{job.version}")
+                             + r"(?:-(\d+))?(\.comfy\.safetensors|\.safetensors|-state)")
+        doomed: list[Path] = []
+        for child in out.iterdir():
+            nm = name_re.fullmatch(child.name)
+            if not nm:
+                continue
+            if (int(nm.group(1)) if nm.group(1) else None) != epoch:
+                continue
+            doomed.append(child)
+        if not doomed:
+            return
+        if any(str(p) in self._inflight for p in doomed):
+            # Uploading right now. Pulling the file out from under the PUT would fail it
+            # half way; the request stays on the row, so the next tick after it lands does it.
+            return
+        doomed.sort(key=lambda p: (p.name.endswith(".comfy.safetensors"), p.name))
+        freed, gone = 0, []
+        for p in doomed:
+            try:
+                size = _size_of(p)
+                if p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                freed += size
+                gone.append(p.name)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                _log(f"!! could not delete {p}: {e} — will try again next tick")
+                continue
+            # Forget it everywhere, so nothing queues, retries or counts it.
+            self._seen.pop(str(p), None)
+            self._failed.get(job.id, {}).pop(str(p), None)
+            self._published.get(job.id, {}).pop(str(p), None)
+            q = self._queue.get(job.id)
+            if q and p in q:
+                q.remove(p)
+        if gone:
+            _log(f"{job.character} v{job.version}: deleted {label} as asked — "
+                 f"{', '.join(gone)} ({freed / 1024 ** 3:.2f} GB freed)")
 
     # ------------------------------------------------------------- checkpoints
 
@@ -268,12 +377,43 @@ class Poller:
                [f for f in files if not EPOCH_RE.search(f.name)]
 
     def _wanted(self, job: Job, path: Path) -> bool:
-        """Should this file go to the bucket? The final always; every epoch only when the
-        run asked for "all"; anything else only when the console asked for it by name."""
+        """Should this file go to the bucket? Never once the console deleted it. Otherwise by
+        the run's policy -- "none" nothing, "final" the final, "all" every epoch -- plus
+        anything the console asked for by name."""
         label = _label(path)
-        if label == "final" or self._policy.get(job.id, "final") == "all":
+        if label in self._deleted.get(job.id, set()):
+            return False
+        policy = self._policy.get(job.id, "final")
+        if policy == "all" or (label == "final" and policy == "final"):
             return True
         return label in self._requested.get(job.id, set())
+
+    def _backing_off(self, job: Job, path: Path) -> bool:
+        """Did this file fail recently enough that it is not to be tried again yet?"""
+        f = self._failed.get(job.id, {}).get(str(path))
+        return f is not None and time.time() < f[1]
+
+    def _fail(self, job: Job, path: Path) -> None:
+        """Record a failure and when to try again: UPLOAD_RETRY_S, doubling, capped."""
+        n = self._failed.get(job.id, {}).get(str(path), (0, 0.0))[0] + 1
+        wait = min(UPLOAD_RETRY_MAX_S, UPLOAD_RETRY_S * 2 ** (n - 1))
+        self._failed.setdefault(job.id, {})[str(path)] = (n, time.time() + wait)
+        _log(f"{path.name}: failure {n}; trying again in {wait / 60:.0f} min")
+
+    def _enough_published(self, job: Job) -> bool:
+        """Is "completed" true of this run? Under "none" nothing has to be in the bucket --
+        testing first IS the point. Under "final"/"all" a run with nothing uploaded did not
+        produce a LoRA anyone can use."""
+        return bool(self._published.get(job.id)) or self._policy.get(job.id, "final") == "none"
+
+    def _completed_line(self, job: Job) -> str:
+        published = len(self._published.get(job.id, {}))
+        left = len(self._local_checkpoints(job)) - published
+        if self._policy.get(job.id, "final") == "none" and left > 0:
+            head = f"{published} checkpoint(s) published, " if published else ""
+            return (f"{head}{left} checkpoint(s) on the trainer — upload or delete each from "
+                    f"the Training page")
+        return f"{published} checkpoint(s) published"
 
     @staticmethod
     def _readable(path: Path) -> bool:
@@ -324,10 +464,12 @@ class Poller:
         if not (enabled() and job.remote_id):
             return
         done = self._published.setdefault(job.id, {})
-        failed = self._failed.setdefault(job.id, [])
         queue = self._queue.setdefault(job.id, [])
+        # A deleted label that was queued before the delete arrived comes out of the queue.
+        gone = self._deleted.get(job.id, set())
+        queue[:] = [p for p in queue if _label(p) not in gone]
         for path in self._local_checkpoints(job):
-            if (str(path) in done or str(path) in failed or path in queue
+            if (str(path) in done or self._backing_off(job, path) or path in queue
                     or str(path) in self._inflight):
                 continue
             if not self._wanted(job, path):
@@ -338,7 +480,8 @@ class Poller:
                          f"NOT publishing it. If the host reset right after it was written, "
                          f"the .safetensors twin beside it is usually intact: regenerate with "
                          f"musubi_tuner.ltx_2.convert_lora_to_comfy.")
-                    failed.append(str(path))
+                    # Backed off like an upload failure, so a regenerated file is noticed.
+                    self._fail(job, path)
                     continue
                 queue.append(path)
         task = self._uploader.get(job.id)
@@ -355,6 +498,8 @@ class Poller:
             final = [p for p in queue if not EPOCH_RE.search(p.name)]
             path = final[0] if final else queue[0]
             queue.remove(path)
+            if _label(path) in self._deleted.get(job.id, set()) or not path.exists():
+                continue    # deleted while it waited
             self._inflight.add(str(path))
             try:
                 await self._publish(job, path)
@@ -415,8 +560,7 @@ class Poller:
         while True:
             self._sweep_checkpoints(job)
             task = self._uploader.get(job.id)
-            failed = self._failed.get(job.id, [])
-            waiting = [p for p in self._unpublished(job) if str(p) not in failed]
+            waiting = [p for p in self._unpublished(job) if not self._backing_off(job, p)]
             busy = task is not None and not task.done()
             if not waiting and not busy:
                 return
@@ -481,10 +625,11 @@ class Poller:
             if r.status_code >= 400:
                 raise RuntimeError(f"{label}: the API refused the commit: {r.text[:300]}")
             self._published.setdefault(job.id, {})[str(path)] = target["uri"]
+            self._failed.get(job.id, {}).pop(str(path), None)
             _log(f"published {label} in {(time.time() - t0) / 60:.1f} min")
         except Exception as e:
-            self._failed.setdefault(job.id, []).append(str(path))
             _log(f"could not publish {path.name}: {e}")
+            self._fail(job, path)
         finally:
             self._current.pop(job.id, None)
             self._sent.pop(job.id, None)
@@ -540,19 +685,22 @@ class Poller:
             await self._patch(job, dict(body, status="running"))
             await self._drain_uploads(job)
             missing = self._unpublished(job)
-            published = self._published.get(job.id, {})
-            if missing or not published:
+            if missing or not self._enough_published(job):
                 # The run trained, and that is not the same as the run having produced a LoRA
                 # anyone can use. A green row with the final checkpoint absent is what this
                 # replaces; better a red one that says where the files are.
+                #
+                # Not under "none" with nothing asked for (#191): uploading nothing is what
+                # was asked, and the checkpoints are waiting on the Training page.
                 body["status"] = "failed"
                 body["error_message"] = (
                     f"trained, but {len(missing) or 'all'} checkpoint(s) could not be uploaded: "
                     + ", ".join(Path(p).name for p in missing)
-                    + f". They are on the trainer under {recipe.run_dir(job.character, job.version, job.arch)}/output")
+                    + f". They are on the trainer under {recipe.run_dir(job.character, job.version, job.arch)}/output"
+                    + " — it keeps retrying, and the run turns completed if they get there")
                 body["progress_log"] = body["error_message"]
             else:
-                body["progress_log"] = f"{len(published)} checkpoint(s) published"
+                body["progress_log"] = self._completed_line(job)
         if not body:
             return
         await self._patch(job, body)
@@ -579,6 +727,22 @@ class Poller:
 def _label(path: Path) -> str:
     m = EPOCH_RE.search(path.name)
     return f"e{int(m.group(1)):02d}" if m else "final"
+
+
+def _policy_of(row: dict) -> str:
+    """The run's upload policy. A row with none recorded predates the choice and behaves as it
+    always did ("final"); the API stamps "none" on every new run by default (#191)."""
+    return (row.get("config") or {}).get("publish") or "final"
+
+
+def _size_of(path: Path) -> int:
+    """Bytes on disk, a directory's summed -- for the "GB freed" line, never load-bearing."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        return path.lstat().st_size
+    except OSError:
+        return 0
 
 
 def _label_of_uri(uri: str) -> str:
