@@ -315,12 +315,30 @@ def base_checkpoint_for(config: dict | None) -> str:
     return checkpoint_path(name)
 
 
-def sdxl_dataset_toml(run: Path, num_repeats: int, keep_tokens: int = 1) -> str:
-    """kohya's dataset config. ONE subset: SDXL is single-identity (no joint runs, no
-    regularization group -- the aio runs had neither).
+def sdxl_dataset_toml(run: Path, num_repeats: int, keep_tokens: int = 1,
+                      subsets: list[dict] | None = None) -> str:
+    """kohya's dataset config.
 
-    shuffle_caption off and keep_tokens 1, as aio: the trigger is the first tag and stays
-    there. caption_dropout 0."""
+    SOLO (no `subsets`): ONE subset, byte-identical to what every run before #184 wrote --
+    no regularization group, as aio had none. shuffle_caption off and keep_tokens 1, as aio:
+    the trigger is the first tag and stays there. caption_dropout 0.
+
+    A PAIR (#184) passes `subsets`, one per group ({data, num_repeats, keep_tokens}): each
+    group's own repeats, and keep_tokens covering its whole prefix ("k3lly, d@vid, 1girl,
+    1boy" is 4) so nothing the identity binds to is ever shuffled or dropped."""
+    if subsets is None:
+        body = f"""[[datasets]]
+  [[datasets.subsets]]
+    image_dir = "{run}/data"
+    num_repeats = {num_repeats}
+"""
+    else:
+        body = "[[datasets]]\n" + "\n".join(
+            f"""  [[datasets.subsets]]
+    image_dir = "{s['data']}"
+    num_repeats = {s['num_repeats']}
+    keep_tokens = {s['keep_tokens']}
+""" for s in subsets)
     return f"""[general]
 enable_bucket = true
 bucket_no_upscale = true
@@ -333,11 +351,7 @@ keep_tokens = {keep_tokens}
 shuffle_caption = false
 caption_dropout_rate = 0.0
 
-[[datasets]]
-  [[datasets.subsets]]
-    image_dir = "{run}/data"
-    num_repeats = {num_repeats}
-"""
+{body}"""
 
 
 def sdxl_train_cmd(run: Path, character: str, version: int, config: dict,

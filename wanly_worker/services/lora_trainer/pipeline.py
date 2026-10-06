@@ -236,40 +236,70 @@ async def stage(job: Job, groups: list[dict]) -> Path:
 
 
 async def _stage_sdxl(job: Job, groups: list[dict]) -> Path:
-    """Stage an SDXL run (#175): one group, images only, then WD14 tags them.
+    """Stage an SDXL run (#175): images only, then WD14 tags them.
 
-    ONE GROUP. The aio recipe is single-identity; a joint run's composition and regularization
-    groups are an LTX experiment with no SDXL counterpart, and silently training only group 0
-    would hand back a LoRA that is not what was asked for.
+    SOLO is one group, tagged under the bare trigger -- the aio recipe, staged exactly as it
+    always was. The incoming captions are not used: they are qwen sentences written for LTX,
+    and this base was trained, and is prompted, in booru tags.
 
-    THE INCOMING CAPTIONS ARE NOT USED. They are qwen sentences written for LTX; this base was
-    trained, and is prompted, in booru tags. The tagger writes each image's .txt instead, with
-    the trigger first -- which is also why there is no length check to make here.
+    A PAIR (#184) is the LTX joint shape: member A, member B, and the composition set of both
+    in frame. Each group gets its own `dataN/` and its own WD14 pass, and each group's tags
+    are prefixed with the phrase the API sent as that group's captions -- "k3lly, 1girl",
+    "k3lly, d@vid, 1girl, 1boy". One phrase per group: the captions are placeholders for it,
+    so a group whose captions disagree is a contract mismatch and is refused.
+
+    NO REGULARIZATION. aio had none, and there is no SDXL pool to draw one from.
     """
-    if len(groups) != 1:
+    reg = [gi for gi, g in enumerate(groups) if g.get("kind") == "regularization"]
+    if reg:
         raise PipelineError(
-            f"an SDXL run takes one identity group; this job has {len(groups)}. Joint, "
-            f"composition and regularization groups are LTX-only.")
-    g = groups[0]
-    if not isinstance(g["num_repeats"], int) or g["num_repeats"] < 1:
-        raise PipelineError(f"num_repeats={g['num_repeats']!r}; it must be >= 1")
+            f"an SDXL run has no regularization group; this job has {len(reg)}. "
+            f"Regularization is LTX-only.")
+    for gi, g in enumerate(groups):
+        if not isinstance(g["num_repeats"], int) or g["num_repeats"] < 1:
+            raise PipelineError(f"group {gi} num_repeats={g['num_repeats']!r}; it must be >= 1")
+    prefixes = [job.trigger] if len(groups) == 1 else [_sdxl_prefix(gi, g)
+                                                        for gi, g in enumerate(groups)]
 
     run = recipe.run_dir(job.character, job.version, "sdxl")
     _clear_run_dir(run)
     for sub in ("data", "output", "logs"):
         (run / sub).mkdir(parents=True, exist_ok=True)
 
-    _log(job, f"staging {len(g['images'])} images ({g['num_repeats']} repeats, WD14 tags)")
-    for i, (name, blob) in enumerate(g["images"]):
-        ext = Path(name).suffix.lower() or ".jpg"
-        (run / "data" / f"sel_{i:03d}{ext}").write_bytes(blob)
-
-    await _stage_cmd(job, run, "tagging (WD14)",
-                     [recipe.SDXL_PYTHON, str(Path(__file__).with_name("wd14.py")),
-                      str(run / "data"), job.trigger, recipe.WD14_DIR],
-                     "00_tag.log", cwd=str(run))
-    (run / "dataset.toml").write_text(recipe.sdxl_dataset_toml(run, g["num_repeats"]))
+    subsets = []
+    for gi, (g, prefix) in enumerate(zip(groups, prefixes)):
+        # Group 0 keeps the bare dir, so a solo run stages exactly as it did before #184.
+        data_dir = run / "data" if gi == 0 else run / f"data{gi}"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _log(job, f"staging group {gi}" + (f" ({g['kind']})" if g.get("kind") else "")
+                  + f": {len(g['images'])} images ({g['num_repeats']} repeats, WD14 tags "
+                  + f"after {prefix!r})")
+        for i, (name, blob) in enumerate(g["images"]):
+            ext = Path(name).suffix.lower() or ".jpg"
+            (data_dir / f"sel_{i:03d}{ext}").write_bytes(blob)
+        await _stage_cmd(job, run, "tagging (WD14)" if gi == 0 else f"tagging group {gi} (WD14)",
+                         [recipe.SDXL_PYTHON, str(Path(__file__).with_name("wd14.py")),
+                          str(data_dir), prefix, recipe.WD14_DIR],
+                         "00_tag.log" if gi == 0 else f"00_tag{gi}.log", cwd=str(run))
+        subsets.append({"data": str(data_dir), "num_repeats": g["num_repeats"],
+                        "keep_tokens": len([t for t in prefix.split(",") if t.strip()])})
+    if len(subsets) == 1:
+        toml = recipe.sdxl_dataset_toml(run, subsets[0]["num_repeats"])
+    else:
+        toml = recipe.sdxl_dataset_toml(run, 0, subsets=subsets)
+    (run / "dataset.toml").write_text(toml)
     return run
+
+
+def _sdxl_prefix(gi: int, g: dict) -> str:
+    """The one WD14 prefix a pair's group carries in its captions (#184)."""
+    caps = {str(c).strip() for c in (g.get("captions") or [])}
+    if len(caps) != 1 or not next(iter(caps)):
+        raise PipelineError(
+            f"group {gi} ({g.get('kind') or 'identity'}) of an SDXL pair needs one tag prefix "
+            f"as its captions (e.g. \"k3lly, 1girl\"); it has {len(caps)} distinct "
+            f"caption(s). The API sends that prefix; an older API does not support SDXL pairs.")
+    return next(iter(caps))
 
 
 async def _stage_cmd(job: Job, run: Path, label: str, argv: list[str], logfile: str,

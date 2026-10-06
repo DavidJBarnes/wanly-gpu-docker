@@ -83,6 +83,9 @@ def main(image_dir: str, trigger: str, model_dir: str) -> int:
     out = session.get_outputs()[0].name
 
     written = []
+    #: What the TAGGER said, behind a one-token prefix: a pair's prefix ("k3lly, 1girl", #184)
+    #: is several tags, and they must not count as evidence the tagger saw anything.
+    tagged = []
     for path in _images(Path(image_dir)):
         a = np.array(Image.open(path).convert("RGB"))[:, :, ::-1]  # RGB -> BGR
         h, w = a.shape[:2]
@@ -92,12 +95,14 @@ def main(image_dir: str, trigger: str, model_dir: str) -> int:
                    mode="constant", constant_values=255)
         a = np.array(Image.fromarray(a[:, :, ::-1]).resize((448, 448), Image.LANCZOS))[:, :, ::-1]
         probs = session.run([out], {inp: np.expand_dims(a.astype(np.float32), 0)})[0][0]
-        text = caption(trigger, [names[i] for i, p in enumerate(probs) if p > THRESHOLD])
+        tags = [names[i] for i, p in enumerate(probs) if p > THRESHOLD]
+        text = caption(trigger, tags)
+        tagged.append(caption("_", tags))
         path.with_suffix(".txt").write_text(text + "\n")
         written.append(text)
         print(f"{path.name}: {text}", flush=True)
 
-    if looks_broken(written):
+    if looks_broken(tagged):
         print("every caption is the broken-preprocessing signature "
               f"({', '.join(sorted(GARBAGE))}) -- refusing to train on them", flush=True)
         return 3
