@@ -99,6 +99,38 @@ DEFAULTS = {
 }
 
 
+#: THE CLIP GROUP (#189): real 5-10 s clips of the character, trained beside the stills so the
+#: LoRA sees the face in motion -- expressions changing, head turns -- which no still carries.
+#:
+#: PROVISIONAL, EVERY NUMBER. None of these has been measured; they are starting points until a
+#: run on the 3090 (seconds per step and peak VRAM) sets them. Expect a video step to be much
+#: slower than a still one. Why each starts where it does:
+#:
+#:     resolution     512    NOT the stills' 1024. A 49-frame sample at the 1024 ceiling is far
+#:                           past the ~14 GB the stills recipe measured. Still a ceiling
+#:                           (bucket_no_upscale is in [general]), and the API caps clips at 768.
+#:     target_frames  49     8n+1, the frame counts LTX's VAE packs into whole latent frames.
+#:                           Anything else is padded by repeating the last frame -- a frozen
+#:                           tail the LoRA would learn as motion.
+#:     windows        3      frame_extraction "uniform" + frame_sample K spreads K 49-frame
+#:                           windows evenly across the clip, so a 10 s clip trains on its start,
+#:                           middle and end rather than its first two seconds only.
+#:     num_repeats    5      half the stills' 10: each clip already yields `windows` samples.
+#:
+#: NO RESAMPLING. The API normalizes every clip to 25 fps, which is musubi's LTX2 target_fps
+#: default, so no source_fps is written and no frame is dropped or duplicated.
+CLIP_DEFAULTS = {
+    "resolution": 512,
+    "target_frames": 49,
+    "windows": 3,
+    "num_repeats": 5,
+}
+#: What a clip group's files are, and what a stills group's are not. musubi picks files by
+#: extension per directory kind, so a file of the wrong kind is silently skipped -- and its
+#: caption with it -- rather than refused.
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm"}
+
+
 def run_dir(character: str, version: int, arch: str = "ltx") -> Path:
     """One directory per VERSION. Never per character.
 
@@ -128,13 +160,13 @@ def dataset_toml(run: Path, groups: list[dict] | None = None) -> str:
     if not groups:
         groups = [{"data": f"{run}/data", "cache": f"{run}/cache",
                    "num_repeats": DEFAULTS["num_repeats"]}]
-    entries = "\n\n".join(
-        f'[[datasets]]\n'
-        f'image_directory = "{g["data"]}"\n'
-        f'cache_directory = "{g["cache"]}"\n'
-        f'resolution = [{DEFAULTS["resolution"]}, {DEFAULTS["resolution"]}]\n'
-        f'num_repeats = {g["num_repeats"]}'
-        for g in groups)
+    entries = "\n\n".join(_clip_entry(g) if g.get("kind") == "clip" else
+                           f'[[datasets]]\n'
+                           f'image_directory = "{g["data"]}"\n'
+                           f'cache_directory = "{g["cache"]}"\n'
+                           f'resolution = [{DEFAULTS["resolution"]}, {DEFAULTS["resolution"]}]\n'
+                           f'num_repeats = {g["num_repeats"]}'
+                           for g in groups)
     return f"""[general]
 caption_extension = ".txt"
 batch_size = 1
@@ -143,6 +175,20 @@ bucket_no_upscale = true
 
 {entries}
 """
+
+
+def _clip_entry(g: dict) -> str:
+    """A clip group's `[[datasets]]` entry (#189): musubi's video dataset, `windows` uniform
+    49-frame samples per clip. See CLIP_DEFAULTS for why each number is what it is."""
+    res = CLIP_DEFAULTS["resolution"]
+    return (f'[[datasets]]\n'
+            f'video_directory = "{g["data"]}"\n'
+            f'cache_directory = "{g["cache"]}"\n'
+            f'resolution = [{res}, {res}]\n'
+            f'num_repeats = {g["num_repeats"]}\n'
+            f'target_frames = [{CLIP_DEFAULTS["target_frames"]}]\n'
+            f'frame_extraction = "uniform"\n'
+            f'frame_sample = {g.get("windows") or CLIP_DEFAULTS["windows"]}')
 
 
 def cache_latents_cmd(run: Path, ckpt: str | None = None) -> list[str]:
@@ -208,15 +254,25 @@ def train_cmd(run: Path, character: str, version: int, config: dict,
     ]
 
 
-def samples_per_epoch(groups: list[tuple[int, int | None]]) -> int:
+def samples_per_epoch(groups: list[tuple]) -> int:
     """One epoch, in samples (= steps at batch_size 1): SUM over groups of images x repeats.
 
     `groups` is [(image_count, num_repeats), ...]; a repeats of None is DEFAULTS'. Per group
     because the repeats are (#145) -- a 50-image identity at 10 beside a 200-image
     regularization pool at 1 is 700 samples, and "250 images x 10" would put the epoch at 2500
     and label every checkpoint with a step it was never written at.
+
+    A CLIP GROUP (#189) passes a third element, its `windows`: musubi cuts that many samples
+    from every clip, so it counts clips x windows x repeats -- the API's arithmetic, which is
+    what keeps the step each checkpoint is labelled with in agreement on both sides. A pair
+    (every caller before #189) is windows 1.
     """
-    return max(1, sum(n * (r or DEFAULTS["num_repeats"]) for n, r in groups))
+    total = 0
+    for g in groups:
+        n, r = g[0], g[1]
+        w = g[2] if len(g) > 2 and g[2] else 1
+        total += n * (r or DEFAULTS["num_repeats"]) * w
+    return max(1, total)
 
 
 def estimated_epochs(image_count: int, steps: int, repeats: int | None = None, *,

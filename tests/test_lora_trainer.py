@@ -1585,6 +1585,122 @@ class TestRepeatsArePerGroup:
         assert Job(**{**old, "effective_repeats": 5}).per_epoch == 250
 
 
+class TestTheClipGroup:
+    """#189: real clips of the character, trained beside its stills as a musubi VIDEO dataset.
+    The stills-only toml must not move a byte, an epoch counts clips x windows x repeats exactly
+    as the API does, and SDXL refuses clips outright."""
+
+    #: What main wrote before #189, captured verbatim. The toml is the regression trail.
+    STILLS_TOML = (
+        '[general]\ncaption_extension = ".txt"\nbatch_size = 1\nenable_bucket = true\n'
+        'bucket_no_upscale = true\n\n'
+        '[[datasets]]\nimage_directory = "/r/data"\ncache_directory = "/r/cache"\n'
+        'resolution = [1024, 1024]\nnum_repeats = 10\n\n'
+        '[[datasets]]\nimage_directory = "/r/data1"\ncache_directory = "/r/cache1"\n'
+        'resolution = [1024, 1024]\nnum_repeats = 2\n')
+
+    def _job(self):
+        from wanly_worker.services.lora_trainer.jobs import Job
+        return Job(id="c", character="k3lly", trigger="k3lly", version=4, steps=1200)
+
+    def _groups(self, **clip):
+        return [
+            {"images": [("a.jpg", b"x"), ("b.png", b"y")], "num_repeats": 10,
+             "kind": "identity", "captions": ["k3lly, woman, smiling", "k3lly, woman, side"]},
+            {"images": [("c0.mp4", b"v0"), ("c1.mp4", b"v1")], "num_repeats": 5,
+             "kind": "clip", "windows": 3,
+             "captions": ["k3lly, woman, turns her head", "k3lly, woman, laughs"], **clip},
+        ]
+
+    def test_a_stills_only_toml_is_byte_identical(self):
+        from wanly_worker.services.lora_trainer.recipe import dataset_toml
+        assert dataset_toml(Path("/r"), [
+            {"data": "/r/data", "cache": "/r/cache", "num_repeats": 10},
+            {"data": "/r/data1", "cache": "/r/cache1", "num_repeats": 2}]) == self.STILLS_TOML
+        single = self.STILLS_TOML.split("\n\n[[datasets]]\nimage_directory = \"/r/data1\"")[0]
+        assert dataset_toml(Path("/r")) == single + "\n"
+
+    def test_a_staged_stills_only_run_writes_the_same_bytes(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        run = _run(pipeline.stage(self._job(), [
+            {"images": [("a.jpg", b"x")], "num_repeats": 10, "captions": ["a"]},
+            {"images": [("b.jpg", b"y")], "num_repeats": 2, "captions": ["b"],
+             "kind": "regularization"}]))
+        assert (run / "dataset.toml").read_text() == \
+            self.STILLS_TOML.replace("/r/", f"{run}/")
+
+    def test_the_mixed_toml(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        run = _run(pipeline.stage(self._job(), self._groups()))
+        assert (run / "dataset.toml").read_text() == (
+            '[general]\ncaption_extension = ".txt"\nbatch_size = 1\nenable_bucket = true\n'
+            'bucket_no_upscale = true\n\n'
+            f'[[datasets]]\nimage_directory = "{run}/data"\ncache_directory = "{run}/cache"\n'
+            'resolution = [1024, 1024]\nnum_repeats = 10\n\n'
+            f'[[datasets]]\nvideo_directory = "{run}/data1"\ncache_directory = "{run}/cache1"\n'
+            'resolution = [512, 512]\nnum_repeats = 5\ntarget_frames = [49]\n'
+            'frame_extraction = "uniform"\nframe_sample = 3\n')
+        # The mp4 keeps its extension -- musubi picks video files by it -- and its caption
+        # sits beside it under the same stem.
+        assert (run / "data1" / "sel_000.mp4").read_bytes() == b"v0"
+        assert (run / "data1" / "sel_001.txt").read_text() == "k3lly, woman, laughs\n"
+        assert (run / "cache1").is_dir()
+
+    def test_the_windows_reach_the_toml(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        run = _run(pipeline.stage(self._job(), self._groups(windows=2)))
+        assert "frame_sample = 2\n" in (run / "dataset.toml").read_text()
+
+    def test_samples_per_epoch_counts_windows(self):
+        from wanly_worker.services.lora_trainer.recipe import samples_per_epoch
+        # 40 stills x 10 + 6 clips x 5 repeats x 3 windows.
+        assert samples_per_epoch([(40, 10), (6, 5, 3)]) == 400 + 90
+        assert samples_per_epoch([(40, 10, None)]) == 400, "no windows is one sample an item"
+        assert samples_per_epoch([(50, 10), (200, 1)]) == 700, "pairs are unchanged"
+
+    def test_the_run_records_the_clip_epoch(self, monkeypatch, tmp_path):
+        from wanly_worker.services.lora_trainer import app as app_mod
+        clips = tmp_path / "clips"
+        clips.mkdir()
+        for i in range(4):
+            (clips / f"{i}.mp4").write_bytes(b"v")
+        (clips / "stray.jpg").write_bytes(b"x")
+        req = app_mod.TrainRequest(
+            character="k3lly", trigger="k3lly", image_dir=_img_dir(tmp_path, "i", 8),
+            config={"num_repeats": 10},
+            identities=[{"image_dir": str(clips), "kind": "clip"}])
+        job, seen, _ = _run_until_preflight(monkeypatch, tmp_path, req)
+        # Absent repeats/windows on a clip group are the CLIP defaults, not the stills' 10.
+        assert job.samples_per_epoch == 8 * 10 + 4 * 5 * 3
+        assert seen["per_epoch"] == 140
+
+    def test_a_clip_in_a_stills_group_is_refused(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        g = self._groups()
+        g[0]["images"][1] = ("b.mp4", b"y")
+        with pytest.raises(pipeline.PipelineError, match="still group"):
+            _run(pipeline.stage(self._job(), g))
+
+    def test_a_still_in_a_clip_group_is_refused(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        g = self._groups()
+        g[1]["images"][0] = ("c0.jpg", b"v0")
+        with pytest.raises(pipeline.PipelineError, match="clip group"):
+            _run(pipeline.stage(self._job(), g))
+
+    def test_sdxl_refuses_a_clip_group(self):
+        from wanly_worker.services.lora_trainer import pipeline
+        from wanly_worker.services.lora_trainer.jobs import Job
+        job = Job(id="s", character="k3lly", trigger="k3lly", version=3, steps=6528, arch="sdxl")
+        with pytest.raises(pipeline.PipelineError, match="no clip group"):
+            _run(pipeline.stage(job, self._groups()))
+
+    def test_the_poller_carries_windows(self):
+        import inspect
+        from wanly_worker.services.lora_trainer import poller as mod
+        assert '"windows": g.get("windows")' in inspect.getsource(mod.Poller.tick)
+
+
 class TestSDXL:
     """#175: SDXL character LoRAs for the START IMAGES, through the same trainer. The recipe is
     the aio runs (k3lly_aio-1_e8 / k3lly_aio-2_e12), read back out of those files' ss_*
