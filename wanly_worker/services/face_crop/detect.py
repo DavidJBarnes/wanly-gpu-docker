@@ -51,6 +51,17 @@ JPEG_QUALITY = int(os.environ.get("FACE_CROP_JPEG_QUALITY", "95"))
 #: but a minimum of 0.48 over the same set -- so padding everything would shift every score.
 RETRY_PAD = float(os.environ.get("FACE_DETECT_RETRY_PAD", "0.5"))
 
+#: HEAD-AND-SHOULDERS FRAMING (#187), in multiples of the detected face box's height. The box
+#: runs roughly brow to chin, so 0.6 above clears the hairline with a little room, and 1.5 below
+#: the chin reaches the collarbone and upper chest. A portrait, 4:5 (width / height) -- the
+#: standard portrait shape, and wide enough at that height to keep both shoulders.
+HS_ABOVE = float(os.environ.get("FACE_CROP_HS_ABOVE", "0.6"))
+HS_BELOW = float(os.environ.get("FACE_CROP_HS_BELOW", "1.5"))
+HS_ASPECT = float(os.environ.get("FACE_CROP_HS_ASPECT", "0.8"))
+
+#: The framings a crop can ask for. "face" is the original square crop and the default.
+FRAMINGS = ("face", "head_shoulders")
+
 _app = None
 
 
@@ -92,8 +103,34 @@ class Face:
     index: int
 
 
-def detect(image_bytes: bytes) -> list[Face]:
-    """Every face in one image, largest first."""
+def head_shoulders_box(x1: float, y1: float, x2: float, y2: float,
+                       w: int, h: int) -> tuple[int, int, int, int]:
+    """The head-and-shoulders window (#187) for one face box in a w x h image, as
+    (left, top, right, bottom).
+
+    SLID, NOT CLAMPED. The square face crop clamps at an image edge and comes back a little
+    narrower; here clamping would cut the shoulders off one side and change the aspect from
+    crop to crop. So the window moves back inside the image and keeps its shape. Only when the
+    photo is smaller than the window does it shrink -- from the bottom, keeping the head: a
+    portrait missing some chest is still a portrait, one missing the hairline is not. Never
+    padded with black, for the same reason as the face crop.
+    """
+    fh = y2 - y1
+    top = y1 - HS_ABOVE * fh
+    height = fh * (1 + HS_ABOVE + HS_BELOW)
+    width = height * HS_ASPECT
+    scale = min(1.0, w / width, h / height)
+    width, height = width * scale, height * scale
+    left = (x1 + x2) / 2 - width / 2
+    left = min(max(0.0, left), w - width)
+    top = min(max(0.0, top), h - height)
+    return (int(left), int(top), min(w, int(left + width)), min(h, int(top + height)))
+
+
+def detect(image_bytes: bytes, framing: str = "face") -> list[Face]:
+    """Every face in one image, largest first, cropped to `framing` (see FRAMINGS)."""
+    if framing not in FRAMINGS:
+        raise ValueError(f"framing {framing!r} is not one of {FRAMINGS}")
     import cv2
 
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -117,15 +154,18 @@ def detect(image_bytes: bytes) -> list[Face]:
     out: list[Face] = []
     for i, f in enumerate(faces):
         x1, y1, x2, y2 = [float(v) - offset for v in f.bbox]
-        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        # SQUARE, because a training crop with a varying aspect ratio buckets unpredictably and
-        # bucket_no_upscale means the bucket is whatever the image already is.
-        side = max(x2 - x1, y2 - y1) * (1 + PAD)
-        half = side / 2
-        # Clamped to the image rather than padded with black: a black border is a feature the
-        # model will happily learn.
-        left, top = max(0, int(cx - half)), max(0, int(cy - half))
-        right, bottom = min(w, int(cx + half)), min(h, int(cy + half))
+        if framing == "head_shoulders":
+            left, top, right, bottom = head_shoulders_box(x1, y1, x2, y2, w, h)
+        else:
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            # SQUARE, because a training crop with a varying aspect ratio buckets unpredictably
+            # and bucket_no_upscale means the bucket is whatever the image already is.
+            side = max(x2 - x1, y2 - y1) * (1 + PAD)
+            half = side / 2
+            # Clamped to the image rather than padded with black: a black border is a feature
+            # the model will happily learn.
+            left, top = max(0, int(cx - half)), max(0, int(cy - half))
+            right, bottom = min(w, int(cx + half)), min(h, int(cy + half))
         crop = img[top:bottom, left:right]
         if crop.size == 0:
             continue
