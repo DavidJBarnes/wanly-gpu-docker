@@ -177,6 +177,8 @@ class Poller:
                 "caption": g.get("caption"),
                 "captions": g.get("captions"),
                 "num_repeats": g.get("num_repeats"),
+                # A clip group's samples per clip (#189). Absent on every other kind.
+                "windows": g.get("windows"),
             }
             for g in (row.get("identities") or [])
         ]

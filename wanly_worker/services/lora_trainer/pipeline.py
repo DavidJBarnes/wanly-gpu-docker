@@ -168,11 +168,46 @@ def check_captions(groups: list[dict]) -> None:
                 f"{blank[:10]}{'...' if len(blank) > 10 else ''}")
 
 
+def _windows(g: dict) -> int:
+    """A clip group's samples per clip (#189): what the API sent, else the provisional default."""
+    return g.get("windows") or recipe.CLIP_DEFAULTS["windows"]
+
+
+def check_media(gi: int, g: dict) -> None:
+    """Refuse a group whose files are the wrong kind for its directory (#189).
+
+    musubi chooses files BY EXTENSION per directory kind: an image_directory ignores an .mp4
+    and a video_directory ignores a .jpg. Neither is an error there -- the file is skipped,
+    its caption is left over, and the run trains on less than the console says with nothing in
+    any log. A clip that reached a stills group (or the reverse) is a contract slip upstream,
+    so it is refused here, before the run directory is touched.
+    """
+    clip = g.get("kind") == "clip"
+    exts = [Path(name).suffix.lower() for name, _ in g["images"]]
+    # A stills group refuses only VIDEO, not "anything unlisted": musubi reads more image
+    # formats than any list here would name, and refusing those would be a new failure for
+    # no gain.
+    bad = [name for (name, _), e in zip(g["images"], exts)
+           if e and ((e not in recipe.VIDEO_EXTS) if clip else (e in recipe.VIDEO_EXTS))]
+    kind = "clip" if clip else "still"
+    if bad:
+        raise PipelineError(
+            f"group {gi} ({g.get('kind') or 'identity'}) is a {kind} group but holds "
+            f"{len(bad)} file(s) that are not: {bad[:5]}{'...' if len(bad) > 5 else ''}. "
+            f"Clips belong in a kind \"clip\" group, stills everywhere else.")
+    if clip:
+        w = g.get("windows")
+        if w is not None and (not isinstance(w, int) or w < 1):
+            raise PipelineError(f"group {gi} (clip) windows={w!r}; it must be >= 1")
+
+
 async def stage(job: Job, groups: list[dict]) -> Path:
     """Write the dataset(s) and the config. Returns the run directory.
 
     `groups` is one entry per group: {images: [(name, bytes)], captions | caption,
-    num_repeats, kind}. `captions` is the per-image list (#145) and wins; `caption` is the
+    num_repeats, kind, windows}. A `kind: "clip"` group (#189) holds mp4s, not images: it
+    stages the same way into its own dirs and becomes a VIDEO dataset entry with `windows`
+    samples per clip (recipe.CLIP_DEFAULTS). `captions` is the per-image list (#145) and wins; `caption` is the
     single string every image of a legacy group shares. ONE entry is the single-identity
     shape every run before #102 wrote — same directories (`data/`, `cache/`), same toml
     bytes. A joint run writes `data0/`+`cache0/`, `data1/`+`cache1/`, per-group captions and
@@ -190,6 +225,7 @@ async def stage(job: Job, groups: list[dict]) -> Path:
     for gi, g in enumerate(groups):
         if not isinstance(g["num_repeats"], int) or g["num_repeats"] < 1:
             raise PipelineError(f"group {gi} num_repeats={g['num_repeats']!r}; it must be >= 1")
+        check_media(gi, g)
 
     run = recipe.run_dir(job.character, job.version)
     _clear_run_dir(run)
@@ -208,13 +244,16 @@ async def stage(job: Job, groups: list[dict]) -> Path:
             cache_dir.mkdir(parents=True, exist_ok=True)
 
         caps = g.get("captions")
+        clip = g.get("kind") == "clip"
         _log(job, f"staging group {gi}"
                   + (f" ({g['kind']})" if g.get("kind") else "")
-                  + f": {len(g['images'])} images ({g['num_repeats']} repeats, "
+                  + (f": {len(g['images'])} clips ({_windows(g)} windows, " if clip
+                     else f": {len(g['images'])} images (")
+                  + f"{g['num_repeats']} repeats, "
                   + ("per-image captions" if caps is not None else "one shared caption")
                   + ")")
         for i, (name, blob) in enumerate(g["images"]):
-            ext = Path(name).suffix.lower() or ".jpg"
+            ext = Path(name).suffix.lower() or (".mp4" if clip else ".jpg")
             (data_dir / f"sel_{i:03d}{ext}").write_bytes(blob)
             # Captions bind whatever they do not name. All 13 of p@y's read "p@y, woman" over
             # close-ups, so the trigger carried close-up framing as part of its identity --
@@ -228,8 +267,11 @@ async def stage(job: Job, groups: list[dict]) -> Path:
                 # what those jobs always got; check_captions keeps it off the new shape.
                 text = g.get("caption") or f"{job.trigger}, woman"
             (data_dir / f"sel_{i:03d}.txt").write_text(text + "\n")
-        toml_groups.append({"data": str(data_dir), "cache": str(cache_dir),
-                            "num_repeats": g["num_repeats"]})
+        entry = {"data": str(data_dir), "cache": str(cache_dir),
+                 "num_repeats": g["num_repeats"]}
+        if clip:
+            entry.update(kind="clip", windows=_windows(g))
+        toml_groups.append(entry)
 
     (run / "dataset.toml").write_text(recipe.dataset_toml(run, toml_groups))
     return run
@@ -255,6 +297,14 @@ async def _stage_sdxl(job: Job, groups: list[dict]) -> Path:
         raise PipelineError(
             f"an SDXL run has no regularization group; this job has {len(reg)}. "
             f"Regularization is LTX-only.")
+    # NO CLIPS (#189). The API drops them from an SDXL plan; one arriving anyway would be fed
+    # to WD14 and kohya as if it were an image. Refused, not skipped: a silently smaller
+    # dataset is the failure this whole trainer is built to avoid.
+    clips = [gi for gi, g in enumerate(groups) if g.get("kind") == "clip"]
+    if clips:
+        raise PipelineError(
+            f"an SDXL run has no clip group; this job has {len(clips)}. Clips train LTX "
+            f"LoRAs only -- the API should have dropped them from an SDXL plan.")
     for gi, g in enumerate(groups):
         if not isinstance(g["num_repeats"], int) or g["num_repeats"] < 1:
             raise PipelineError(f"group {gi} num_repeats={g['num_repeats']!r}; it must be >= 1")

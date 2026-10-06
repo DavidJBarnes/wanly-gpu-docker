@@ -44,14 +44,15 @@ class TrainRequest(BaseModel):
     #: PER-IMAGE CAPTIONS for group 0 (#145), parallel to image_urls. Present, it replaces
     #: `caption`; absent (a legacy row, retried), `caption` applies to every image as before.
     captions: list[str] | None = None
-    #: THE EXTRA GROUPS (#102, #106, #145). ABSENT means single-identity. Each entry:
-    #: {character, trigger, gender, caption, captions, kind, image_urls, num_repeats} --
-    #: presigned by the API alongside group 0's. `kind` is identity | composition |
-    #: regularization. An IDENTITY group has a trigger; a COMPOSITION group (#106) has none
-    #: and its captions name the people in its frames, which is what teaches the model they
-    #: appear together; a REGULARIZATION group has none either and usually its own, lower
-    #: num_repeats. `captions` is per image, parallel to image_urls; `caption` is the legacy
-    #: one-for-all string. The claim builds the list; a POST body may also give it directly.
+    #: THE EXTRA GROUPS (#102, #106, #145, #189). ABSENT means single-identity. Each entry:
+    #: {character, trigger, gender, caption, captions, kind, image_urls, num_repeats, windows}
+    #: -- presigned by the API alongside group 0's. `kind` is identity | composition |
+    #: regularization | clip. An IDENTITY group has a trigger; a COMPOSITION group (#106) has
+    #: none and its captions name the people in its frames, which is what teaches the model
+    #: they appear together; a REGULARIZATION group has none either and usually its own, lower
+    #: num_repeats. A CLIP group (#189) holds mp4s and carries `windows`, its samples per clip.
+    #: `captions` is per image, parallel to image_urls; `caption` is the legacy one-for-all
+    #: string. The claim builds the list; a POST body may also give it directly.
     identities: list[dict] = Field(default_factory=list)
     steps: int = Field(default=1200, ge=100, le=30000)
     config: dict = Field(default_factory=dict)
@@ -210,30 +211,41 @@ async def _run(job: Job, req: TrainRequest, on_progress=None) -> None:
                        "num_repeats": int((req.config or {}).get("num_repeats")
                                           or defaults["num_repeats"])}]
             for gi, g in enumerate(req.identities):
+                # A CLIP GROUP (#189) is mp4s, with its own repeats default and `windows`
+                # samples per clip. Absent fields fall to CLIP_DEFAULTS, not the stills'.
+                clip = g.get("kind") == "clip"
                 g_urls = g.get("image_urls") or []
                 if not g_urls and g.get("image_dir"):
                     d = Path(g["image_dir"])
+                    exts = recipe.VIDEO_EXTS if clip else {".jpg", ".jpeg", ".png", ".webp"}
                     g_images = [(f.name, f.read_bytes()) for f in sorted(d.iterdir())
-                                if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+                                if f.suffix.lower() in exts]
                 else:
                     g_images = await _fetch(client, g_urls)
                 if not g_images:
                     raise pipeline.PipelineError(
-                        f"group {gi + 2} has no images to train on")
-                groups.append({
+                        f"group {gi + 2} has no {'clips' if clip else 'images'} to train on")
+                group = {
                     "images": g_images,
                     "caption": g.get("caption"),
                     "captions": g.get("captions"),
                     "kind": g.get("kind"),
                     "num_repeats": int(g.get("num_repeats")
-                                       or defaults["num_repeats"]),
-                })
+                                       or (recipe.CLIP_DEFAULTS if clip
+                                           else defaults)["num_repeats"]),
+                }
+                if clip:
+                    group["windows"] = int(g.get("windows")
+                                           or recipe.CLIP_DEFAULTS["windows"])
+                groups.append(group)
                 job.images += len(g_images)
             # THE REAL EPOCH, per group (#145). A regularization pool rides at its own repeats,
             # so "total images x one repeats" is wrong in both directions: the disk gate
-            # over- or under-counts checkpoints, and every epoch's reported step is off.
+            # over- or under-counts checkpoints, and every epoch's reported step is off. A clip
+            # group (#189) also multiplies by its windows -- the API counts it that way, and
+            # the two must agree or every checkpoint's step label drifts from the console's.
             job.samples_per_epoch = recipe.samples_per_epoch(
-                [(len(g["images"]), g["num_repeats"]) for g in groups])
+                [(len(g["images"]), g["num_repeats"], g.get("windows") or 1) for g in groups])
             if req.identities:
                 # Still written for anything that reads a job snapshot's old field.
                 job.effective_repeats = max(g["num_repeats"] for g in groups)
