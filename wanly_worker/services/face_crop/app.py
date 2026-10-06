@@ -8,6 +8,8 @@ from __future__ import annotations
 import base64
 
 from fastapi import FastAPI
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from wanly_worker.services.face_crop import detect as fd
@@ -56,6 +58,9 @@ class CropRequest(BaseModel):
     #: face per photo -- but `false` is honest about two-person photos rather than silently
     #: picking the bigger woman.
     largest_only: bool = True
+    #: "face" (the square crop, and the default) or "head_shoulders" (#187): a 4:5 portrait
+    #: from just above the hairline to the upper chest.
+    framing: Literal["face", "head_shoulders"] = "face"
 
 
 class CropFace(BaseModel):
@@ -80,6 +85,9 @@ class CropResponse(BaseModel):
     #: face" is the number that tells you the source set is wrong.
     no_face: list[int]
     cos_floor: float
+    #: The framing these crops were cut to, echoed (#187). A service that predates framing
+    #: ignores the request field and sends face crops; without this the caller could not tell.
+    framing: str = "face"
 
 
 @app.get("/health")
@@ -104,7 +112,7 @@ async def crop(req: CropRequest):
     faces: list[CropFace] = []
     no_face: list[int] = []
     for i, b64 in enumerate(req.images):
-        found = fd.detect(base64.b64decode(b64))
+        found = fd.detect(base64.b64decode(b64), req.framing)
         if not found:
             no_face.append(i)
             continue
@@ -117,4 +125,5 @@ async def crop(req: CropRequest):
                 cos=fd.cosine(f.embedding, mean) if mean else None,
                 embedding=f.embedding,
             ))
-    return CropResponse(faces=faces, no_face=no_face, cos_floor=fd.COS_FLOOR)
+    return CropResponse(faces=faces, no_face=no_face, cos_floor=fd.COS_FLOOR,
+                        framing=req.framing)

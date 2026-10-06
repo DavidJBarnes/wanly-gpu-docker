@@ -243,3 +243,86 @@ class TestATightCropIsRetriedPadded:
         monkeypatch.setattr(fd, "RETRY_PAD", 0.0)
         assert fd.detect(self._img()) == []
         assert calls == [(440, 440)]
+
+
+class TestHeadAndShoulders:
+    """#187: a portrait framing beside the tight face crop -- just above the hairline down to
+    the collarbone and upper chest, 4:5. The face crop must not move a pixel."""
+
+    # A 100 px face box (brow to chin) in the middle of a big photo.
+    BOX = (450.0, 300.0, 530.0, 400.0)
+
+    def test_it_reaches_above_the_hairline_and_down_to_the_chest(self):
+        left, top, right, bottom = fd.head_shoulders_box(*self.BOX, 2000, 2000)
+        assert top == 300 - 60                     # 0.6 face heights above the box
+        assert bottom == 400 + 150                 # 1.5 face heights below the chin
+        assert (right - left) / (bottom - top) == pytest.approx(0.8, abs=0.01)
+        assert (left + right) / 2 == pytest.approx(490, abs=1)   # centred on the face
+
+    def test_at_an_edge_it_slides_and_keeps_its_shape(self):
+        """Clamping would cut a shoulder off and change the aspect crop to crop."""
+        left, top, right, bottom = fd.head_shoulders_box(10, 10, 90, 110, 2000, 2000)
+        assert (left, top) == (0, 0)
+        assert (right - left) / (bottom - top) == pytest.approx(0.8, abs=0.01)
+        assert bottom - top == 310
+
+    def test_a_small_photo_shrinks_from_the_bottom_keeping_the_head(self):
+        # 310 px of window in a 250 px tall photo: the head stays, the chest goes.
+        left, top, right, bottom = fd.head_shoulders_box(*self.BOX, 2000, 250 + 300 - 60)
+        assert top <= 240 and bottom <= 490
+        assert (right - left) / (bottom - top) == pytest.approx(0.8, abs=0.01)
+        assert 0 <= left and right <= 2000
+
+    def test_it_never_leaves_the_image(self):
+        for box, (w, h) in [((0, 0, 200, 300), (220, 320)), ((900, 900, 1000, 1000), (1000, 1000))]:
+            left, top, right, bottom = fd.head_shoulders_box(*box, w, h)
+            assert 0 <= left < right <= w and 0 <= top < bottom <= h
+
+    def _fake_detector(self, monkeypatch):
+        import numpy as np
+
+        class F:
+            bbox = np.array(self.BOX)
+            det_score = 0.9
+            normed_embedding = np.array([0.6, 0.8])
+            pose = None
+
+        class App:
+            def get(self, img):
+                return [F()]
+        monkeypatch.setattr(fd, "_analyser", lambda: App())
+
+    def _img(self):
+        import cv2
+        import numpy as np
+        ok, buf = cv2.imencode(".jpg", np.full((1000, 1000, 3), 128, np.uint8))
+        return buf.tobytes()
+
+    def test_detect_cuts_a_portrait_and_the_face_crop_is_unchanged(self, monkeypatch):
+        import cv2
+        import numpy as np
+        self._fake_detector(monkeypatch)
+        face = fd.detect(self._img())[0]
+        portrait = fd.detect(self._img(), "head_shoulders")[0]
+        shape = lambda f: cv2.imdecode(np.frombuffer(f.png, np.uint8), cv2.IMREAD_COLOR).shape[:2]
+        assert shape(face) == (140, 140)           # square, 1.4 x the 100 px box, as ever
+        h, w = shape(portrait)
+        assert (h, w) == (310, 248)
+        assert portrait.embedding == face.embedding   # same face, same score
+
+    def test_an_unknown_framing_is_refused(self):
+        with pytest.raises(ValueError):
+            fd.detect(b"", "full_body")
+
+    def test_the_service_takes_and_echoes_it(self, monkeypatch):
+        """An older service ignores `framing` and returns face crops; the echo is how the API
+        tells. Absent on the request means face, as before."""
+        import asyncio
+        import base64
+        from wanly_worker.services.face_crop import app as svc
+        self._fake_detector(monkeypatch)
+        assert svc.CropRequest(images=["x"]).framing == "face"
+        req = svc.CropRequest(images=[base64.b64encode(self._img()).decode()],
+                              framing="head_shoulders")
+        out = asyncio.run(svc.crop(req))
+        assert out.framing == "head_shoulders" and out.faces[0].width == 248
