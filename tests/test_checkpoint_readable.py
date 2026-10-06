@@ -35,7 +35,7 @@ def test_the_sweep_refuses_it_and_records_the_failure():
     import inspect
     src = inspect.getsource(Poller._sweep_checkpoints)
     assert "if not self._readable(path):" in src
-    assert "failed.append(str(path))" in src
+    assert "self._fail(job, path)" in src     # backed off and retried (#191), not stuck
     # Ordered: only a SETTLED file is judged, so a checkpoint still being written is not
     # mistaken for a corrupt one.
     assert src.index("if self._settled(path):") < src.index("self._readable(path)")

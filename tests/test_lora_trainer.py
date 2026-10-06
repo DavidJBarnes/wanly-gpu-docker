@@ -627,7 +627,7 @@ class TestCheckpointsGoStraightToS3:
         self._write(tmp_path, job, ["p@y_v2-000001.comfy.safetensors", "p@y_v2.comfy.safetensors"])
         # e01 made it; the final did not.
         p._published["j1"] = {str(p._local_checkpoints(job)[0]): "s3://ltx-loras/character/pay_v2_e01.safetensors"}
-        p._failed["j1"] = [str(p._local_checkpoints(job)[1])]
+        p._failed["j1"] = {str(p._local_checkpoints(job)[1]): (1, 9e18)}
         sent = []
 
         async def fake_patch(j, body):
@@ -1050,7 +1050,7 @@ class TestARunTheRestartInterruptedMidUploadIsFinished:
         import inspect
         from wanly_worker.services.lora_trainer import poller as mod
         src = inspect.getsource(mod.Poller.check_publish_requests)
-        assert 'row.get("status") in ("running", "claimed")' in src
+        assert 'row.get("status") in ("running", "claimed", "failed")' in src
         assert 'self._patch(job, {"status": "completed"' in src
         # only after the sweep, so a missing final is queued before it is judged
         assert src.index("self._sweep_checkpoints(job)") < src.index('"status": "completed"')
@@ -2022,3 +2022,310 @@ class TestCancelStopsTheWholeProcessGroup:
         assert "start_new_session=True" in inspect.getsource(pipeline._stage_cmd)
         src = inspect.getsource(pipeline.train)
         assert "proc.terminate()" not in src and "stop_process_group" in src
+
+
+class TestTestFirstThenUploadOrDelete:
+    """#191: David wants to test checkpoints before anything is uploaded, then per checkpoint
+    upload it or delete it forever. `publish: "none"` uploads nothing on its own; a delete
+    request on the row removes exactly that checkpoint's files from the trainer's disk."""
+
+    # The real names, as musubi (LTX) and kohya (SDXL) wrote them on 3090a, 2026-10-06.
+    LTX = ["Brandy_v1-000001.comfy.safetensors", "Brandy_v1-000001.safetensors",
+           "Brandy_v1-000001-state/",
+           "Brandy_v1-000002.comfy.safetensors", "Brandy_v1-000002.safetensors",
+           "Brandy_v1-000002-state/",
+           "Brandy_v1.comfy.safetensors", "Brandy_v1.safetensors", "Brandy_v1-state/"]
+    SDXL = ["Brandy_v1-000001.safetensors", "Brandy_v1-000002.safetensors",
+            "Brandy_v1.safetensors"]
+
+    def _poller(self, monkeypatch, client=None):
+        from wanly_worker.services.lora_trainer import poller as mod
+        monkeypatch.setattr(mod, "QUEUE_URL", "http://api")
+        monkeypatch.setattr(mod, "QUEUE_API_KEY", "k")
+        monkeypatch.setattr(mod, "_log", lambda m: None)
+        return mod.Poller(client=client, worker_id_getter=lambda: "w")
+
+    def _job(self, arch="ltx", phase="completed"):
+        from wanly_worker.services.lora_trainer.jobs import Job
+        return Job(id="j1", character="Brandy", trigger="br@ndy", version=1, steps=1200,
+                   remote_id="r1", arch=arch, phase=phase)
+
+    def _write(self, job, names):
+        from wanly_worker.services.lora_trainer import recipe
+        out = recipe.run_dir(job.character, job.version, job.arch) / "output"
+        out.mkdir(parents=True, exist_ok=True)
+        for n in names:
+            if n.endswith("/"):
+                (out / n[:-1]).mkdir()
+                (out / n[:-1] / "model.safetensors").write_bytes(b"s" * 32)
+                (out / n[:-1] / "optimizer.bin").write_bytes(b"o" * 16)
+            else:
+                (out / n).write_bytes(b"x" * 16)
+        return out
+
+    @staticmethod
+    def _left(out):
+        return sorted(p.name + ("/" if p.is_dir() else "") for p in out.iterdir())
+
+    def _fake_patch(self, p):
+        sent = []
+
+        async def fake_patch(j, body):
+            sent.append(body)
+        p._patch = fake_patch
+        return sent
+
+    # ---------------------------------------------------------------- "none"
+
+    def test_none_wants_nothing_until_asked(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        self._write(job, self.LTX)
+        p._policy["j1"] = "none"
+        assert p._unpublished(job) == []
+        p._requested["j1"] = {"e02"}
+        assert [f.name for f in p._unpublished(job)] == ["Brandy_v1-000002.comfy.safetensors"]
+
+    def test_a_none_run_with_nothing_uploaded_is_completed_not_failed(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        self._write(job, self.LTX)
+        p._policy["j1"] = "none"
+        sent = self._fake_patch(p)
+
+        async def no_drain(j):
+            return None
+        p._drain_uploads = no_drain
+        _run(p._report(job))
+        assert sent[-1]["status"] == "completed"
+        assert "3 checkpoint(s) on the trainer" in sent[-1]["progress_log"]
+        assert "upload or delete" in sent[-1]["progress_log"]
+        assert "error_message" not in sent[-1]
+
+    def test_final_with_nothing_uploaded_is_still_failed(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        self._write(job, self.LTX)
+        p._policy["j1"] = "final"
+        p._failed["j1"] = {str(p._local_checkpoints(job)[-1]): (1, 9e18)}
+        sent = self._fake_patch(p)
+
+        async def no_drain(j):
+            return None
+        p._drain_uploads = no_drain
+        _run(p._report(job))
+        assert sent[-1]["status"] == "failed"
+
+    def test_a_row_with_no_policy_behaves_as_it_always_did(self):
+        from wanly_worker.services.lora_trainer import poller as mod
+        assert mod._policy_of({"config": {}}) == "final"
+        assert mod._policy_of({"config": {"publish": "none"}}) == "none"
+
+    # ---------------------------------------------------------------- deletes
+
+    def test_an_ltx_epoch_takes_its_comfy_file_its_twin_and_its_state(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        out = self._write(job, self.LTX)
+        p._delete_checkpoint(job, "e01")
+        assert self._left(out) == sorted(n for n in self.LTX if "000001" not in n)
+
+    def test_the_ltx_final_is_the_unnumbered_set_and_its_end_state(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        out = self._write(job, self.LTX)
+        p._delete_checkpoint(job, "final")
+        assert self._left(out) == sorted(n for n in self.LTX if "-0000" in n)
+
+    def test_an_sdxl_epoch_is_its_one_file(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job(arch="sdxl")
+        out = self._write(job, self.SDXL)
+        p._delete_checkpoint(job, "e02")
+        assert self._left(out) == ["Brandy_v1-000001.safetensors", "Brandy_v1.safetensors"]
+        p._delete_checkpoint(job, "final")
+        assert self._left(out) == ["Brandy_v1-000001.safetensors"]
+
+    def test_a_delete_is_idempotent(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        out = self._write(job, self.LTX)
+        p._delete_checkpoint(job, "e02")
+        after = self._left(out)
+        p._delete_checkpoint(job, "e02")
+        p._delete_checkpoint(job, "e09")        # matches nothing: a no-op, not an error
+        assert self._left(out) == after
+
+    def test_nothing_outside_the_label_is_touched(self, monkeypatch):
+        """Not another epoch, not another run's files in the same directory, not a path a
+        crafted label could reach."""
+        p, job = self._poller(monkeypatch), self._job()
+        out = self._write(job, self.LTX + ["Brandy_v10-000001.safetensors",
+                                           "Other_v1-000001.safetensors", "notes.txt"])
+        outside = out.parent / "keep.safetensors"
+        outside.write_bytes(b"k")
+        before = self._left(out)
+        for bad in ("../keep", "e01/../..", "", "E01", "1", "e1"):
+            p._delete_checkpoint(job, bad)
+        assert self._left(out) == before and outside.exists()
+        p._delete_checkpoint(job, "e01")
+        left = self._left(out)
+        assert "Brandy_v10-000001.safetensors" in left and "Other_v1-000001.safetensors" in left
+        assert "notes.txt" in left and outside.exists()
+
+    def test_a_deleted_label_is_never_uploaded(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import poller as mod
+        monkeypatch.setattr(mod, "CHECKPOINT_SETTLE_S", 0)
+        p, job = self._poller(monkeypatch), self._job()
+        self._write(job, self.LTX)
+        for f in p._local_checkpoints(job):
+            _real_safetensors(f)
+            p._settled(f)
+        p._policy["j1"] = "all"
+        p._requested["j1"] = {"e01"}
+        p._deleted["j1"] = {"e01"}
+
+        async def idle(_job):
+            return None
+        p._upload_worker = idle
+
+        async def go():
+            p._sweep_checkpoints(job)
+        _run(go())
+        assert [f.name for f in p._queue["j1"]] == ["Brandy_v1-000002.comfy.safetensors",
+                                                    "Brandy_v1.comfy.safetensors"]
+
+    def test_a_queued_label_that_is_deleted_comes_out_of_the_queue(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        self._write(job, self.LTX)
+        p._policy["j1"] = "all"
+        p._queue["j1"] = list(p._local_checkpoints(job))
+        published = []
+
+        async def fake_publish(j, path):
+            published.append(path.name)
+        p._publish = fake_publish
+        p._deleted["j1"] = {"e02"}
+        _run(p._upload_worker(job))
+        assert "Brandy_v1-000002.comfy.safetensors" not in published
+        assert len(published) == 2
+
+    def test_a_file_going_up_is_not_deleted_under_it(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        out = self._write(job, self.LTX)
+        p._inflight.add(str(out / "Brandy_v1-000001.comfy.safetensors"))
+        p._delete_checkpoint(job, "e01")
+        assert "Brandy_v1-000001.comfy.safetensors" in self._left(out)
+        p._inflight.clear()
+        p._delete_checkpoint(job, "e01")      # next tick, once it has landed
+        assert not any("000001" in n for n in self._left(out))
+
+    def _row_client(self, row):
+        class R:
+            status_code = 200
+
+            def __init__(self, b):
+                self._b = b
+
+            def json(self):
+                return self._b
+
+        class C:
+            async def get(self, *a, **k):
+                return R(row)
+        return C()
+
+    def _store(self, monkeypatch, jobs):
+        from wanly_worker.services.lora_trainer import app as app_mod
+
+        class S:
+            def all(self):
+                return jobs
+        monkeypatch.setattr(app_mod, "STORE", S())
+
+    def test_the_watch_loop_deletes_and_never_queues_the_deleted(self, monkeypatch):
+        """Through check_publish_requests, with a row that both asks for e01 and deletes it,
+        on a run that finished three months ago -- there is no 14-day window any more."""
+        import time as _time
+        from wanly_worker.services.lora_trainer import poller as mod
+        monkeypatch.setattr(mod, "CHECKPOINT_SETTLE_S", 0)
+        job = self._job()
+        job.finished_at = _time.time() - 90 * 86400
+        out = self._write(job, self.LTX)
+        row = {"status": "completed", "config": {"publish": "none"}, "checkpoints": [],
+               "publish_requests": ["e01", "e02"], "delete_requests": ["e01"]}
+        p = self._poller(monkeypatch, client=self._row_client(row))
+        self._store(monkeypatch, [job])
+        swept = []
+        monkeypatch.setattr(p, "_sweep_checkpoints", lambda j: swept.append(set(p._requested["j1"])))
+        _run(p.check_publish_requests())
+        assert not any("000001" in n for n in self._left(out))
+        assert swept == [{"e02"}]
+        assert not hasattr(mod, "PUBLISH_WATCH_DAYS")
+
+    def test_a_run_with_nothing_left_on_disk_is_not_polled(self, monkeypatch):
+        job = self._job()
+        self._write(job, ["notes.txt"])
+        calls = []
+
+        class C:
+            async def get(self, *a, **k):
+                calls.append(a)
+        p = self._poller(monkeypatch, client=C())
+        self._store(monkeypatch, [job])
+        _run(p.check_publish_requests())
+        assert calls == []
+
+    # ---------------------------------------------------------------- retries
+
+    def test_a_failed_upload_is_retried_after_a_growing_backoff(self, monkeypatch):
+        from wanly_worker.services.lora_trainer import poller as mod
+        monkeypatch.setattr(mod, "CHECKPOINT_SETTLE_S", 0)
+        clock = [1000.0]
+        monkeypatch.setattr(mod.time, "time", lambda: clock[0])
+        p, job = self._poller(monkeypatch), self._job()
+        self._write(job, ["Brandy_v1.comfy.safetensors"])
+        f = p._local_checkpoints(job)[0]
+        _real_safetensors(f)
+        p._policy["j1"] = "final"
+
+        async def idle(_job):
+            return None
+        p._upload_worker = idle
+
+        def sweep():
+            p._queue["j1"] = []
+            _run(_async(p._sweep_checkpoints, job))
+            return p._queue["j1"]
+
+        p._settled(f)
+        p._fail(job, f)
+        assert sweep() == []                       # backing off
+        clock[0] += mod.UPLOAD_RETRY_S + 1
+        assert sweep() == [f]                      # tried again, no restart needed
+        p._fail(job, f)                            # failed again: twice as long now
+        clock[0] += mod.UPLOAD_RETRY_S + 1
+        assert sweep() == []
+        clock[0] += mod.UPLOAD_RETRY_S
+        assert sweep() == [f]
+
+    def test_a_publish_that_raises_records_a_retry_and_a_success_clears_it(self, monkeypatch):
+        p, job = self._poller(monkeypatch), self._job()
+        self._write(job, ["Brandy_v1.comfy.safetensors"])
+        f = p._local_checkpoints(job)[0]
+
+        class Boom:
+            async def post(self, *a, **k):
+                raise RuntimeError("uplink down")
+        p._client = Boom()
+        _run(p._publish(job, f))
+        assert p._failed["j1"][str(f)][0] == 1 and p._backing_off(job, f)
+
+    def test_a_failed_row_turns_completed_once_the_retry_lands(self, monkeypatch):
+        job = self._job()
+        self._write(job, self.LTX)
+        row = {"status": "failed", "config": {"publish": "final"}, "publish_requests": [],
+               "checkpoints": ["s3://ltx-loras/character/brandy_v1_final.safetensors"]}
+        p = self._poller(monkeypatch, client=self._row_client(row))
+        self._store(monkeypatch, [job])
+        monkeypatch.setattr(p, "_sweep_checkpoints", lambda j: None)
+        sent = self._fake_patch(p)
+        _run(p.check_publish_requests())
+        assert sent and sent[-1]["status"] == "completed" and sent[-1]["error_message"] == ""
+
+
+async def _async(fn, *a):
+    return fn(*a)
