@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from wanly_worker import registry
+from wanly_worker import gpu_pin, registry
 from wanly_worker.queue_client import QueueClient, export_identity
 from wanly_worker.supervisor import Supervisor, gpu_snapshot
 
@@ -84,6 +84,9 @@ async def lifespan(app: FastAPI):
     print(f"=== wanly-gpu-docker === image build: {BUILD} | code: {_code_ref()}", flush=True)
     try:
         global _equipped, _mode, _active
+        # FIRST, before any service picks a card (#163): with GPU_UUID set, this container must
+        # see exactly that card. A worker that boots on the wrong one fails every render later.
+        gpu_pin.enforce()
         equipped = registry.parse_services(os.environ.get("SERVICES"))
         _equipped = equipped
         # MODE narrows what actually runs; SERVICES stays the box's own capability line, so

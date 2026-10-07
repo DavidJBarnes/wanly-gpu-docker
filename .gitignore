@@ -4,3 +4,4 @@ __pycache__/
 
 # Carries the queue API key — never commit (see deploy/README.md)
 deploy/worker.env
+deploy/*.env

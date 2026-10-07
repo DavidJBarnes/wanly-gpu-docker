@@ -56,7 +56,10 @@ class TestTheContainerSpecIsComplete:
         """`--gpus all` grants the device nodes outside the OCI spec, and a systemd reload
         takes them away again (#95). CDI puts them in the spec, where a reload keeps them."""
         s = RUN.read_text()
-        assert "--device nvidia.com/gpu=all" in s
+        # One card by UUID when GPU_UUID is set (#163), every card otherwise -- through CDI
+        # either way.
+        assert 'GPU_DEVICE_ARG="nvidia.com/gpu=all"' in s
+        assert '--device "$GPU_DEVICE_ARG"' in s
         # As a FLAG. The comment above the run block names the old one to explain why.
         assert not re.search(r"^\s*--gpus\b", s, re.M)
 

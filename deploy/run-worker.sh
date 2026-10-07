@@ -254,7 +254,70 @@ if ss -tlnp 2>/dev/null | grep -q ":${CONTROL_PORT} " \
     exit 1
 fi
 
-echo "recreating $NAME from $IMAGE (SERVICES=$SERVICES${MODE:+, MODE=$MODE})"
+# ONE CARD PER CONTAINER (wanly-gpu-docker#163). GPU_UUID (or GPU_DEVICE) names the card by its
+# UUID -- `nvidia-smi -L` on the host -- and CDI hands the container exactly that one. An index
+# would do the same until a reboot reordered the cards. Unset keeps `all`, the behaviour before
+# this, so a box changes only when its worker.env opts in. The container checks the result at
+# boot (wanly_worker/gpu_pin.py) and refuses unless it sees exactly this card.
+#
+# Checked HERE, before `docker rm -f`, like everything else in this script: a typo in a UUID
+# must not cost the running worker. The CDI spec names each card by index AND by UUID
+# (`nvidia-ctk cdi list`), and a UUID the spec does not list fails `docker run` AFTER the rm.
+GPU_UUID="${GPU_UUID:-${GPU_DEVICE:-}}"
+GPU_DEVICE_ARG="nvidia.com/gpu=all"
+if [ -n "$GPU_UUID" ]; then
+    case "$GPU_UUID" in
+        GPU-*) ;;
+        *) echo "!! GPU_UUID=$GPU_UUID is not a UUID (want GPU-xxxxxxxx-..., from nvidia-smi -L). An index is not stable across boots."; exit 1 ;;
+    esac
+    if command -v nvidia-smi >/dev/null 2>&1 && ! nvidia-smi -L 2>/dev/null | grep -qi "$GPU_UUID"; then
+        echo "!! GPU_UUID=$GPU_UUID is not a card on this host. nvidia-smi -L says:"
+        nvidia-smi -L 2>/dev/null | sed 's/^/!!   /'
+        exit 1
+    fi
+    if command -v nvidia-ctk >/dev/null 2>&1 && ! nvidia-ctk cdi list 2>/dev/null | grep -qi "nvidia.com/gpu=$GPU_UUID"; then
+        echo "!! the CDI spec has no device nvidia.com/gpu=$GPU_UUID. Regenerate it (sudo systemctl start nvidia-cdi-refresh) and check: nvidia-ctk cdi list"
+        exit 1
+    fi
+    GPU_DEVICE_ARG="nvidia.com/gpu=$GPU_UUID"
+fi
+
+# A SECOND CONTAINER ON ONE HOST (#163, #167): the 2070's scene captioner runs beside the 3090
+# worker, from its own env file (deploy/scene.env) with its own NAME. Two ways that goes wrong,
+# and both cost the OTHER container, so both are refused before the rm:
+#
+#   * The env file is right but NAME was left out: NAME defaults to wanly-gpu-docker, and the
+#     `docker rm -f` below would delete the 3090 worker mid-render. Every container records the
+#     env file it was created from (label wanly.env); a container made from a DIFFERENT file is
+#     not this one to replace. A container from before the label is the main worker's, and only
+#     the default worker.env may replace it.
+#   * Two containers with one FRIENDLY_NAME: wanly-api upserts its worker row on that name, so
+#     they would share one row and overwrite each other (#74).
+ENV_FILE_ABS="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
+if docker inspect "$NAME" >/dev/null 2>&1; then
+    made_from=$(docker inspect -f '{{ index .Config.Labels "wanly.env" }}' "$NAME" 2>/dev/null || true)
+    case "$made_from" in
+        /*) ;;                                 # an env file's absolute path, as recorded
+        *) made_from="$HERE/worker.env" ;;     # no label ("<no value>"): the main worker
+    esac
+    if [ "$made_from" != "$ENV_FILE_ABS" ]; then
+        echo "!! $NAME was created from $made_from, not $ENV_FILE_ABS."
+        echo "!! Recreating it from this file would replace a different worker. Set NAME in $ENV_FILE"
+        echo "!! (e.g. NAME=wanly-scene) -- or, if you really mean to replace it, docker rm -f $NAME first."
+        exit 1
+    fi
+fi
+for other in $(docker ps -a --format '{{.Names}}'); do
+    [ "$other" = "$NAME" ] && continue
+    if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$other" 2>/dev/null \
+         | grep -qx "FRIENDLY_NAME=$FRIENDLY_NAME"; then
+        echo "!! container $other already registers as FRIENDLY_NAME=$FRIENDLY_NAME."
+        echo "!! wanly-api keys its worker row on that name; give this one its own (e.g. ${FRIENDLY_NAME}-scene)."
+        exit 1
+    fi
+done
+
+echo "recreating $NAME from $IMAGE (SERVICES=$SERVICES${MODE:+, MODE=$MODE}, GPU=${GPU_DEVICE_ARG#nvidia.com/gpu=})"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 # COMFYUI_PATH is EMPTY on purpose — see the note in start.sh. With a path set the daemon
@@ -288,7 +351,8 @@ docker run -d \
     --name "$NAME" \
     "${MEM_ARGS[@]}" \
     --restart unless-stopped \
-    --device nvidia.com/gpu=all \
+    --label "wanly.env=$ENV_FILE_ABS" \
+    --device "$GPU_DEVICE_ARG" \
     --shm-size "$SHM_SIZE" \
     "${ENGINE_ARGS[@]}" \
     -p "${CONTROL_PORT}:8081" \
@@ -299,6 +363,7 @@ docker run -d \
     "${SCENE_ENV_ARGS[@]}" \
     "${DEV_MOUNT_ARGS[@]}" \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
+    -e "GPU_UUID=$GPU_UUID" \
     -e "SERVICES=$SERVICES" \
     -e "MODE=${MODE:-}" \
     -e "MODE_SWITCH_VRAM_MAX_MIB=${MODE_SWITCH_VRAM_MAX_MIB:-}" \
