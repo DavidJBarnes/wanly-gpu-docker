@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from wanly_worker import control
+from wanly_worker import control, registry
 
 
 class _FakeSup:
@@ -134,11 +134,20 @@ def sup(monkeypatch):
     monkeypatch.setattr(control, "_client", object())
     monkeypatch.setattr(control, "_equipped",
                         ["ltx-engine", "lora-trainer", "image-description", "face-crop"])
-    monkeypatch.setattr(control, "_mode", "ltx-engine")
+    _in_mode(monkeypatch, "render")
     monkeypatch.setattr(control, "_mode_lock", asyncio.Lock())
     monkeypatch.setattr(control, "_pending", None)
     monkeypatch.setattr(control, "_mode_error", None)
+    monkeypatch.setattr(control, "_queue", None)
+    # The card empties the moment anything stops; TestTheUnloadCheck covers when it does not.
+    monkeypatch.setattr(control, "_vram_used", lambda: 1200)
     return s
+
+
+def _in_mode(monkeypatch, mode):
+    """Put the box in `mode` the way a landed switch leaves it: the mode AND what is running."""
+    monkeypatch.setattr(control, "_mode", registry.canonical_mode(mode))
+    monkeypatch.setattr(control, "_active", registry.select_mode(control._equipped, mode))
 
 
 def _post(mode):
@@ -164,9 +173,9 @@ def _post_and_settle(mode):
 
 def test_caption_stops_everything_that_claims_work(sup):
     body, mode, pending = _post_and_settle("caption")
-    assert sup.applied == [["image-description", "face-crop"]]
+    assert sup.applied == [["face-crop"], ["image-description", "face-crop"]]
     assert body["changed"] is True
-    assert mode == "caption" and pending is None
+    assert mode == "motion" and pending is None
 
 
 def test_the_request_RETURNS_before_the_switch_runs(sup):
@@ -177,19 +186,20 @@ def test_the_request_RETURNS_before_the_switch_runs(sup):
     body = _post("caption")
     assert body["pending"] == "caption"
     assert body["mode"] == "ltx-engine", "it claimed the new mode before the switch ran"
+    assert (body["mode_name"], body["pending_mode_name"]) == ("render", "motion")
     assert sup.applied == [], "the switch ran inside the request"
 
 
 def test_a_second_request_for_the_same_switch_is_not_an_error(sup, monkeypatch):
     """A UI that re-sends while it waits must not be told it failed for asking twice."""
-    monkeypatch.setattr(control, "_pending", "caption")
+    monkeypatch.setattr(control, "_pending", "motion")
     body = asyncio.run(control.set_mode(control.ModeRequest(mode="caption")))
     assert body["pending"] == "caption"
     assert body["changed"] is False
 
 
 def test_switching_to_a_DIFFERENT_mode_mid_switch_is_a_409(sup, monkeypatch):
-    monkeypatch.setattr(control, "_pending", "caption")
+    monkeypatch.setattr(control, "_pending", "motion")
     with pytest.raises(HTTPException) as e:
         _post("ltx-engine")
     assert e.value.status_code == 409
@@ -203,16 +213,17 @@ def test_a_failed_switch_is_reported_not_swallowed(sup, monkeypatch):
     _post_and_settle("caption")
     assert control._pending is None
     assert "would not stop" in (control._mode_error or "")
-    assert control._mode == "ltx-engine", "a failed switch moved the mode anyway"
+    assert control._mode == "render", "a failed switch moved the mode anyway"
 
 
 def test_going_back_starts_the_whole_capability_line_again(sup, monkeypatch):
     """Everything the box renders with -- minus the 32B captioner, which never sits beside the
     render stack (#173): it is what the switch back to render mode unloads."""
-    monkeypatch.setattr(control, "_mode", "caption")
+    _in_mode(monkeypatch, "caption")
     _, mode, pending = _post_and_settle("ltx-engine")
-    assert sup.applied == [["ltx-engine", "lora-trainer", "face-crop"]]
-    assert mode == "ltx-engine" and pending is None
+    # Stop the captioner (keeping face-crop), verify the card, then start the render line.
+    assert sup.applied == [["face-crop"], ["ltx-engine", "lora-trainer", "face-crop"]]
+    assert mode == "render" and pending is None
 
 
 def test_asking_for_the_mode_it_is_already_in_changes_nothing(sup):
@@ -272,24 +283,27 @@ def test_health_says_what_the_box_can_do_and_what_it_is_doing(monkeypatch):
     monkeypatch.setattr(control, "_sup", _FakeSup([
         {"name": "image-description", "ready": True, "running": True, "stopped": False}]))
     monkeypatch.setattr(control, "_equipped", ["ltx-engine", "image-description"])
-    monkeypatch.setattr(control, "_mode", "caption")
+    monkeypatch.setattr(control, "_mode", "motion")
     monkeypatch.setattr(control, "_pending", None)
     monkeypatch.setattr(control, "_mode_error", None)
     _, body = _get()
     assert body["equipped"] == ["ltx-engine", "image-description"]
-    assert body["mode"] == "caption"
+    assert body["mode"] == "caption", "wanly-api compares against the pre-#164 spelling"
+    assert body["mode_name"] == "motion"
+    assert body["modes"] == ["render", "motion"]
 
 
 def test_health_carries_the_switch_in_progress(monkeypatch):
     """So the caller shows "switching" rather than the mode it is not in yet."""
     monkeypatch.setattr(control, "_sup", _FakeSup([
         {"name": "image-description", "ready": True, "running": True, "stopped": False}]))
-    monkeypatch.setattr(control, "_mode", "ltx-engine")
-    monkeypatch.setattr(control, "_pending", "caption")
+    monkeypatch.setattr(control, "_mode", "render")
+    monkeypatch.setattr(control, "_pending", "motion")
     monkeypatch.setattr(control, "_mode_error", None)
     _, body = _get()
     assert body["mode"] == "ltx-engine"
     assert body["pending_mode"] == "caption"
+    assert (body["mode_name"], body["pending_mode_name"]) == ("render", "motion")
 
 
 class TestTheCaptionModelAroundASwitch:
@@ -320,7 +334,7 @@ class TestTheCaptionModelAroundASwitch:
 
     def test_leaving_caption_mode_drops_it_BEFORE_the_stack_starts(self, sup, imgsvc,
                                                                    monkeypatch):
-        monkeypatch.setattr(control, "_mode", "caption")
+        _in_mode(monkeypatch, "caption")
         order = []
 
         async def apply(groups, client):
@@ -335,17 +349,17 @@ class TestTheCaptionModelAroundASwitch:
         monkeypatch.setattr(s, "release", release)
 
         _post_and_settle("ltx-engine")
-        assert order == ["release", "apply"], \
+        assert order == ["release", "apply", "apply"], \
             "ComfyUI started while the captioner still held the card"
 
     def test_entering_render_mode_from_render_mode_drops_nothing(self, sup, imgsvc,
                                                                  monkeypatch):
         """Nothing was pinned, so there is nothing to drop -- and an unload here would be a
         pointless round trip on every no-op."""
-        monkeypatch.setattr(control, "_mode", "caption")
+        _in_mode(monkeypatch, "caption")
         _post_and_settle("ltx-engine")
         before = list(imgsvc)
-        monkeypatch.setattr(control, "_mode", "ltx-engine")
+        _in_mode(monkeypatch, "ltx-engine")
         _post_and_settle("ltx-engine")
         assert list(imgsvc) == before
 
@@ -372,7 +386,7 @@ class TestSwitchingToRenderWaitsForCaptions:
         from wanly_worker.services.image_description import service as imgsvc
 
         async def apply(groups, client):
-            order.append("start-render")
+            order.append("start-render" if "ltx-engine" in groups else "stop-captioner")
         monkeypatch.setattr(sup, "apply", apply)
 
         async def release(client, model=imgsvc.MODEL):
@@ -384,7 +398,7 @@ class TestSwitchingToRenderWaitsForCaptions:
             return True
         monkeypatch.setattr(imgsvc, "warm", warm)
 
-        monkeypatch.setattr(control, "_mode", "caption")
+        _in_mode(monkeypatch, "caption")
         monkeypatch.setattr(control, "CAPTION_DRAIN_TIMEOUT_S", 100.0)
         return order
 
@@ -412,7 +426,7 @@ class TestSwitchingToRenderWaitsForCaptions:
         monkeypatch.setattr(control, "_caption_queue_depth", depth)
 
         _post_and_settle("ltx-engine")
-        assert flow == ["drop-model", "start-render"]
+        assert flow == ["drop-model", "stop-captioner", "start-render"]
 
     def test_an_API_that_will_not_answer_does_not_block_the_switch(self, flow, monkeypatch):
         """An older API has no such endpoint. Blocking every switch on a question nothing
@@ -422,7 +436,7 @@ class TestSwitchingToRenderWaitsForCaptions:
         monkeypatch.setattr(control, "_caption_queue_depth", depth)
 
         _post_and_settle("ltx-engine")
-        assert flow == ["drop-model", "start-render"]
+        assert flow == ["drop-model", "stop-captioner", "start-render"]
 
     def test_a_wedged_captioner_does_not_hold_the_box_forever(self, flow, monkeypatch):
         """Loud, and then proceed. A queue that never empties must not mean a box that can

@@ -111,6 +111,35 @@ captioner's footprint (qwen3-vl:32b leaves ~2 GB, under the 2.5 GB bar -> CPU).
 `curl -s :8085/health` reports `model_loaded`, the device, why the last edit ran where it did,
 and `vram_peak_mib` -- torch's measured peak for the last GPU edit.
 
+## Four modes: render / train / motion / edit (#164)
+
+A 3090 holds one big model at a time, so a mode is the choice of tenant:
+
+| mode | runs | old name |
+|---|---|---|
+| `render` | ltx-engine (+ lora-trainer on its drain, until #165) | `ltx-engine` |
+| `train` | lora-trainer | -- |
+| `motion` | image-description (Qwen3-VL 32B) | `caption` |
+| `edit` | image-edit (Qwen-Image-Edit) | -- |
+
+face-crop, face-edit and scene-caption run in every mode. `POST :8081/mode {"mode": "train"}`
+switches in place; the old names are accepted everywhere.
+
+**Every switch verifies the unload.** It finishes what is in flight (the segment, the queued
+captions), drops the old tenant's model (ollama `keep_alive: 0`, ComfyUI `/free`), stops its
+services, then waits for `nvidia-smi` to show the card under `MODE_SWITCH_VRAM_MAX_MIB` (8192 by
+default) before starting the next mode. A card that does not empty within
+`MODE_SWITCH_UNLOAD_TIMEOUT_S` (90 s) is refused with the numbers and the previous mode is put
+back. Every switch logs `mode: unload A -> B: card held X MiB, Y MiB after Ns`, and `/health`
+carries the last one as `last_unload`.
+
+**A training run is never interrupted.** A switch while one is live is a 409 naming the run.
+
+**/health reports the mode twice.** `mode` / `pending_mode` keep the spelling wanly-api and the
+console compare against (`ltx-engine`, `caption`, `edit`, `train`); `mode_name` /
+`pending_mode_name` are the four-mode names, and `modes` lists the ones this box can enter.
+wanly-api#392 and wanly-console#589 move to the new fields.
+
 ## image-edit and edit mode (console#548)
 
 Qwen-Image-Edit "full mode" for the console's Edit dialog: head angles beyond LivePortrait's

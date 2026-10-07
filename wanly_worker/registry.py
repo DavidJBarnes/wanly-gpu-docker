@@ -69,42 +69,70 @@ class ConfigError(RuntimeError):
 #:
 #: SERVICES is a property of the BOX -- everything this machine is equipped to do, set once
 #: and left alone. MODE is a property of RIGHT NOW. Keeping them separate is what makes the
-#: switch a plain `docker run -e MODE=caption` with the box's own SERVICES line untouched,
+#: switch a plain `docker run -e MODE=motion` with the box's own SERVICES line untouched,
 #: instead of an edit that has to remember the full list to put back.
 #:
-#: `caption` is DERIVED, not a hardcoded pair of names: it is every enabled service that
-#: claims no work. That is exactly the property that matters -- with nothing on the box that
-#: can claim, queued jobs simply wait and the GPU belongs to the captioner. A service added
-#: to KIND_BY_SERVICE later is excluded automatically, which is the right default: anything
-#: that takes work does not belong in caption mode.
-MODES = ("ltx-engine", "caption", "edit")
-_MODE_ALIASES = {"render": "ltx-engine", "engine": "ltx-engine",
-                 "image-caption": "caption", "image-description": "caption",
+#: FOUR MODES, ONE TENANT EACH (wanly-gpu-docker#164, wanly-console#572). A 3090 holds one
+#: big model at a time -- an LTX render, the trainer, the 32B Qwen3-VL motion captioner, or
+#: Qwen-Image-Edit, each ~14-21 GB of 24 -- so a mode IS the choice of tenant:
+#:
+#:     render   ltx-engine (and, until wanly-gpu-docker#165, the trainer riding along on its drain)
+#:     train    lora-trainer, nothing else that claims work
+#:     motion   image-description: every enabled service that claims no work
+#:     edit     image-edit
+#:
+#: face-crop, face-edit and scene-caption run in every mode: CPU-first or on another card.
+#:
+#: `motion` is DERIVED, not a hardcoded pair of names: it is every enabled service that claims
+#: no work. With nothing on the box that can claim, queued jobs simply wait and the GPU belongs
+#: to the captioner. A service added to KIND_BY_SERVICE later is excluded automatically.
+MODES = ("render", "train", "motion", "edit")
+#: The names the modes had before #164, and other spellings people type. Accepted everywhere a
+#: mode is read -- POST /mode, MODE in worker.env, run-worker.sh -- so nothing that already
+#: says `ltx-engine` or `caption` breaks.
+_MODE_ALIASES = {"ltx-engine": "render", "engine": "render",
+                 "caption": "motion", "image-caption": "motion", "image-description": "motion",
+                 "motion-caption": "motion",
+                 "training": "train", "trainer": "train", "lora-trainer": "train",
                  "image-edit": "edit", "full-edit": "edit"}
+
+#: THE SPELLING THE CONTRACT STILL USES. wanly-api and the console compare the reported mode
+#: against `ltx-engine` and `caption` (the captioner refusal in app/joycaption.py, the Workers
+#: page toggle), so /health keeps reporting those for render and motion until wanly-api#392 and
+#: wanly-console#589 read `mode_name`. Reporting the new words today would make every caption
+#: on a rendering box look allowed and leave the toggle with nothing selected.
+LEGACY_NAME = {"render": "ltx-engine", "motion": "caption"}
+
+
+def legacy_name(mode: str | None) -> str | None:
+    """`mode` in the spelling wanly-api and the console compare against (see LEGACY_NAME)."""
+    return LEGACY_NAME.get(mode, mode) if mode else mode
+
 
 #: Services that run ONLY in one mode (console#548). image-edit is Qwen-Image-Edit: ~20 GB of
 #: a 24 GB card, the same class of tenant as a render or a Qwen captioner, so it cannot sit
 #: beside either and has no CPU fallback to retreat to. It is therefore not part of "everything
-#: this box is equipped for" in render mode, nor a "claims no work" service in caption mode --
+#: this box is equipped for" in render mode, nor a "claims no work" service in motion mode --
 #: it is the card's tenant in edit mode and nowhere else.
 MODE_ONLY = {"image-edit": "edit"}
 
-#: What each mode leaves out on top of the claiming services. Edit mode drops the captioner for
-#: the reason MODE_ONLY exists: a caption landing mid-edit would load a 20 GB vision model onto
-#: a card Qwen is already holding. face-crop and face-edit stay -- CPU-first and ~2 GB at most.
-_MODE_EXCLUDES = {"edit": {"image-description"}}
+#: What each mode leaves out on top of the claiming services. Edit and train drop the captioner
+#: for the reason MODE_ONLY exists: a caption landing mid-edit or mid-run would load a 20 GB
+#: vision model onto a card that already has its tenant. face-crop and face-edit stay --
+#: CPU-first and ~2 GB at most.
+_MODE_EXCLUDES = {"edit": {"image-description"}, "train": {"image-description"}}
 
 
 def canonical_mode(raw: str | None) -> str:
     """The mode's one true spelling, so callers compare modes and not spellings.
 
-    Unset is `ltx-engine`: a box with no MODE runs everything, which IS render mode. Saying
-    so explicitly keeps "am I already in this mode?" a string comparison rather than a
-    special case for empty.
+    Unset is `render`: a box with no MODE runs everything, which IS render mode. Saying so
+    explicitly keeps "am I already in this mode?" a string comparison rather than a special
+    case for empty.
     """
     mode = (raw or "").strip().lower()
     if not mode:
-        return "ltx-engine"
+        return "render"
     return _MODE_ALIASES.get(mode, mode)
 
 
@@ -113,8 +141,7 @@ def select_mode(names: list[str], raw: str | None) -> list[str]:
 
     Order is preserved -- see parse_services; services start in the order given.
     """
-    mode = (raw or "").strip().lower()
-    mode = _MODE_ALIASES.get(mode, mode) if mode else "ltx-engine"
+    mode = canonical_mode(raw)
     if mode not in MODES:
         raise ConfigError(
             f"MODE={raw!r} is not a mode. Known modes: {', '.join(MODES)} "
@@ -122,7 +149,7 @@ def select_mode(names: list[str], raw: str | None) -> list[str]:
         )
     # A service tied to another mode never runs here. Render mode is otherwise everything.
     mine = [n for n in names if MODE_ONLY.get(n, mode) == mode]
-    if mode == "ltx-engine":
+    if mode == "render":
         # A STANDING box -- nothing on it claims work (no render stack, no trainer) -- runs
         # everything it is equipped with in its default mode, mode-bound services included:
         # there is no render for image-edit to collide with, and nothing to switch to.
@@ -135,12 +162,21 @@ def select_mode(names: list[str], raw: str | None) -> list[str]:
         # landing mid-render loaded qwen3-vl 32B (~21.5 GB anon RAM, UseMmap:false) next to
         # ComfyUI (~33 GB); the container hit its 54 GiB memory cap and the kernel OOM-killed
         # ComfyUI, failing the render. Render and the 32B captioner cannot share one box's RAM
-        # or its 24 GB card, so on a box that renders, the captioner runs in caption mode only.
+        # or its 24 GB card, so on a box that renders, the captioner runs in motion mode only.
         # The API-side guard (refuse captions while rendering) stays, but it matched boxes by
         # hostname and let this one through; the box itself is the authority now.
         rendering = [n for n in mine if n != "image-description"]
         return rendering or mine or list(names)
     excluded = _MODE_EXCLUDES.get(mode, set())
+    if mode == "train":
+        # The trainer and what claims nothing -- never the render stack, which is the other
+        # claiming tenant and would take the card the run needs.
+        if "lora-trainer" not in names:
+            raise ConfigError(
+                f"MODE=train needs lora-trainer in SERVICES (SERVICES={','.join(names)}). "
+                f"Add it, with the trainer mounts -- see deploy/README.md.")
+        return [n for n in mine
+                if (n == "lora-trainer" or n not in KIND_BY_SERVICE) and n not in excluded]
     kept = [n for n in mine if n not in KIND_BY_SERVICE and n not in excluded]
     if mode == "edit" and "image-edit" not in kept:
         raise ConfigError(

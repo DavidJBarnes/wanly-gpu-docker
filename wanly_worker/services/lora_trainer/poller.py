@@ -62,8 +62,14 @@ def enabled() -> bool:
 
 
 class Poller:
-    def __init__(self, client, worker_id_getter):
+    def __init__(self, client, worker_id_getter, may_claim=None):
         self._client = client
+        #: Whether the box's current mode lets the trainer take a new run (#164). The poller runs
+        #: in every mode on a box equipped with the trainer -- publish and delete requests for
+        #: finished runs are answered whatever the card is doing -- but it CLAIMS only while the
+        #: mode has the trainer in it and no switch is under way. None means always (POST /train
+        #: boxes and tests).
+        self._may_claim = may_claim
         #: A callable rather than a value: the worker id does not exist until the queue client
         #: has registered, and a 404 makes it re-register with a new one.
         self._worker_id = worker_id_getter
@@ -141,6 +147,10 @@ class Poller:
         # Do not even ask while busy. Claiming marks the row on the API side, so asking for work
         # we cannot start would take a job out of the queue and sit on it.
         if not trainer_app.STORE.claim_slot():
+            return
+        # Not in a mode that trains (#164): a run claimed now would load beside the motion
+        # captioner or Qwen-Image-Edit, which is the OOM a mode exists to prevent.
+        if self._may_claim is not None and not self._may_claim():
             return
 
         r = await self._client.get(

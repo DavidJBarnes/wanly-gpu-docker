@@ -36,6 +36,11 @@ DRAIN_TIMEOUT_S = int(os.environ.get("DRAIN_TIMEOUT_S", "3600"))
 #: Below this the card is ours in practice. Our own trainer has not started yet at this point,
 #: so anything above it is somebody else.
 FREE_VRAM_FLOOR_MIB = int(os.environ.get("FREE_VRAM_FLOOR_MIB", "4000"))
+#: Set by the control plane while the box is in TRAIN MODE (#164). The render stack is stopped,
+#: so there is no daemon to drain: the trainer is the card's only tenant. Looking for one anyway
+#: is worse than useless -- the daemon's id file still names a row it deleted on its way out,
+#: and with that gone find_render_worker would pick ANOTHER BOX's render worker and drain it.
+SOLE_TENANT = False
 #: Which render worker shares this GPU. See find_render_worker for why this cannot be detected.
 RENDER_WORKER_NAME = os.environ.get("RENDER_WORKER_NAME", "")
 #: ONE CONTAINER PER GPU (wanly-gpu-docker#83): when the render daemon runs in this same
@@ -140,6 +145,16 @@ async def acquire(client, hostname: str, on_wait=None) -> str:
     """
     if not enabled():
         _log("no QUEUE_URL/QUEUE_API_KEY — cannot coordinate, proceeding on trust")
+        return ""
+
+    if SOLE_TENANT:
+        used = vram_used_mib()
+        if used > FREE_VRAM_FLOOR_MIB:
+            # The mode switch verified the card emptied; something has taken it since.
+            raise RuntimeError(
+                f"train mode, but {used} MiB of the card is in use (floor "
+                f"{FREE_VRAM_FLOOR_MIB} MiB). Refusing to train beside it.")
+        _log(f"train mode: this box's card is the trainer's ({used} MiB in use) — nothing to drain")
         return ""
 
     own = own_worker_id()
