@@ -49,8 +49,8 @@ SERVICES="${SERVICES:-ltx-engine}"
 # Validated HERE as well as in the container because this script's rule is to refuse before
 # `docker rm -f`, not after: a typo must not cost the running worker.
 case "${MODE:-}" in
-    ""|ltx-engine|render|engine|caption|image-caption|image-description|edit|image-edit|full-edit) ;;
-    *) echo "!! MODE=$MODE is not a mode. Known: ltx-engine, caption, edit"; exit 1 ;;
+    ""|render|ltx-engine|engine|train|training|trainer|lora-trainer|motion|motion-caption|caption|image-caption|image-description|edit|image-edit|full-edit) ;;
+    *) echo "!! MODE=$MODE is not a mode. Known: render, train, motion, edit (old names ltx-engine, caption still work)"; exit 1 ;;
 esac
 
 case ",$SERVICES," in *,lora-trainer,*)       WANT_TRAINER=1 ;; *) WANT_TRAINER=0 ;; esac
@@ -301,6 +301,7 @@ docker run -d \
     -e "FRIENDLY_NAME=$FRIENDLY_NAME" \
     -e "SERVICES=$SERVICES" \
     -e "MODE=${MODE:-}" \
+    -e "MODE_SWITCH_VRAM_MAX_MIB=${MODE_SWITCH_VRAM_MAX_MIB:-}" \
     -e "IMAGE_DESCRIPTION_MODEL=${IMAGE_DESCRIPTION_MODEL:-joycaption:beta-one}" \
     -e "ENGINE=ltx" \
     -e "QUEUE_URL=$QUEUE_URL" \

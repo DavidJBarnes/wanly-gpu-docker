@@ -46,7 +46,12 @@ _poller = None
 #: Everything SERVICES said this box is equipped to run, and which subset is live. The
 #: capability list never changes for the life of the container; the mode does.
 _equipped: list[str] = []
+#: The mode, in its canonical #164 spelling (render / train / motion / edit). /health reports
+#: it twice: `mode_name` as is, `mode` in the spelling wanly-api still compares against.
 _mode: str = ""
+#: What is running right now: select_mode(_equipped, _mode) once a switch lands. Kept rather
+#: than recomputed so the switch knows exactly what it is about to stop.
+_active: list[str] = []
 #: The lifespan's client, kept so POST /mode can use it for readiness probes. Starting a
 #: service means waiting for it to answer, which needs one.
 _client: httpx.AsyncClient | None = None
@@ -78,7 +83,7 @@ async def lifespan(app: FastAPI):
     global _sup
     print(f"=== wanly-gpu-docker === image build: {BUILD} | code: {_code_ref()}", flush=True)
     try:
-        global _equipped, _mode
+        global _equipped, _mode, _active
         equipped = registry.parse_services(os.environ.get("SERVICES"))
         _equipped = equipped
         # MODE narrows what actually runs; SERVICES stays the box's own capability line, so
@@ -87,6 +92,7 @@ async def lifespan(app: FastAPI):
         names = registry.select_mode(equipped, os.environ.get("MODE"))
         mode = (os.environ.get("MODE") or "").strip()
         _mode = registry.canonical_mode(os.environ.get("MODE"))
+        _active = list(names)
         print(f"SERVICES={','.join(names)}"
               + (f"  (MODE={mode} of {','.join(equipped)})" if mode else ""), flush=True)
         # Before any child starts: the render daemon reads these from its env and registers
@@ -120,12 +126,15 @@ async def lifespan(app: FastAPI):
         global _queue, _poller
         _queue = QueueClient(_sup, client)
         _queue.start()
-        # The trainer claims its own work, but only when it is one of the enabled services --
-        # a joycaption-only box must not poll for training jobs it could never run.
-        if "lora-trainer" in names:
+        # The trainer claims its own work, but only on a box EQUIPPED with it -- a captioner-only
+        # box must not poll for training jobs it could never run. Started whatever the boot
+        # mode (#164): finished runs' publish and delete requests are answered in every mode,
+        # and the gate below keeps it from CLAIMING outside a mode that trains.
+        if "lora-trainer" in equipped:
             from wanly_worker.services.lora_trainer.poller import Poller
-            _poller = Poller(client, _worker_id)
+            _poller = Poller(client, _worker_id, may_claim=_trainer_may_claim)
             _poller.start()
+        _sync_trainer_tenancy()
         try:
             yield
         finally:
@@ -145,7 +154,45 @@ def _worker_id() -> str | None:
     404 makes either writer re-register with a new one.
     """
     from wanly_worker.services.lora_trainer import gpu
+    # In train mode the daemon is stopped and deregistered its row on the way out, but its id
+    # file still names that row. The supervisor's queue client is the registrar then (#131),
+    # and its id is the live one.
+    if _queue is not None and not _queue.render_daemon_registers():
+        return _queue.worker_id or None
     return gpu.own_worker_id() or (_queue.worker_id if _queue else None)
+
+
+def _trainer_may_claim() -> bool:
+    """The poller's claim gate (#164): the trainer is in the running set and no switch is
+    under way. A switch accepted mid-claim would otherwise land a run on a card the next
+    mode's model is about to load onto."""
+    return "lora-trainer" in _active and _pending is None
+
+
+def _sync_trainer_tenancy() -> None:
+    """Tell the trainer whether it has the card to itself (train mode) or shares it with a
+    render daemon it must drain first (render mode). See gpu.SOLE_TENANT."""
+    if "lora-trainer" not in _equipped:
+        return
+    from wanly_worker.services.lora_trainer import gpu
+    gpu.SOLE_TENANT = _mode == "train"
+
+
+def _training_now() -> str | None:
+    """`<character> v<version> (step n/m)` while a training run is live in this process, else
+    None. The poller runs training here, in the control process -- the trainer service on
+    :8082 is POST /train's and never sees a claimed run."""
+    if "lora-trainer" not in _equipped:
+        return None
+    try:
+        from wanly_worker.services.lora_trainer.app import STORE
+        job = STORE.active()
+    except Exception:                           # noqa: BLE001 -- no trainer importable
+        return None
+    if job is None:
+        return None
+    snap = job.snapshot()
+    return f"{snap['character']} v{snap['version']} (step {snap['step']}/{snap['steps']})"
 
 
 def _fatal(e: Exception) -> None:
@@ -171,6 +218,76 @@ class ModeRequest(BaseModel):
 #: two make an image, so a handful is a couple of minutes; past this something is wedged and
 #: holding the box hostage is worse than the overlap.
 CAPTION_DRAIN_TIMEOUT_S = float(os.environ.get("CAPTION_DRAIN_TIMEOUT_S") or "600")
+
+#: THE UNLOAD CHECK (#164). After the old mode's services stop and before the new mode's start,
+#: the card must come down under this. Every mode's tenant is 14-21 GB, so a tenant left behind
+#: always shows; what may legitimately stay is the small stuff every mode keeps -- face-crop
+#: (~1.5 GB) and, on a card it shares, the scene captioner (JoyCaption, ~6.4 GB on 3090b).
+#: A box with another permanent tenant on the same card sets it higher in worker.env.
+MODE_SWITCH_VRAM_MAX_MIB = int(os.environ.get("MODE_SWITCH_VRAM_MAX_MIB") or "8192")
+#: How long the card gets to empty. Processes free their memory as they exit; ollama's unload
+#: takes a few seconds. Past this something is holding on, and starting anyway is the OOM.
+MODE_SWITCH_UNLOAD_TIMEOUT_S = float(os.environ.get("MODE_SWITCH_UNLOAD_TIMEOUT_S") or "90")
+#: The last switch's unload numbers, for /health and the ticket: what the card held when the
+#: switch found it, and after the unload.
+_last_unload: dict | None = None
+
+
+def _vram_used() -> int | None:
+    snap = gpu_snapshot()
+    return snap["vram_used_mib"] if snap else None
+
+
+class CardNotEmpty(RuntimeError):
+    """The old mode's services stopped and the card still holds a tenant's worth of memory."""
+
+
+async def _free_comfyui() -> None:
+    """Ask ComfyUI to drop its models before it is stopped. Best effort: the process exiting
+    frees the card anyway; this makes the release start sooner and is harmless between
+    prompts (ComfyUI acts on the flag only when nothing is executing)."""
+    from wanly_worker.services.ltx_engine import COMFY_PORT
+    try:
+        await _client.post(f"http://127.0.0.1:{COMFY_PORT}/free",
+                           json={"unload_models": True, "free_memory": True}, timeout=10)
+    except Exception as e:                      # noqa: BLE001
+        print(f"mode: ComfyUI /free did not answer ({e}) — stopping it frees the card anyway",
+              flush=True)
+
+
+async def _wait_for_empty_card(before: str, target: str, found: int | None) -> None:
+    """Wait until the card is under MODE_SWITCH_VRAM_MAX_MIB, or raise CardNotEmpty.
+
+    Logs what it found and what is left, always: the numbers are the record of whether a switch
+    really cleared the card, and the one time it did not is the time they are needed.
+    """
+    global _last_unload
+    if found is None:
+        print("!! mode: cannot read the card (no nvidia-smi) — the unload is NOT verified",
+              flush=True)
+        _last_unload = {"from": before, "to": target, "found_mib": None, "after_mib": None,
+                        "limit_mib": MODE_SWITCH_VRAM_MAX_MIB, "ok": None}
+        return
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    used = _vram_used()
+    while used is not None and used > MODE_SWITCH_VRAM_MAX_MIB:
+        if loop.time() - started >= MODE_SWITCH_UNLOAD_TIMEOUT_S:
+            break
+        await asyncio.sleep(2)
+        used = _vram_used()
+    took = loop.time() - started
+    ok = used is not None and used <= MODE_SWITCH_VRAM_MAX_MIB
+    _last_unload = {"from": before, "to": target, "found_mib": found, "after_mib": used,
+                    "limit_mib": MODE_SWITCH_VRAM_MAX_MIB, "seconds": round(took, 1), "ok": ok}
+    print(f"mode: unload {before} -> {target}: card held {found} MiB, {used} MiB after "
+          f"{took:.0f}s (limit {MODE_SWITCH_VRAM_MAX_MIB} MiB)", flush=True)
+    if not ok:
+        raise CardNotEmpty(
+            f"the card still holds {used} MiB {took:.0f}s after stopping {before} (limit "
+            f"{MODE_SWITCH_VRAM_MAX_MIB} MiB) — not starting {target} on it. Something the "
+            f"switch does not own is on this GPU (nvidia-smi on the host says what); if it "
+            f"belongs there, raise MODE_SWITCH_VRAM_MAX_MIB in worker.env.")
 
 
 async def _caption_queue_depth() -> int | None:
@@ -230,7 +347,7 @@ async def _drain_captions() -> None:
 #: an idle 20 GB model. This is the backstop, not the mechanism.
 EDIT_IDLE_RETURN_S = float(os.environ.get("EDIT_IDLE_RETURN_S") or "600")
 #: The mode edit mode goes back to. Recorded on the way in; render when unknown.
-_return_from_edit: str = "ltx-engine"
+_return_from_edit: str = "render"
 _edit_watch: asyncio.Task | None = None
 
 
@@ -269,24 +386,46 @@ def _begin(target: str, names: list[str]) -> None:
 
 
 async def _switch(target: str, names: list[str]) -> None:
-    """Do the switch, off the request. Never raises: it has no caller left to raise to."""
-    global _mode, _pending, _mode_error, _return_from_edit, _edit_watch
+    """Do the switch, off the request. Never raises: it has no caller left to raise to.
+
+    THE ORDER (#164): finish what is in flight, drop the old tenant's model, stop its services,
+    VERIFY THE CARD EMPTIED, then start the new mode. A 20 GB model left resident by the last
+    mode is how a switch turns into an OOM; checking the card rather than trusting the stops is
+    what turns that into a refusal with a number in it.
+    """
+    global _mode, _active, _pending, _mode_error, _return_from_edit, _edit_watch
     from wanly_worker.services import image_description as imgdesc
-    before = _mode
+    before, before_names = _mode, list(_active)
+    touched = False          # whether anything was stopped or started, i.e. needs putting back
     try:
         async with _mode_lock:
-            # LEAVING caption mode: drop the model BEFORE the render stack comes back, or
-            # ComfyUI starts against a card a 20 GB captioner is still holding. That is the
-            # collision in the other direction, and it is the one that costs a render.
-            if target != "caption" and _mode == "caption":
-                # Order matters: let the captions FINISH, then drop the model, then start
-                # the render stack. Dropping first would pull the card out from under a
-                # caption that is still running.
+            # Re-checked under the lock: the poller may have claimed between the accept and
+            # now. Training is never interrupted mid-step.
+            training = _training_now()
+            if training:
+                raise RuntimeError(f"training {training} started before the switch ran; "
+                                   f"switch after it finishes")
+            leaving = [n for n in before_names if n not in names]
+            # LEAVING motion mode: let the captions FINISH, then drop the model. Dropping
+            # first would pull the card out from under a caption that is still running.
+            if "image-description" in leaving and before == "motion":
                 await _drain_captions()
+            if "image-description" in leaving:
                 await imgdesc.service.release(_client)
+            if "ltx-engine" in leaving:
+                await _free_comfyui()
+            if leaving:
+                found = _vram_used()
+                touched = True
+                # Stop only: everything that stays is already up, so this starts nothing.
+                await _sup.apply([n for n in before_names if n in names], _client)
+                _active = [n for n in before_names if n in names]
+                await _wait_for_empty_card(before, target, found)
 
+            touched = True
             await _sup.apply(names, _client)
-            _mode = target
+            _mode, _active = target, list(names)
+            _sync_trainer_tenancy()
             # WHO REGISTERS THIS BOX depends on what is running, and the switch just changed
             # that. Without this the first flip to captions left no registrar at all: the
             # daemon deregisters as it exits, so the row was deleted and the box disappeared
@@ -294,12 +433,11 @@ async def _switch(target: str, names: list[str]) -> None:
             if _queue is not None:
                 _queue.rebalance()
 
-            # ENTERING caption mode: pay the cold load here, where it is expected, instead
+            # ENTERING motion mode: pay the cold load here, where it is expected, instead
             # of inside the first caption, where 88 seconds reads as a hung request. Pinned
             # rather than left on wanly-api's 15m keep_alive, so it stays resident until the
-            # box is flipped back -- and re-pinned on a timer, because every caption request
-            # resets the model's keep_alive to its own.
-            if target == "caption":
+            # box is flipped back.
+            if target == "motion":
                 await imgdesc.service.warm(_client)
             if target == "edit":
                 if before != "edit":
@@ -309,14 +447,14 @@ async def _switch(target: str, names: list[str]) -> None:
     except Exception as e:                      # noqa: BLE001 -- reported, not swallowed
         _mode_error = str(e)
         print(f"!! mode switch to {target} failed: {e}", flush=True)
-        if target == "edit" and before != "edit":
-            # PUT THE BOX BACK. Entering edit mode stops the render stack first; if image-edit
-            # then fails to start (a missing mount, a truncated checkpoint), leaving it there
-            # would park every queued render behind a service that is not running.
+        if touched and _mode != target:
+            # PUT THE BOX BACK. The old mode's services were stopped; leaving them stopped
+            # would park every queued job behind a mode that never arrived.
             try:
                 async with _mode_lock:
-                    await _sup.apply(registry.select_mode(_equipped, before), _client)
-                    _mode = before
+                    await _sup.apply(before_names, _client)
+                    _mode, _active = before, before_names
+                    _sync_trainer_tenancy()
                     if _queue is not None:
                         _queue.rebalance()
                 print(f"mode: restored {before} after the failed switch", flush=True)
@@ -352,21 +490,50 @@ async def set_mode(body: ModeRequest):
 
     target = registry.canonical_mode(body.mode)
 
+    # NEVER MID-RUN (#164). A training run is an hour or more -- not a segment to wait out
+    # behind a pending switch that blocks every other switch meanwhile -- so it is refused
+    # with the run named, and the caller switches when it ends.
+    training = _training_now() if target != _mode else None
+    if training and _pending is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"training {training} on this box; switch to {target} after it finishes")
+
     # ACCEPTED AND RETURNED IMMEDIATELY. Stopping the render daemon waits for the segment in
     # flight to finish -- by design, so nothing is destroyed -- and that is up to ~27
     # minutes. Waiting for it here means the client times out and reports a failure while
     # the switch is going perfectly well. The state is readable from /health instead.
     if _pending is not None:
         if _pending == target:
-            return {"mode": _mode, "pending": _pending, "services": names, "changed": False}
+            return _mode_body(names, changed=False)
         raise HTTPException(
             status_code=409,
             detail=f"already switching to {_pending}; wait for it to land")
     if target == _mode:
-        return {"mode": _mode, "pending": None, "services": names, "changed": False}
+        return _mode_body(names, changed=False)
 
     _begin(target, names)
-    return {"mode": _mode, "pending": target, "services": names, "changed": True}
+    return _mode_body(names, changed=True)
+
+
+def _mode_body(names: list[str], changed: bool) -> dict:
+    """POST /mode's answer. `mode`/`pending` in the spelling wanly-api compares against
+    (registry.LEGACY_NAME), `mode_name`/`pending_mode_name` in the four-mode one."""
+    return {"mode": registry.legacy_name(_mode), "pending": registry.legacy_name(_pending),
+            "mode_name": _mode, "pending_mode_name": _pending,
+            "services": names, "changed": changed}
+
+
+def _available_modes() -> list[str]:
+    """The modes this box can enter -- the ones select_mode does not refuse for its SERVICES."""
+    out = []
+    for m in registry.MODES:
+        try:
+            registry.select_mode(_equipped, m)
+            out.append(m)
+        except registry.ConfigError:
+            pass
+    return out
 
 
 @app.get("/health")
@@ -388,12 +555,20 @@ async def health():
         # What this box CAN do and what it is doing, so a caller can offer the other mode
         # without knowing anything about this container.
         "equipped": _equipped,
-        "mode": _mode,
+        # `mode` and `pending_mode` keep the spelling wanly-api and the console compare against
+        # (ltx-engine / caption / edit, and train); `mode_name` and `pending_mode_name` are
+        # the four-mode names (#164). See registry.LEGACY_NAME.
+        "mode": registry.legacy_name(_mode),
+        "mode_name": _mode,
+        "modes": _available_modes() if _equipped else [],
         # Set while a switch is running. The caller shows it as in-progress rather than as
         # the mode it is not in yet -- and `mode_error` is how a switch that failed says so,
         # since by then there is no request left to answer.
-        "pending_mode": _pending,
+        "pending_mode": registry.legacy_name(_pending),
+        "pending_mode_name": _pending,
         "mode_error": _mode_error,
+        # What the last switch found on the card and what was left after the unload.
+        "last_unload": _last_unload,
         "build": BUILD,
         "code": _code_ref(),
         "services": services,

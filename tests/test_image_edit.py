@@ -670,11 +670,13 @@ def box(monkeypatch):
         monkeypatch.setattr(control, "_sup", s)
         monkeypatch.setattr(control, "_client", object())
         monkeypatch.setattr(control, "_equipped", list(THE_3090))
-        monkeypatch.setattr(control, "_mode", "ltx-engine")
+        monkeypatch.setattr(control, "_mode", "render")
+        monkeypatch.setattr(control, "_active", select_mode(THE_3090, "render"))
         monkeypatch.setattr(control, "_mode_lock", asyncio.Lock())
         monkeypatch.setattr(control, "_pending", None)
         monkeypatch.setattr(control, "_mode_error", None)
         monkeypatch.setattr(control, "_queue", None)
+        monkeypatch.setattr(control, "_vram_used", lambda: 1200)
         return s
     return make
 
@@ -695,22 +697,23 @@ class TestEditModeSwitch:
         s = box()
         mode, err = _settle("edit")
         assert (mode, err) == ("edit", None)
-        assert s.applied == [["face-crop", "image-edit"]]
-        assert control._return_from_edit == "ltx-engine"
+        # Stop the render line down to what stays (face-crop), verify the card, start edit.
+        assert s.applied == [["face-crop"], ["face-crop", "image-edit"]]
+        assert control._return_from_edit == "render"
 
     def test_a_failed_start_puts_the_render_stack_back(self, box):
         """Entering edit mode stops the render stack first. If image-edit then cannot start,
         leaving the box there would park every queued render behind nothing."""
         s = box(fail_on="image-edit")
         mode, err = _settle("edit")
-        assert mode == "ltx-engine"
+        assert mode == "render"
         assert "not mounted" in err
         assert s.applied[-1] == select_mode(THE_3090, "ltx-engine")
 
     def test_idle_hands_the_card_back(self, box, monkeypatch):
         s = box()
         monkeypatch.setattr(control, "EDIT_IDLE_RETURN_S", 4.0)
-        monkeypatch.setattr(control, "_return_from_edit", "ltx-engine")
+        monkeypatch.setattr(control, "_return_from_edit", "render")
 
         async def idle():
             return 999.0
@@ -722,6 +725,7 @@ class TestEditModeSwitch:
 
         async def go():
             control._mode = "edit"
+            control._active = select_mode(THE_3090, "edit")
             real_sleep = asyncio.sleep
             monkeypatch.setattr(control.asyncio, "sleep", fast_sleep)
             await control._watch_edit_idle()
@@ -729,7 +733,7 @@ class TestEditModeSwitch:
             await control._mode_task
             return control._mode
 
-        assert asyncio.run(go()) == "ltx-engine"
+        assert asyncio.run(go()) == "render"
         assert s.applied[-1] == select_mode(THE_3090, "ltx-engine")
 
     def test_not_idle_long_enough_stays(self, box, monkeypatch):
