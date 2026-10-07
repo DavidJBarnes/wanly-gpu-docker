@@ -310,13 +310,19 @@ def gpu_snapshot() -> dict | None:
     """
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total,memory.used",
+            ["nvidia-smi", "--query-gpu=name,uuid,memory.total,memory.used",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10)
         if out.returncode != 0 or not out.stdout.strip():
             return None
-        name, total, used = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")]
-        return {"name": name, "vram_total_mib": int(total), "vram_used_mib": int(used),
+        lines = out.stdout.strip().splitlines()
+        name, uuid, total, used = [p.strip() for p in lines[0].split(",")]
+        # `uuid` names the card (#163): with two cards in a box, "RTX 3090" alone does not say
+        # whether the pin landed. `visible` > 1 means this container is NOT pinned, and these
+        # numbers are card 0's only.
+        return {"name": name, "uuid": uuid, "visible": len(lines),
+                "pinned_uuid": os.environ.get("GPU_UUID") or os.environ.get("GPU_DEVICE") or None,
+                "vram_total_mib": int(total), "vram_used_mib": int(used),
                 "vram_free_mib": int(total) - int(used)}
     except Exception:
         return None

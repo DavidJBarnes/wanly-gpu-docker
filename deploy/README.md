@@ -267,6 +267,45 @@ forever" delay, which is the gap an edit starts in.
    defaults to `http://2070.zero:8086` and is simply skipped while nothing healthy answers
    there. If the box is renamed, set `IMAGE_EDIT_STANDING_URL` in the API's env.
 
+## One card per container, and a second container on one host (#163)
+
+With two cards in a box (3090a: the 3090 + the 2070; 3090b: the 3090 + the 3080),
+`--device nvidia.com/gpu=all` hands both to every container, and ollama, ComfyUI and torch pick
+one **by index** -- which a reboot can reorder. Pin each container to its card **by UUID**:
+
+    nvidia-smi -L                      # on the host: GPU 0: NVIDIA GeForce RTX 3090 (UUID: GPU-522c...)
+    nvidia-ctk cdi list                # the CDI spec must list nvidia.com/gpu=GPU-522c...
+
+    # deploy/worker.env
+    GPU_UUID=GPU-522c32cc-7ac2-9dcd-f1d5-4f5390e68f0b
+
+`run-worker.sh` then passes `--device nvidia.com/gpu=$GPU_UUID` (CDI, never `--gpus`, #95). It
+refuses **before removing anything** if the value is not a UUID, not a card on this host, or not
+in the CDI spec (after a new card: `sudo systemctl start nvidia-cdi-refresh`). The container
+checks again at boot and refuses unless it sees exactly that one card; `/health` → `gpu.uuid`,
+`gpu.visible` (1 when pinned) and `gpu.pinned_uuid`. Unset `GPU_UUID` keeps `all`, with a boot
+warning when that is more than one card. `GPU_DEVICE` is accepted as the same setting.
+
+**A second container** -- the 2070's scene captioner beside the 3090 worker -- runs from its own
+env file:
+
+    cp deploy/scene.env.example deploy/scene.env     # fill in QUEUE_API_KEY and the 2070's GPU_UUID
+    WORKER_ENV=deploy/scene.env ./deploy/run-worker.sh
+
+It needs its own `NAME` (`wanly-scene`), `FRIENDLY_NAME` (`3090a-scene`) and `CONTROL_PORT`
+(`8088`). `run-worker.sh` refuses, before the rm, if `NAME` would replace a container created
+from a different env file (every container records its env file in the `wanly.env` label; an
+unlabelled one is the main worker's), if another container already uses the `FRIENDLY_NAME`
+(wanly-api keys its worker row on it), or if a port is taken. A `SERVICES=scene-caption`
+container registers as a `service`: no render daemon, never offered a segment.
+
+The update timer converges `deploy/worker.env`'s container only. Update the scene container by
+re-running the line above after changing its `IMAGE`.
+
+Memory: the two caps together should leave the host ~6-8 GB. On 3090a (61 GB) that means
+lowering the 3090 worker's `WORKER_MEMORY_LIMIT` from 54g to ~46g when the scene container takes
+8g.
+
 ## scene-caption: JoyCaption, always on (wanly-console#572)
 
 One captioner used to make both halves of a video prompt -- the static scene and the motion
