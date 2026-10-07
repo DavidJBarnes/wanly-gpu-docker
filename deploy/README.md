@@ -375,6 +375,24 @@ reference rather than sending it to an engine without that feature, so a worker 
 older image fails sheet renders with a message saying to re-pin -- it never renders them
 without the sheet.
 
+## Why did it reset? (#193)
+
+3090a resets without a trace in the journal. The AMD chipset records the cause of the last reset
+(`S5_RESET_STATUS`); kernel 6.14 neither reads nor clears it, so `reset-reason.sh` does, once a
+boot, as a lingering user unit:
+
+```bash
+cp deploy/wanly-reset-reason.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable wanly-reset-reason.service
+```
+
+Each boot appends a line to `~/.local/state/wanly/reset-reasons.log` (and the journal, tag
+`wanly-reset-reason`): how the previous boot ended, and the decoded register. An UNCLEAN end
+with only bit 21 (an ACPI power transition) -- no thermal trip, CPU shutdown, watchdog or sync
+flood -- means the chip did not reset itself: power was taken away from it. Bit 11 (reserved)
+is set on 3090a and does not clear: ignore it. The first read, 2026-10-07, held 0x00200800 --
+bit 21 and bit 11 alone after ~23 unclean resets since 09-06.
+
 ## Rollback
 
 `run-worker.sh` honours `IMAGE`, so pinning an older build is:

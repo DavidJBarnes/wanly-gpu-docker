@@ -1,0 +1,15 @@
+[Unit]
+Description=Log why this box last reset (AMD S5_RESET_STATUS), then clear it
+Documentation=https://github.com/DavidJBarnes/wanly-gpu-docker/issues/193
+
+[Service]
+Type=oneshot
+# A USER unit, like wanly-worker-update: the user owns the docker socket, which is the only
+# route to /dev/mem without sudo. Linger is on, so the user manager -- and this -- starts at
+# boot without a login.
+ExecStart=/home/david/wanly-gpu-docker/deploy/reset-reason.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
