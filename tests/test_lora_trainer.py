@@ -1885,6 +1885,15 @@ class TestWD14Captions:
                                 "explicit"])
         assert got == "k3lly, solo, smile, breast_hold, hair_over_shoulder, parted_lips"
 
+    def test_worn_glasses_train_into_the_trigger(self):
+        """#202: Joana's frames belong to her trigger, not to a tag SDXL draws generically."""
+        from wanly_worker.services.lora_trainer.wd14 import caption
+        got = caption("j0ana", ["glasses", "brown-framed_eyewear", "semi-rimless_eyewear",
+                                "smile", "sunglasses", "eyewear_on_head", "adjusting_eyewear",
+                                "holding_eyewear", "tinted_eyewear", "eyewear_removed"])
+        assert got == ("j0ana, smile, sunglasses, eyewear_on_head, adjusting_eyewear, "
+                       "holding_eyewear, tinted_eyewear, eyewear_removed")
+
     def test_broken_preprocessing_is_recognised(self):
         from wanly_worker.services.lora_trainer.wd14 import looks_broken
         assert looks_broken(["k3lly, solo, simple_background, black_background",
