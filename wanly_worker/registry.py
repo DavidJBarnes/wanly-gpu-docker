@@ -17,6 +17,8 @@ degraded state to tolerate, it is a misconfiguration to report.
 """
 from __future__ import annotations
 
+import os
+
 from typing import Callable
 
 from wanly_worker.service import Service
@@ -40,7 +42,8 @@ KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
     "image-edit": image_edit_group,
     # JoyCaption for the <SCENE> half, always resident (wanly-console#572). Called, claims
     # nothing, adds no kind, and runs in every mode: on a card it shares with image-edit it
-    # yields per edit (SCENE_CAPTION_SHARED) rather than being stopped by a mode.
+    # yields per edit (SCENE_CAPTION_SHARED) rather than being stopped by a mode -- unless
+    # SCENE_CAPTION_MODES keeps it to some modes (#199, 3090b until the 2070).
     "scene-caption": scene_caption_group,
 }
 
@@ -136,7 +139,45 @@ def canonical_mode(raw: str | None) -> str:
     return _MODE_ALIASES.get(mode, mode)
 
 
+#: The env var that scopes scene-caption to some modes (wanly-gpu-docker#199). Unset: every
+#: mode, which is right for its own card (the 2070). Set, e.g. `edit`: only those modes.
+SCENE_CAPTION_MODES_ENV = "SCENE_CAPTION_MODES"
+
+
+def scene_caption_modes(raw: str | None) -> set[str] | None:
+    """The modes scene-caption may run in, or None for all of them (the default).
+
+    Exists for a box whose ONE card scene-caption shares with everything else -- 3090b until
+    the 2070 is in. JoyCaption (~6 GB) is resident; it yields to image-edit per edit
+    (SCENE_CAPTION_SHARED) but knows nothing about a render, so beside a 23 GB LTX render it
+    would OOM the card. `SCENE_CAPTION_MODES=edit` keeps it to the mode it knows how to share.
+    An unknown mode refuses: a typo here would otherwise drop scene captions from every mode
+    and look exactly like a captioner that is down.
+    """
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    if not parts:
+        return None
+    out = {canonical_mode(p) for p in parts}
+    bad = sorted(m for m in out if m not in MODES)
+    if bad:
+        raise ConfigError(
+            f"{SCENE_CAPTION_MODES_ENV}={raw!r} names {', '.join(bad)}, which "
+            f"{'is not a mode' if len(bad) == 1 else 'are not modes'}. "
+            f"Known modes: {', '.join(MODES)}")
+    return out
+
+
 def select_mode(names: list[str], raw: str | None) -> list[str]:
+    """Narrow `names` to the services MODE asks for, then drop scene-caption from any mode
+    SCENE_CAPTION_MODES leaves it out of (#199). Unset means render mode."""
+    picked = _select_mode(names, raw)
+    allowed = scene_caption_modes(os.environ.get(SCENE_CAPTION_MODES_ENV))
+    if allowed is None or canonical_mode(raw) in allowed:
+        return picked
+    return [n for n in picked if n != "scene-caption"]
+
+
+def _select_mode(names: list[str], raw: str | None) -> list[str]:
     """Narrow `names` to the services MODE asks for. Unset means render mode.
 
     Order is preserved -- see parse_services; services start in the order given.

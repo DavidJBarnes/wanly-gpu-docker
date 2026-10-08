@@ -149,7 +149,8 @@ if [ "$WANT_SCENE" = "1" ]; then
     fi
     # SCENE_CAPTION_SHARED=1 only where the card is shared with image-edit (3090b, interim):
     # each edit then asks JoyCaption to unload first, and hands the card back after.
-    for v in SCENE_CAPTION_SHARED SCENE_CAPTION_YIELD_WAIT_S IMAGE_EDIT_SCENE_RESUME_IDLE_S MODEL_LIMIT_RATE; do
+    # SCENE_CAPTION_MODES keeps it to some modes (#199): 3090b runs it in edit mode only.
+    for v in SCENE_CAPTION_SHARED SCENE_CAPTION_MODES SCENE_CAPTION_YIELD_WAIT_S IMAGE_EDIT_SCENE_RESUME_IDLE_S MODEL_LIMIT_RATE; do
         if [ -n "${!v:-}" ]; then SCENE_ENV_ARGS+=(-e "$v=${!v}"); fi
     done
 fi
