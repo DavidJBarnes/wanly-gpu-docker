@@ -35,6 +35,8 @@ class FaceCrop(Service):
 
     def details(self) -> dict:
         from wanly_worker.services.face_crop import detect as fd
+        from wanly_worker.services.face_crop import upscale as up
         # Reported here too, so the Workers page can show a box that is up but still fetching
         # its model rather than presenting it as ready to work.
-        return {"cos_floor": fd.COS_FLOOR, "pad": fd.PAD, "model_loaded": fd.is_loaded()}
+        return {"cos_floor": fd.COS_FLOOR, "pad": fd.PAD, "model_loaded": fd.is_loaded(),
+                "upscale_ready": up.available()}

@@ -304,6 +304,30 @@ RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
       echo "built without the SDXL trainer (WITH_TRAINER=0) — the lean :latest tag"; \
     fi
 
+# ---------------------------------------------------------------- face-crop upscaler (#206)
+#
+# Real-ESRGAN realesr-general-x4v3 and its wdn (denoise) pair, blended 0.2 / 0.8 by
+# wanly_worker/services/face_crop/upscale.py to bring small face crops and tiny close-ups up
+# to the trainer's 1024 ceiling (bucket_no_upscale never does it). ~5 MB each, so BOTH tags
+# carry them -- face-crop runs from either -- and baked rather than fetched at first use, for
+# the reason buffalo_l is preloaded: a model download inside a request blows wanly-api's
+# timeout. sha256-checked, like face-edit's: the release URLs are stable, but a truncated or
+# swapped file would load into a net that then quietly draws something else.
+#
+# No new Python dependency: SRVGG is a plain conv stack, run on the image's own torch on CPU.
+# Its own RUN, after every heavy layer, so adding it invalidated none of them.
+ENV FACE_UPSCALE_MODELS_DIR=/opt/face-crop/models
+RUN set -eux; mkdir -p "$FACE_UPSCALE_MODELS_DIR" && cd "$FACE_UPSCALE_MODELS_DIR" \
+ && for m in realesr-general-x4v3 realesr-general-wdn-x4v3; do \
+      curl -fsSL --retry 3 -o "$m.pth" \
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/$m.pth"; \
+    done \
+ && printf '%s  %s\n' \
+      8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292 realesr-general-x4v3.pth \
+      1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca realesr-general-wdn-x4v3.pth \
+    | sha256sum -c - \
+ && chmod -R a+rX /opt/face-crop
+
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
