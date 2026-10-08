@@ -40,7 +40,21 @@ STRIP_TAGS = {
     "breasts", "large_breasts", "medium_breasts", "small_breasts", "nipples", "dark_nipples",
     "areolae", "breasts_apart",
     "freckles", "lips", "nose", "mole", "mole_on_breast", "mole_under_mouth", "forehead",
+    "glasses",
 }
+
+#: WORN GLASSES ARE A FIXED FEATURE TOO (#202): Joana wears hers in every render. Tagged, they
+#: bind to `glasses` / `brown-framed_eyewear` instead of the trigger, and prompting the tag back
+#: draws SDXL's generic frames pasted over a face the LoRA learned bare. So `glasses` and every
+#: frame-style `*_eyewear` tag go -- but not these, which describe the SHOT, not the face.
+#: `sunglasses` and `eyewear_removed` / `eyewear_on_head` don't end in `_eyewear` and stay too.
+KEEP_EYEWEAR_TAGS = {"adjusting_eyewear", "holding_eyewear", "tinted_eyewear"}
+
+
+def _stripped(tag: str) -> bool:
+    if tag in STRIP_TAGS:
+        return True
+    return tag.endswith("_eyewear") and tag not in KEEP_EYEWEAR_TAGS
 
 #: What broken preprocessing produces for every image (how-to §4).
 GARBAGE = {"solo", "simple_background", "black_background", "dark", "negative_space"}
@@ -49,7 +63,7 @@ GARBAGE = {"solo", "simple_background", "black_background", "dark", "negative_sp
 def caption(trigger: str, tags: list[str]) -> str:
     """`<trigger>, tag, tag, ...` -- trigger FIRST, because keep_tokens and the prompt both
     assume it is. Missing trigger = dead LoRA (it killed a v8)."""
-    kept = [t for t in tags if t not in EXCLUDE_TAGS and t not in STRIP_TAGS and t != trigger]
+    kept = [t for t in tags if t not in EXCLUDE_TAGS and not _stripped(t) and t != trigger]
     return ", ".join([trigger, *kept])
 
 
