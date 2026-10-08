@@ -47,14 +47,20 @@ STRIP_TAGS = {
 #: bind to `glasses` / `brown-framed_eyewear` instead of the trigger, and prompting the tag back
 #: draws SDXL's generic frames pasted over a face the LoRA learned bare. So `glasses` and every
 #: frame-style `*_eyewear` tag go -- but not these, which describe the SHOT, not the face.
+#: `no_eyewear` most of all: it marks a bare-faced shot, the one place glasses are NOT on.
+#: Tinted lenses (`tinted_eyewear`, `red-tinted_eyewear`, ...) are sunglasses by another name.
 #: `sunglasses` and `eyewear_removed` / `eyewear_on_head` don't end in `_eyewear` and stay too.
-KEEP_EYEWEAR_TAGS = {"adjusting_eyewear", "holding_eyewear", "tinted_eyewear"}
+#: Names checked against the tagger's own selected_tags.csv on 3090a.
+KEEP_EYEWEAR_TAGS = {"adjusting_eyewear", "holding_eyewear", "hand_on_eyewear",
+                     "looking_over_eyewear", "no_eyewear"}
 
 
 def _stripped(tag: str) -> bool:
     if tag in STRIP_TAGS:
         return True
-    return tag.endswith("_eyewear") and tag not in KEEP_EYEWEAR_TAGS
+    if tag in KEEP_EYEWEAR_TAGS or tag.endswith("tinted_eyewear"):
+        return False
+    return tag.endswith("_eyewear")
 
 #: What broken preprocessing produces for every image (how-to §4).
 GARBAGE = {"solo", "simple_background", "black_background", "dark", "negative_space"}

@@ -1894,6 +1894,14 @@ class TestWD14Captions:
         assert got == ("j0ana, smile, sunglasses, eyewear_on_head, adjusting_eyewear, "
                        "holding_eyewear, tinted_eyewear, eyewear_removed")
 
+    def test_eyewear_that_describes_the_shot_stays(self):
+        """#202 follow-up: action/state tags and tinted lenses are not her frames."""
+        from wanly_worker.services.lora_trainer.wd14 import caption
+        keep = ["no_eyewear", "looking_over_eyewear", "hand_on_eyewear", "red-tinted_eyewear",
+                "opaque_glasses"]
+        assert caption("j0ana", ["rectangular_eyewear", "grey-framed_eyewear", *keep]) == \
+            ", ".join(["j0ana", *keep])
+
     def test_broken_preprocessing_is_recognised(self):
         from wanly_worker.services.lora_trainer.wd14 import looks_broken
         assert looks_broken(["k3lly, solo, simple_background, black_background",
