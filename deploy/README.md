@@ -353,16 +353,27 @@ peaks at ~23.5 GB, so it cannot load beside JoyCaption. Mirroring image-edit's A
 
 On a dedicated card (the 2070, phase 2) leave the flag off: `/yield` then does nothing.
 
-**3090b's `worker.env`** (interim):
+**Only in some modes (`SCENE_CAPTION_MODES`, #199).** scene-caption runs in every mode by
+default, which is right on its own card. On a card that also renders it must not: JoyCaption
+(~6 GB, resident) yields to image-edit but knows nothing about a render, and beside a 23 GB LTX
+render it would OOM the card. `SCENE_CAPTION_MODES=edit` keeps it to edit mode: a switch to
+render stops it like any mode-excluded service (with #164's checked unload), a switch to edit
+starts it. A comma list takes several modes; an unknown one refuses the boot.
 
-    SERVICES=image-edit,scene-caption
-    OLLAMA_HOST_STORE=/usr/share/ollama/.ollama
+**3090b's `worker.env`** (interim, until the 2070 is in — render and edit from the console,
+scene captions while in edit):
+
+    SERVICES=ltx-engine,image-edit,face-crop,scene-caption
+    MODE=render
     SCENE_CAPTION_SHARED=1
+    SCENE_CAPTION_MODES=edit
+    OLLAMA_HOST_STORE=/home/david/ollama-store
     PRUNE_IMAGES=0
 
-then `PRUNE_IMAGES=0 ./deploy/run-worker.sh` and check `curl -s :11436/health` (`ollama_up`,
-`resident: true`, `shared: true`) and `curl -s :8086/health` (`shares_with_scene_caption: true`).
-`select_mode` runs both: a box where nothing claims work runs everything it is equipped with.
+then `PRUNE_IMAGES=0 ./deploy/run-worker.sh`. Switch to edit from the console's Workers page and
+check `curl -s :11436/health` (`ollama_up`, `resident: true`, `shared: true`) and
+`curl -s :8086/health` (`shares_with_scene_caption: true`). In render mode `:11436` is down by
+design: scene captions wait for the next switch to edit.
 
 ## Render or caption, one command (#131)
 
