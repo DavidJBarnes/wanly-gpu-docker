@@ -63,9 +63,11 @@ class TestCroppingRules:
 
     def test_faces_are_returned_largest_first_and_indexed(self):
         import inspect
-        src = inspect.getsource(fd.detect)
-        assert "faces.sort" in src
-        assert "index=i" in src
+        # Sorted in the finder detect() and measure() share (#206), so "face 0" means the same
+        # face to a crop and to a measurement.
+        assert "faces.sort" in inspect.getsource(fd._find)
+        assert "_find(" in inspect.getsource(fd.measure)
+        assert "index=i" in inspect.getsource(fd.detect)
 
     def test_the_crop_is_square(self):
         """A varying aspect ratio buckets unpredictably, and bucket_no_upscale means the bucket
@@ -326,3 +328,265 @@ class TestHeadAndShoulders:
                               framing="head_shoulders")
         out = asyncio.run(svc.crop(req))
         assert out.framing == "head_shoulders" and out.faces[0].width == 248
+
+
+# ------------------------------------------------------------------ #206: measure + upscale
+
+class _FakeFace:
+    def __init__(self, bbox, score=0.9, pose=None):
+        import numpy as np
+        self.bbox = np.array(bbox, dtype=float)
+        self.det_score = score
+        self.normed_embedding = np.array([0.6, 0.8])
+        self.pose = None if pose is None else np.array(pose, dtype=float)
+
+
+def _jpeg(w, h):
+    import cv2
+    import numpy as np
+    ok, buf = cv2.imencode(".jpg", np.full((h, w, 3), 128, np.uint8))
+    return buf.tobytes()
+
+
+def _detector(monkeypatch, faces):
+    class App:
+        def get(self, img):
+            return list(faces)
+    monkeypatch.setattr(fd, "_analyser", lambda: App())
+
+
+class TestMeasureAtTrainingSize:
+    """wanly-api#431: 29 of Joana v3's 48 faces were under 250 px AT TRAINING SIZE. The trainer
+    scales an image down to the 1024^2 area and never up (bucket_no_upscale), so the number
+    that matters is the face's height after that -- not in the photograph."""
+
+    def test_a_phone_photo_is_scaled_down_to_the_training_area(self):
+        # 1080x1440: the v3 phone shots.
+        assert fd.train_scale(1080, 1440) == pytest.approx((1024 * 1024 / (1080 * 1440)) ** 0.5)
+
+    def test_a_small_image_is_never_scaled_up(self):
+        """A 254 px close-up trains at 254 px -- the whole reason upscaling exists."""
+        assert fd.train_scale(254, 373) == 1.0
+        assert fd.train_scale(1024, 1024) == 1.0
+
+    def test_the_area_matches_the_trainer(self):
+        from wanly_worker.services.lora_trainer import recipe
+        assert fd.TRAIN_EDGE == recipe.DEFAULTS["resolution"] == recipe.SDXL_DEFAULTS["resolution"]
+
+    def test_it_reports_face_height_at_training_size_and_pose(self, monkeypatch):
+        # A 300 px face (y 100..400) in a 2048x2048 photo trains at 150 px.
+        _detector(monkeypatch, [_FakeFace([100, 100, 300, 400], pose=[5.0, -20.0, 2.0])])
+        m = fd.measure(_jpeg(2048, 2048))
+        assert (m["width"], m["height"], m["train_scale"]) == (2048, 2048, 0.5)
+        face = m["faces"][0]
+        assert face["face_h"] == 300 and face["face_px_at_train"] == 150
+        # insightface's pose is (pitch, yaw, roll); yaw is the one detect() has always read.
+        assert (face["pitch"], face["yaw"], face["roll"]) == (5.0, -20.0, 2.0)
+        assert face["box"] == [100, 100, 300, 400]
+
+    def test_faces_come_back_largest_first(self, monkeypatch):
+        _detector(monkeypatch, [_FakeFace([0, 0, 50, 50]), _FakeFace([0, 0, 200, 200])])
+        assert [f["face_h"] for f in fd.measure(_jpeg(500, 500))["faces"]] == [200, 50]
+
+    def test_no_face_is_an_empty_list_and_no_pose_is_none(self, monkeypatch):
+        _detector(monkeypatch, [])
+        monkeypatch.setattr(fd, "RETRY_PAD", 0.0)
+        assert fd.measure(_jpeg(400, 300))["faces"] == []
+        _detector(monkeypatch, [_FakeFace([0, 0, 100, 100])])
+        assert fd.measure(_jpeg(400, 300))["faces"][0]["yaw"] is None
+
+    def test_a_face_found_on_the_padded_retry_is_measured_in_the_original_frame(self, monkeypatch):
+        """#178's retry border must not inflate the box -- or the image size."""
+        class App:
+            def get(self, img):
+                return [_FakeFace([300, 300, 500, 500])] if img.shape[0] > 400 else []
+        monkeypatch.setattr(fd, "_analyser", lambda: App())
+        m = fd.measure(_jpeg(400, 400))   # 200 px border on each side when padded
+        assert m["width"] == 400 and m["faces"][0]["box"] == [100, 100, 300, 300]
+
+    def test_bytes_that_are_not_an_image_measure_as_none(self):
+        assert fd.measure(b"not an image") is None
+
+
+class TestUpscalePlanning:
+    """Which images Real-ESRGAN touches, and how far. Pure arithmetic, tested without torch."""
+
+    def test_a_small_crop_is_brought_to_the_ceiling_on_its_long_edge(self):
+        from wanly_worker.services.face_crop import upscale as up
+        assert up.plan(254, 373) == pytest.approx(1024 / 373)
+
+    def test_one_already_near_the_ceiling_is_left_alone(self):
+        """900 -> 1024 buys the trainer nothing and costs a model pass and a re-encode."""
+        from wanly_worker.services.face_crop import upscale as up
+        assert up.plan(720, 900) == 1.0
+        assert up.plan(2000, 3000) == 1.0
+
+    def test_the_target_is_the_trainer_ceiling(self):
+        from wanly_worker.services.face_crop import upscale as up
+        assert up.TARGET_EDGE == fd.MAX_EDGE == 1024
+
+    def test_the_denoise_blend_keeps_mostly_the_wdn_model(self):
+        """normal * 0.2 + wdn * 0.8 is the setting validated as keeping freckles. Backwards, it
+        is the plastic skin this exists to avoid."""
+        from wanly_worker.services.face_crop import upscale as up
+        assert up.DENOISE == 0.2
+        out = up.blend({"w": 1.0}, {"w": 0.0}, up.DENOISE)
+        assert out["w"] == pytest.approx(0.2)
+
+    def test_the_skin_smoothing_rrdb_model_is_not_used(self):
+        import inspect
+        from wanly_worker.services.face_crop import upscale as up
+        assert up.NORMAL == "realesr-general-x4v3.pth" and up.WDN == "realesr-general-wdn-x4v3.pth"
+        assert "RRDB" not in inspect.getsource(up._build)
+
+    def test_one_native_pass_at_most(self):
+        """A second 4x pass renders 16x internally for detail a tiny face does not have."""
+        from wanly_worker.services.face_crop import upscale as up
+        assert up.MAX_PASSES == 1
+
+    def test_the_weights_are_baked_into_the_image_and_checksummed(self):
+        import pathlib
+        from wanly_worker.services.face_crop import upscale as up
+        df = (pathlib.Path(__file__).parent.parent / "Dockerfile").read_text()
+        assert f"FACE_UPSCALE_MODELS_DIR={up.MODELS_DIR}" in df
+        for name in (up.NORMAL, up.WDN):
+            assert name.removesuffix(".pth") in df
+        assert "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292" in df
+        assert "1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca" in df
+
+    def test_missing_weights_say_so(self, monkeypatch, tmp_path):
+        from wanly_worker.services.face_crop import upscale as up
+        monkeypatch.setattr(up, "MODELS_DIR", tmp_path)
+        assert up.available() is False
+
+
+class TestTilingHasNoSeams:
+    """Tiles are feathered, not hard-cut. With a net that is exactly nearest-neighbour 4x, the
+    tiled result must equal the untiled one to the last pixel."""
+
+    def test_tiled_equals_whole(self, monkeypatch):
+        torch = pytest.importorskip("torch")
+        import torch.nn.functional as F
+        from wanly_worker.services.face_crop import upscale as up
+        net = lambda x: F.interpolate(x, scale_factor=4, mode="nearest")
+        x = torch.rand(1, 3, 300, 520)
+        monkeypatch.setattr(up, "TILE", 128)
+        assert torch.allclose(up._run_tiled(net, x), net(x), atol=1e-5)
+
+
+class TestCropWithUpscale:
+    def _fake_up(self, monkeypatch):
+        import cv2
+        from wanly_worker.services.face_crop import upscale as up
+        calls = []
+
+        def fake(img, target):
+            calls.append((img.shape[:2], target))
+            f = up.plan(img.shape[1], img.shape[0], target)
+            if f == 1.0:
+                return img
+            return cv2.resize(img, (round(img.shape[1] * f), round(img.shape[0] * f)))
+        monkeypatch.setattr(up, "upscale_bgr", fake)
+        monkeypatch.setattr(up, "available", lambda: True)
+        return calls
+
+    def _shape(self, face):
+        import cv2
+        import numpy as np
+        return cv2.imdecode(np.frombuffer(face.png, np.uint8), cv2.IMREAD_COLOR).shape[:2]
+
+    def test_a_small_crop_is_upscaled_to_the_ceiling(self, monkeypatch):
+        calls = self._fake_up(monkeypatch)
+        _detector(monkeypatch, [_FakeFace([450, 300, 530, 400])])   # 100 px face
+        face = fd.detect(_jpeg(1000, 1000), "head_shoulders", upscale=True)[0]
+        assert face.upscaled is True
+        assert max(self._shape(face)) == 1024
+        assert calls[0][1] == fd.MAX_EDGE
+        # The embedding is the original detection's, not re-run on invented pixels.
+        assert face.embedding == [0.6, 0.8]
+
+    def test_without_the_flag_nothing_changes(self, monkeypatch):
+        calls = self._fake_up(monkeypatch)
+        _detector(monkeypatch, [_FakeFace([450, 300, 530, 400])])
+        face = fd.detect(_jpeg(1000, 1000), "head_shoulders")[0]
+        assert face.upscaled is False and self._shape(face) == (310, 248) and calls == []
+
+    def test_a_crop_already_large_is_not_upscaled(self, monkeypatch):
+        self._fake_up(monkeypatch)
+        _detector(monkeypatch, [_FakeFace([1000, 600, 1400, 1100])])   # 500 px face
+        face = fd.detect(_jpeg(3000, 3000), "head_shoulders", upscale=True)[0]
+        assert face.upscaled is False and max(self._shape(face)) == 1024
+
+    def test_the_service_echoes_upscale(self, monkeypatch):
+        """An older service ignores `upscale` and sends plain crops; the echo is how wanly-api
+        tells, the same way it tells for framing."""
+        import asyncio
+        import base64
+        from wanly_worker.services.face_crop import app as svc
+        self._fake_up(monkeypatch)
+        _detector(monkeypatch, [_FakeFace([450, 300, 530, 400])])
+        assert svc.CropRequest(images=["x"]).upscale is False
+        req = svc.CropRequest(images=[base64.b64encode(_jpeg(1000, 1000)).decode()],
+                              framing="head_shoulders", upscale=True)
+        out = asyncio.run(svc.crop(req))
+        assert out.upscale is True and out.faces[0].upscaled is True
+
+    def test_upscale_without_weights_is_refused_not_ignored(self, monkeypatch):
+        import asyncio
+        from fastapi import HTTPException
+        from wanly_worker.services.face_crop import app as svc
+        from wanly_worker.services.face_crop import upscale as up
+        monkeypatch.setattr(up, "available", lambda: False)
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(svc.crop(svc.CropRequest(images=["x"], upscale=True)))
+        assert e.value.status_code == 503
+
+
+class TestTheEndpoints:
+    def test_health_names_what_this_build_can_do(self, monkeypatch):
+        """wanly-api checks this before a "Fix small faces" run, so an older service is caught
+        before any work, not half way through."""
+        import asyncio
+        from wanly_worker.services.face_crop import app as svc
+        from wanly_worker.services.face_crop import upscale as up
+        monkeypatch.setattr(up, "available", lambda: True)
+        h = asyncio.run(svc.health())
+        assert {"measure", "upscale", "head_shoulders"} <= set(h["features"])
+        assert h["upscale_ready"] is True and h["train_edge"] == fd.TRAIN_EDGE
+
+    def test_new_code_in_an_old_image_does_not_claim_upscale(self, monkeypatch):
+        """The code is fetched at boot, the weights come with the image: after a restart on an
+        image built before #206 this code runs with no weights, and must say so."""
+        import asyncio
+        from wanly_worker.services.face_crop import app as svc
+        from wanly_worker.services.face_crop import upscale as up
+        monkeypatch.setattr(up, "available", lambda: False)
+        h = asyncio.run(svc.health())
+        assert "measure" in h["features"] and "upscale" not in h["features"]
+
+    def test_measure_is_parallel_to_the_images(self, monkeypatch):
+        import asyncio
+        import base64
+        from wanly_worker.services.face_crop import app as svc
+        _detector(monkeypatch, [_FakeFace([0, 0, 100, 200])])
+        b = lambda x: base64.b64encode(x).decode()
+        out = asyncio.run(svc.measure(svc.ImagesRequest(images=[b(_jpeg(500, 500)),
+                                                               b(b"junk")])))
+        assert out["results"][0]["faces"][0]["face_px_at_train"] == 200
+        assert out["results"][1] is None
+
+    def test_whole_image_upscale_skips_what_is_already_big_enough(self, monkeypatch):
+        import asyncio
+        import base64
+        import cv2
+        import numpy as np
+        from wanly_worker.services.face_crop import app as svc
+        TestCropWithUpscale()._fake_up(monkeypatch)
+        b = lambda x: base64.b64encode(x).decode()
+        out = asyncio.run(svc.upscale(svc.ImagesRequest(images=[b(_jpeg(254, 373)),
+                                                               b(_jpeg(900, 900))])))
+        small, big = out["images"]
+        assert small["upscaled"] is True and (small["width"], small["height"]) == (697, 1024)
+        img = cv2.imdecode(np.frombuffer(base64.b64decode(small["b64"]), np.uint8), 1)
+        assert img.shape[:2] == (1024, 697)
+        assert big["upscaled"] is False and big["b64"] is None

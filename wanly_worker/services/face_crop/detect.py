@@ -21,6 +21,7 @@ embeddings leaves that check to be bolted on later, which is how it got skipped 
 """
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -101,6 +102,9 @@ class Face:
     #: photo the biggest face may be the wrong woman. That is the single most likely thing to go
     #: wrong here, and it did on p@y: an 887px crop of the wrong person survived a by-eye pass.
     index: int
+    #: Whether Real-ESRGAN enlarged this crop (#206). False for a crop already near the
+    #: ceiling, even when an upscale was asked for.
+    upscaled: bool = False
 
 
 def head_shoulders_box(x1: float, y1: float, x2: float, y2: float,
@@ -127,16 +131,17 @@ def head_shoulders_box(x1: float, y1: float, x2: float, y2: float,
     return (int(left), int(top), min(w, int(left + width)), min(h, int(top + height)))
 
 
-def detect(image_bytes: bytes, framing: str = "face") -> list[Face]:
-    """Every face in one image, largest first, cropped to `framing` (see FRAMINGS)."""
-    if framing not in FRAMINGS:
-        raise ValueError(f"framing {framing!r} is not one of {FRAMINGS}")
+def _decode(image_bytes: bytes):
+    import cv2
+    return cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def _find(img) -> tuple[list, int]:
+    """Every face the detector is confident in, largest first, and the border offset its boxes
+    are in (0 unless the retry below ran). Shared by detect() and measure(), so a face that can
+    be cropped is exactly a face that can be measured."""
     import cv2
 
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return []
     h, w = img.shape[:2]
     faces = [f for f in _analyser().get(img) if float(f.det_score) >= MIN_DET_SCORE]
     # A FACE THAT FILLS THE FRAME (#178): nothing found, so look again with a border round it.
@@ -150,6 +155,25 @@ def detect(image_bytes: bytes, framing: str = "face") -> list[Face]:
                                     cv2.BORDER_CONSTANT, value=(0, 0, 0))
         faces = [f for f in _analyser().get(padded) if float(f.det_score) >= MIN_DET_SCORE]
     faces.sort(key=lambda f: -( (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]) ))
+    return faces, offset
+
+
+def detect(image_bytes: bytes, framing: str = "face", upscale: bool = False) -> list[Face]:
+    """Every face in one image, largest first, cropped to `framing` (see FRAMINGS).
+
+    `upscale` (#206): a crop smaller than the trainer's ceiling is brought up to it with
+    Real-ESRGAN (upscale.py) before encoding. Without it a crop of a small face is exactly as
+    small to the trainer as the face already was in the photograph.
+    """
+    if framing not in FRAMINGS:
+        raise ValueError(f"framing {framing!r} is not one of {FRAMINGS}")
+    import cv2
+
+    img = _decode(image_bytes)
+    if img is None:
+        return []
+    h, w = img.shape[:2]
+    faces, offset = _find(img)
 
     out: list[Face] = []
     for i, f in enumerate(faces):
@@ -169,6 +193,14 @@ def detect(image_bytes: bytes, framing: str = "face") -> list[Face]:
         crop = img[top:bottom, left:right]
         if crop.size == 0:
             continue
+        # UP FIRST, when asked (#206): a small crop is brought to the ceiling before anything
+        # else, and never past it -- the cap below would only throw the extra away.
+        upscaled = False
+        if upscale:
+            from wanly_worker.services.face_crop import upscale as up
+            before = crop.shape[:2]
+            crop = up.upscale_bgr(crop, min(up.TARGET_EDGE, MAX_EDGE))
+            upscaled = crop.shape[:2] != before
         # DOWNSCALE, THEN JPEG. Both matter, and the reason is the wire, not the disk.
         #
         # A face box with PAD out of a 5 MB phone photo is ~1500 px square, and lossless PNG of
@@ -196,8 +228,54 @@ def detect(image_bytes: bytes, framing: str = "face") -> list[Face]:
             yaw=float(getattr(f, "pose", [0, 0, 0])[1]) if getattr(f, "pose", None) is not None else 0.0,
             embedding=[float(x) for x in emb] if emb is not None else [],
             index=i,
+            upscaled=upscaled,
         ))
     return out
+
+
+#: THE TRAINER'S AREA, as an edge: SDXL and LTX stills both bucket to about TRAIN_EDGE^2 pixels
+#: with bucket_no_upscale (lora_trainer/recipe.py), so a larger image is scaled DOWN to that
+#: area and a smaller one is left as it is. That is the size a face is learned at, and the only
+#: size worth measuring it at -- a 400 px face in a 4000 px photo trains at about 100 px.
+TRAIN_EDGE = int(os.environ.get("FACE_TRAIN_EDGE", "1024"))
+
+
+def train_scale(w: int, h: int) -> float:
+    """What the trainer scales a w x h image by: down to the TRAIN_EDGE^2 area, never up."""
+    if w <= 0 or h <= 0:
+        return 1.0
+    return min(1.0, math.sqrt(TRAIN_EDGE * TRAIN_EDGE / (w * h)))
+
+
+def measure(image_bytes: bytes) -> dict | None:
+    """One image's size and every face in it, largest first, with the face height AT TRAINING
+    SIZE (#206). None when the bytes are not an image.
+
+    `face_h` is the detector box's height, which runs roughly brow to chin -- the same number
+    the v3 audit was taken in (wanly-api#431: 29 of 48 under 250 px). Pose is insightface's
+    (pitch, yaw, roll) in degrees, absent as None when the landmark model gave none.
+    """
+    img = _decode(image_bytes)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    scale = train_scale(w, h)
+    faces, offset = _find(img)
+    out = []
+    for f in faces:
+        x1, y1, x2, y2 = [float(v) - offset for v in f.bbox]
+        pose = getattr(f, "pose", None)
+        pitch, yaw, roll = ([float(v) for v in pose[:3]] if pose is not None
+                            else [None, None, None])
+        face_h = y2 - y1
+        out.append({
+            "box": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+            "det_score": round(float(f.det_score), 4),
+            "yaw": yaw, "pitch": pitch, "roll": roll,
+            "face_h": round(face_h, 1),
+            "face_px_at_train": round(face_h * scale, 1),
+        })
+    return {"width": w, "height": h, "train_scale": round(scale, 4), "faces": out}
 
 
 def embed(image_bytes: bytes) -> list[float]:
