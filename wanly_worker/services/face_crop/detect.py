@@ -60,8 +60,21 @@ HS_ABOVE = float(os.environ.get("FACE_CROP_HS_ABOVE", "0.6"))
 HS_BELOW = float(os.environ.get("FACE_CROP_HS_BELOW", "1.5"))
 HS_ASPECT = float(os.environ.get("FACE_CROP_HS_ASPECT", "0.8"))
 
+#: PAIR FRAMING (wanly-api#436): both people of a two-person photo, for a COMPOSITION set (the
+#: pair's dataset, captioned with both triggers). A head-and-shoulders crop of ONE face there
+#: would train under "d@vid, jo@na, 1girl, 1boy" while showing one person -- teaching the pair
+#: LoRA that one face is both people, the face bleed of wanly-api#430. So the window is the
+#: union of the two largest face boxes, with head-and-shoulders room around it: HS_ABOVE /
+#: HS_BELOW of the BIGGER face's height above and below, PAIR_SIDE of it either side for the
+#: outer shoulders. Its aspect is held between PAIR_MIN_ASPECT (4:5, the portrait the solo
+#: crop uses: two heads one above the other) and PAIR_MAX_ASPECT (3:2: two heads side by side)
+#: -- a sliver 5:1 strip of two faces is no training image.
+PAIR_SIDE = float(os.environ.get("FACE_CROP_PAIR_SIDE", "0.8"))
+PAIR_MIN_ASPECT = float(os.environ.get("FACE_CROP_PAIR_MIN_ASPECT", "0.8"))
+PAIR_MAX_ASPECT = float(os.environ.get("FACE_CROP_PAIR_MAX_ASPECT", "1.5"))
+
 #: The framings a crop can ask for. "face" is the original square crop and the default.
-FRAMINGS = ("face", "head_shoulders")
+FRAMINGS = ("face", "head_shoulders", "pair")
 
 _app = None
 
@@ -131,6 +144,39 @@ def head_shoulders_box(x1: float, y1: float, x2: float, y2: float,
     return (int(left), int(top), min(w, int(left + width)), min(h, int(top + height)))
 
 
+def pair_box(a: tuple[float, float, float, float], b: tuple[float, float, float, float],
+             w: int, h: int) -> tuple[int, int, int, int]:
+    """The two-person window (wanly-api#436) around face boxes `a` and `b` (x1, y1, x2, y2) in
+    a w x h image, as (left, top, right, bottom).
+
+    BOTH FACES ARE ALWAYS INSIDE IT. Everything else gives way first: the aspect is corrected by
+    GROWING the window (wider for a tall pair, taller -- downward, toward the chests -- for a
+    wide one), never by cutting into the union; and when the photo is smaller than the window
+    it is clamped to the photo, which still holds the union because the union is in the photo.
+    Then it slides back inside, like head_shoulders_box. Never padded with black.
+    """
+    fh = max(a[3] - a[1], b[3] - b[1])
+    # The union, clamped to the photo: a detector box can poke past the frame at an edge.
+    x1, y1 = max(0.0, min(a[0], b[0])), max(0.0, min(a[1], b[1]))
+    x2, y2 = min(float(w), max(a[2], b[2])), min(float(h), max(a[3], b[3]))
+    left, right = x1 - PAIR_SIDE * fh, x2 + PAIR_SIDE * fh
+    top, bottom = y1 - HS_ABOVE * fh, y2 + HS_BELOW * fh
+    width, height = right - left, bottom - top
+    if width / height < PAIR_MIN_ASPECT:          # tall: widen, centred
+        grow = PAIR_MIN_ASPECT * height - width
+        left, width = left - grow / 2, width + grow
+    elif width / height > PAIR_MAX_ASPECT:        # wide: deepen, downward (keep the heads)
+        height = width / PAIR_MAX_ASPECT
+    width, height = min(width, float(w)), min(height, float(h))
+    # Clamping must not drop the union: a window narrower than the image is moved, not cut.
+    left = min(max(0.0, left), w - width, x1)
+    left = max(left, x2 - width, 0.0)
+    top = min(max(0.0, top), h - height, y1)
+    top = max(top, y2 - height, 0.0)
+    return (int(left), int(top), min(w, int(math.ceil(left + width))),
+            min(h, int(math.ceil(top + height))))
+
+
 def _decode(image_bytes: bytes):
     import cv2
     return cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -175,10 +221,26 @@ def detect(image_bytes: bytes, framing: str = "face", upscale: bool = False) -> 
     h, w = img.shape[:2]
     faces, offset = _find(img)
 
+    def box(f):
+        return tuple(float(v) - offset for v in f.bbox)
+
+    # PAIR: one crop per image, of both people, or nothing. Fewer than two faces means it is
+    # not a pair photo to the detector, and a one-face crop is exactly what must not happen
+    # here (wanly-api#436); the caller sees it in `no_face`. Face 0's detection rides along
+    # (its score, its embedding), as the largest face always has.
+    if framing == "pair":
+        if len(faces) < 2:
+            return []
+        windows = [(faces[0], pair_box(box(faces[0]), box(faces[1]), w, h))]
+    else:
+        windows = [(f, None) for f in faces]
+
     out: list[Face] = []
-    for i, f in enumerate(faces):
-        x1, y1, x2, y2 = [float(v) - offset for v in f.bbox]
-        if framing == "head_shoulders":
+    for i, (f, window) in enumerate(windows):
+        x1, y1, x2, y2 = box(f)
+        if window is not None:
+            left, top, right, bottom = window
+        elif framing == "head_shoulders":
             left, top, right, bottom = head_shoulders_box(x1, y1, x2, y2, w, h)
         else:
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
