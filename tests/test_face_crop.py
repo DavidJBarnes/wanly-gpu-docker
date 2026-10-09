@@ -597,7 +597,7 @@ class TestTheEndpoints:
 class TestPairFraming:
     """A composition set is captioned with BOTH triggers. A one-face crop under that caption
     teaches the pair LoRA that one face is both people (wanly-api#430), so the composition
-    fix crops both people: the union of the two largest faces, head-and-shoulders room around."""
+    fix crops both people: the union of the two largest faces, hair to chin round each (#209)."""
 
     # Two 100 px faces side by side, a little apart, in a big photo.
     A = (400.0, 500.0, 480.0, 600.0)
@@ -608,19 +608,27 @@ class TestPairFraming:
         return all(left <= b[0] and top <= b[1] and b[2] <= right and b[3] <= bottom
                    for b in boxes)
 
-    def test_it_holds_both_faces_with_room_round_them(self):
+    def test_it_holds_both_faces_hair_to_chin(self):
         win = fd.pair_box(self.A, self.B, 3000, 3000)
         left, top, right, bottom = win
         assert self._contains(win, self.A, self.B)
-        assert top == 500 - 60                                   # 0.6 face heights above
-        assert left == 400 - 80 and right == 780 + 80            # 0.8 either side
-        assert 0.8 <= (right - left) / (bottom - top) <= 1.5
+        assert top == 500 - 45                                   # 0.45 face heights above
+        assert left == 400 - 24 and right == 780 + 24            # 0.3 face widths either side
+        # 428 x 190 hair to chin is past 2:1, so it is deepened to exactly 2:1 -- downward.
+        assert (right - left, bottom - top) == (428, 214)
+
+    def test_each_face_gets_room_in_its_own_size(self):
+        """The smaller face's hair room is its own: sizing both by the bigger one is area the
+        smaller face pays for."""
+        big, small = (400.0, 500.0, 560.0, 700.0), (600.0, 560.0, 680.0, 660.0)
+        left, top, right, bottom = fd.pair_box(big, small, 3000, 3000)
+        assert top == 500 - 90 and left == 400 - 48 and right == 680 + 24
 
     def test_a_wide_pair_is_deepened_downward_not_cropped(self):
         far = (2000.0, 500.0, 2080.0, 600.0)
         left, top, right, bottom = fd.pair_box(self.A, far, 4000, 4000)
-        assert (right - left) / (bottom - top) == pytest.approx(1.5, abs=0.01)
-        assert top == 440 and self._contains((left, top, right, bottom), self.A, far)
+        assert (right - left) / (bottom - top) == pytest.approx(2.0, abs=0.01)
+        assert top == 455 and self._contains((left, top, right, bottom), self.A, far)
 
     def test_a_stacked_pair_is_widened_to_a_portrait(self):
         below = (420.0, 900.0, 500.0, 1000.0)
@@ -632,6 +640,14 @@ class TestPairFraming:
         cases = [((5, 5, 105, 105), (300, 10, 400, 110), (420, 300)),       # tight photo
                  ((0, 0, 80, 100), (900, 880, 1000, 1000), (1000, 1000)),     # opposite corners
                  ((-10, 50, 90, 150), (600, 40, 700, 140), (700, 400))]       # box past the edge
+        # And a sweep of side-by-side pairs, sizes and gaps, near every edge of a phone photo.
+        for fh in (120, 200, 600):
+            for gap in (0.0, 0.5, 1.5, 3.0):
+                for x0, y0 in ((0, 0), (1500, 2000), (3000 - 2.6 * fh - gap * fh, 4000 - fh)):
+                    a = (x0, y0, x0 + 0.8 * fh, y0 + fh)
+                    bx = a[2] + gap * fh
+                    cases.append((a, (bx, y0 + 0.1 * fh, bx + 0.7 * fh, y0 + 0.95 * fh),
+                                  (3000, 4000)))
         for a, b, (w, h) in cases:
             win = fd.pair_box(a, b, w, h)
             left, top, right, bottom = win
@@ -643,7 +659,7 @@ class TestPairFraming:
         _detector(monkeypatch, [_FakeFace(list(self.A)), _FakeFace(list(self.B))])
         out = fd.detect(_jpeg(2000, 2000), "pair")
         assert len(out) == 1 and out[0].index == 0
-        assert out[0].width == 860 - 320
+        assert out[0].width == 804 - 376
 
     def test_fewer_than_two_faces_is_no_crop_at_all(self, monkeypatch):
         """Never a one-face crop under a two-person caption."""
@@ -658,4 +674,151 @@ class TestPairFraming:
         one = base64.b64encode(_jpeg(2000, 2000)).decode()
         out = asyncio.run(svc.crop(svc.CropRequest(images=[one], framing="pair")))
         assert out.framing == "pair" and out.faces == [] and out.no_face == [0]
+        assert out.too_far_apart == []                  # one face is not "too far apart"
         assert "pair" in asyncio.run(svc.health())["features"]
+
+
+# ------------------------------------------------------------------ #209: tight enough to train
+
+def _side_by_side(fa, fb, gap, w=3000, h=4000):
+    """Two faces (heights fa, fb; width 0.8 of height) `gap` face-heights apart, a little
+    offset in height, centred in a w x h photo -- the shape of a two-person phone photo."""
+    fw_a, fw_b = 0.8 * fa, 0.8 * fb
+    x0 = w / 2 - (fw_a + gap * fa + fw_b) / 2
+    a = (x0, 1500.0, x0 + fw_a, 1500.0 + fa)
+    bx = a[2] + gap * fa
+    return a, (bx, 1530.0, bx + fw_b, 1530.0 + fb)
+
+
+class TestPairFaceSizeAtTraining:
+    """#209: on DavidJoana the first pair framing took the smaller face from a median 183 px to
+    210 at training size; 5 of 24 crops reached 250. The trainer takes ~TRAIN_EDGE^2 of area,
+    so what decides it is the faces' share of the crop -- and, for a wide crop, being delivered
+    at that area rather than at a 1024 long edge."""
+
+    @pytest.fixture
+    def fake_up(self, monkeypatch):
+        import cv2
+        from wanly_worker.services.face_crop import upscale as up
+
+        def fake(img, target):
+            f = up.plan(img.shape[1], img.shape[0], target)
+            if f == 1.0:
+                return img
+            return cv2.resize(img, (round(img.shape[1] * f), round(img.shape[0] * f)))
+        monkeypatch.setattr(up, "upscale_bgr", fake)
+        monkeypatch.setattr(up, "available", lambda: True)
+
+    def _trained_smaller_face(self, monkeypatch, a, b, w=3000, h=4000):
+        """END TO END: the crop detect() actually returns, then the trainer's own scaling --
+        the number wanly-api's next /measure would put on the badge."""
+        import cv2
+        import numpy as np
+        _detector(monkeypatch, [_FakeFace(list(a)), _FakeFace(list(b))])
+        face = fd.detect(_jpeg(w, h), "pair", upscale=True)[0]
+        out_h, out_w = cv2.imdecode(np.frombuffer(face.png, np.uint8), 1).shape[:2]
+        small = min(a[3] - a[1], b[3] - b[1])
+        return small * (out_w / face.width) * fd.train_scale(out_w, out_h)
+
+    @pytest.mark.parametrize("fa,fb,gap", [
+        (200, 200, 0.1),     # cheek to cheek
+        (220, 180, 0.3),
+        (180, 180, 0.5),
+        (210, 190, 1.0),
+        (200, 180, 2.0),     # a couple of face-heights apart
+    ])
+    def test_typical_side_by_side_faces_clear_250(self, monkeypatch, fake_up, fa, fb, gap):
+        a, b = _side_by_side(fa, fb, gap)
+        assert fd.pair_face_px(fd.pair_box(a, b, 3000, 4000), min(fa, fb)) >= 250
+        assert self._trained_smaller_face(monkeypatch, a, b) >= 250 * 0.99   # JPEG/int rounding
+
+    def test_it_beats_the_first_cut_by_far(self):
+        """The same cheek-to-cheek pair through #208's window (0.6 / 1.5 / 0.8 fh, 3:2, a 1024
+        long edge) trained the smaller face at 306 px; the tight window must do much better."""
+        a, b = _side_by_side(200, 200, 0.1)
+        assert fd.pair_face_px(fd.pair_box(a, b, 3000, 4000), 200) > 1.5 * 306
+
+    def test_a_wide_crop_is_delivered_at_the_training_area_not_a_1024_edge(self, monkeypatch,
+                                                                           fake_up):
+        """A 2:1 crop at 1024x512 is half the area the trainer would take, every face in it
+        1/sqrt(2) the size it could be."""
+        import cv2
+        import numpy as np
+        a, b = _side_by_side(200, 200, 2.5)
+        _detector(monkeypatch, [_FakeFace(list(a)), _FakeFace(list(b))])
+        face = fd.detect(_jpeg(3000, 4000), "pair", upscale=True)[0]
+        out_h, out_w = cv2.imdecode(np.frombuffer(face.png, np.uint8), 1).shape[:2]
+        assert out_w / out_h == pytest.approx(2.0, abs=0.01)
+        assert out_w * out_h == pytest.approx(fd.TRAIN_EDGE ** 2, rel=0.01)
+        assert fd.train_scale(out_w, out_h) == pytest.approx(1.0, abs=0.002)  # trainer keeps it
+
+    def test_a_big_pair_crop_is_scaled_down_to_the_area_too(self, monkeypatch):
+        import cv2
+        import numpy as np
+        a, b = _side_by_side(600, 600, 2.0)
+        _detector(monkeypatch, [_FakeFace(list(a)), _FakeFace(list(b))])
+        face = fd.detect(_jpeg(3000, 4000), "pair")[0]
+        out_h, out_w = cv2.imdecode(np.frombuffer(face.png, np.uint8), 1).shape[:2]
+        assert out_w * out_h <= fd.TRAIN_EDGE ** 2 and out_w > fd.MAX_EDGE
+
+    def test_the_solo_framings_still_cap_the_long_edge(self, monkeypatch):
+        """Area sizing is the pair's alone; the square and portrait crops are unchanged."""
+        import cv2
+        import numpy as np
+        _detector(monkeypatch, [_FakeFace([1000, 600, 1400, 1100])])
+        face = fd.detect(_jpeg(3000, 3000), "head_shoulders")[0]
+        shape = cv2.imdecode(np.frombuffer(face.png, np.uint8), 1).shape[:2]
+        assert max(shape) == fd.MAX_EDGE
+
+
+class TestPairTooFarApart:
+    """#209: two faces many face-widths apart leave each a sliver of a crop that is mostly the
+    room between them. Below PAIR_MIN_PX for the smaller face, the photo is reported, not
+    cropped -- in `no_face`, which is what wanly-api#440 already treats as "no crop"."""
+
+    def test_far_apart_faces_are_refused_with_the_number(self, monkeypatch):
+        a, b = _side_by_side(200, 200, 6.0)
+        _detector(monkeypatch, [_FakeFace(list(a)), _FakeFace(list(b))])
+        with pytest.raises(fd.PairTooFarApart) as e:
+            fd.detect(_jpeg(3000, 4000), "pair")
+        assert e.value.px < fd.PAIR_MIN_PX
+
+    def test_the_threshold_is_wanly_apis_small_face_line(self):
+        assert fd.PAIR_MIN_PX == 250
+
+    def test_it_is_judged_on_the_smaller_face(self):
+        """A big face beside a small one, close: the big one would clear 250, the small one
+        does not -- and the small one is the person the pair LoRA would learn small."""
+        big, small = (1000.0, 1500.0, 1400.0, 2000.0), (1450.0, 1700.0, 1530.0, 1800.0)
+        win = fd.pair_box(big, small, 3000, 4000)
+        assert fd.pair_face_px(win, 500) >= 250 > fd.pair_face_px(win, 100)
+
+    def test_zero_turns_the_rule_off(self, monkeypatch):
+        a, b = _side_by_side(200, 200, 6.0)
+        _detector(monkeypatch, [_FakeFace(list(a)), _FakeFace(list(b))])
+        monkeypatch.setattr(fd, "PAIR_MIN_PX", 0.0)
+        assert len(fd.detect(_jpeg(3000, 4000), "pair")) == 1
+
+    def test_the_service_reports_it_where_the_api_already_looks(self, monkeypatch):
+        """In `no_face` (the API's "no crop for this photo", unchanged) AND in `too_far_apart`
+        (why). Other images in the batch are unaffected."""
+        import asyncio
+        import base64
+        from wanly_worker.services.face_crop import app as svc
+        far = _side_by_side(200, 200, 6.0)
+        near = _side_by_side(200, 200, 0.2)
+        jpg = base64.b64encode(_jpeg(3000, 4000)).decode()
+        seq = iter([list(far), list(near)])
+
+        class App:
+            def get(self, img):
+                return [_FakeFace(list(box)) for box in next(seq)]
+        monkeypatch.setattr(fd, "_analyser", lambda: App())
+        out = asyncio.run(svc.crop(svc.CropRequest(images=[jpg, jpg], framing="pair")))
+        assert out.no_face == [0] and out.too_far_apart == [0]
+        assert [f.source_index for f in out.faces] == [1]
+
+    def test_other_framings_never_raise_it(self, monkeypatch):
+        a, b = _side_by_side(200, 200, 6.0)
+        _detector(monkeypatch, [_FakeFace(list(a)), _FakeFace(list(b))])
+        assert len(fd.detect(_jpeg(3000, 4000), "head_shoulders")) == 2

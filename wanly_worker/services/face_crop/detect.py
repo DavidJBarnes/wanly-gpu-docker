@@ -64,14 +64,38 @@ HS_ASPECT = float(os.environ.get("FACE_CROP_HS_ASPECT", "0.8"))
 #: pair's dataset, captioned with both triggers). A head-and-shoulders crop of ONE face there
 #: would train under "d@vid, jo@na, 1girl, 1boy" while showing one person -- teaching the pair
 #: LoRA that one face is both people, the face bleed of wanly-api#430. So the window is the
-#: union of the two largest face boxes, with head-and-shoulders room around it: HS_ABOVE /
-#: HS_BELOW of the BIGGER face's height above and below, PAIR_SIDE of it either side for the
-#: outer shoulders. Its aspect is held between PAIR_MIN_ASPECT (4:5, the portrait the solo
-#: crop uses: two heads one above the other) and PAIR_MAX_ASPECT (3:2: two heads side by side)
-#: -- a sliver 5:1 strip of two faces is no training image.
-PAIR_SIDE = float(os.environ.get("FACE_CROP_PAIR_SIDE", "0.8"))
+#: union of the two largest face boxes with room round each.
+#:
+#: TIGHT, HAIR TO CHIN (#209). The first cut gave each face head-and-shoulders room (0.6 above,
+#: 1.5 below, 0.8 of a face height either side) and on DavidJoana the smaller face went from a
+#: median 183 px to 210 px at training size -- 5 of 24 crops reached 250, some shrank. The
+#: trainer takes about TRAIN_EDGE^2 of AREA, so a face trains at
+#:     face_h * TRAIN_EDGE / sqrt(crop_w * crop_h)
+#: and the only lever is the faces' share of the crop: every shoulder in it is face lost. So
+#: each face gets its OWN room, in its own size -- PAIR_ABOVE of its height above the box (the
+#: box starts about the brow; this clears the crown and the hair on it), PAIR_BELOW under the
+#: chin, PAIR_SIDE of its width beyond the outer faces for ears and hair. Two 200 px faces
+#: cheek to cheek in a phone photo go from 306 px at training size to 518; two faces three
+#: face-heights apart from 190 to 338.
+PAIR_ABOVE = float(os.environ.get("FACE_CROP_PAIR_ABOVE", "0.45"))
+PAIR_BELOW = float(os.environ.get("FACE_CROP_PAIR_BELOW", "0.25"))
+PAIR_SIDE = float(os.environ.get("FACE_CROP_PAIR_SIDE", "0.3"))
+#: The aspect (width / height) the tight window is held between. Correcting it GROWS the window
+#: and so costs face size (area), which is why the wide end is 2:1 and not the 3:2 of the first
+#: cut: two heads a couple of face-heights apart are already 2:1 hair to chin, and holding them
+#: to 3:2 adds a third of chest for nothing -- at four face-heights apart that is the difference
+#: between 274 px and 237. Past 2:1 is a strip, not a picture of two people.
+#: The tall end is the solo portrait's 4:5, for one head above the other.
 PAIR_MIN_ASPECT = float(os.environ.get("FACE_CROP_PAIR_MIN_ASPECT", "0.8"))
-PAIR_MAX_ASPECT = float(os.environ.get("FACE_CROP_PAIR_MAX_ASPECT", "1.5"))
+PAIR_MAX_ASPECT = float(os.environ.get("FACE_CROP_PAIR_MAX_ASPECT", "2.0"))
+#: TOO FAR APART (#209): the smaller face must reach this many px AT TRAINING SIZE in the pair
+#: window, or no crop is made. It is wanly-api's "small face" line (#431), so a crop under it
+#: would come back from the fix still small -- an image added to the set that the very next
+#: measure flags again. Judged at the best the window can do (brought to the training area),
+#: which distance mostly decides: two faces many face-widths apart leave each a sliver of a crop
+#: that is mostly the room between them. Such a photo is reported, not cropped (app.py's
+#: `too_far_apart`). 0 turns the rule off.
+PAIR_MIN_PX = float(os.environ.get("FACE_CROP_PAIR_MIN_PX", "250"))
 
 #: The framings a crop can ask for. "face" is the original square crop and the default.
 FRAMINGS = ("face", "head_shoulders", "pair")
@@ -146,8 +170,8 @@ def head_shoulders_box(x1: float, y1: float, x2: float, y2: float,
 
 def pair_box(a: tuple[float, float, float, float], b: tuple[float, float, float, float],
              w: int, h: int) -> tuple[int, int, int, int]:
-    """The two-person window (wanly-api#436) around face boxes `a` and `b` (x1, y1, x2, y2) in
-    a w x h image, as (left, top, right, bottom).
+    """The two-person window (wanly-api#436, tightened in #209) around face boxes `a` and `b`
+    (x1, y1, x2, y2) in a w x h image, as (left, top, right, bottom).
 
     BOTH FACES ARE ALWAYS INSIDE IT. Everything else gives way first: the aspect is corrected by
     GROWING the window (wider for a tall pair, taller -- downward, toward the chests -- for a
@@ -155,12 +179,18 @@ def pair_box(a: tuple[float, float, float, float], b: tuple[float, float, float,
     it is clamped to the photo, which still holds the union because the union is in the photo.
     Then it slides back inside, like head_shoulders_box. Never padded with black.
     """
-    fh = max(a[3] - a[1], b[3] - b[1])
+    # Room in each face's OWN size: a small face beside a big one needs less hair room, and
+    # sizing both by the bigger one is area the smaller face pays for.
+    def room(f):
+        fw, fh = f[2] - f[0], f[3] - f[1]
+        return (f[0] - PAIR_SIDE * fw, f[1] - PAIR_ABOVE * fh,
+                f[2] + PAIR_SIDE * fw, f[3] + PAIR_BELOW * fh)
+    ra, rb = room(a), room(b)
     # The union, clamped to the photo: a detector box can poke past the frame at an edge.
     x1, y1 = max(0.0, min(a[0], b[0])), max(0.0, min(a[1], b[1]))
     x2, y2 = min(float(w), max(a[2], b[2])), min(float(h), max(a[3], b[3]))
-    left, right = x1 - PAIR_SIDE * fh, x2 + PAIR_SIDE * fh
-    top, bottom = y1 - HS_ABOVE * fh, y2 + HS_BELOW * fh
+    left, right = min(ra[0], rb[0]), max(ra[2], rb[2])
+    top, bottom = min(ra[1], rb[1]), max(ra[3], rb[3])
     width, height = right - left, bottom - top
     if width / height < PAIR_MIN_ASPECT:          # tall: widen, centred
         grow = PAIR_MIN_ASPECT * height - width
@@ -175,6 +205,34 @@ def pair_box(a: tuple[float, float, float, float], b: tuple[float, float, float,
     top = max(top, y2 - height, 0.0)
     return (int(left), int(top), min(w, int(math.ceil(left + width))),
             min(h, int(math.ceil(top + height))))
+
+
+def area_edge(w: int, h: int) -> int:
+    """The long edge a w x h crop has when brought to the trainer's TRAIN_EDGE^2 area -- what
+    a PAIR crop is delivered at (#209). Capping its long edge at MAX_EDGE instead, as the solo
+    framings do, would hand the trainer a 2:1 pair at 1024x512: half the area it would have
+    taken, and every face in it 1/sqrt(2) the size."""
+    if w <= 0 or h <= 0:
+        return MAX_EDGE
+    return int(TRAIN_EDGE * math.sqrt(max(w, h) / min(w, h)))
+
+
+def pair_face_px(window: tuple[int, int, int, int], face_h: float) -> float:
+    """How tall a face of `face_h` source px trains in `window` (#209), at the best that window
+    can do: brought to the training area. The far-apart rule (PAIR_MIN_PX) is judged on this."""
+    left, top, right, bottom = window
+    return face_h * TRAIN_EDGE / math.sqrt(max(1, right - left) * max(1, bottom - top))
+
+
+class PairTooFarApart(Exception):
+    """framing="pair" on a photo whose two faces are too far apart for any crop of both to
+    train the smaller at PAIR_MIN_PX (#209). Raised, not returned empty, so the service can
+    say WHY there is no crop -- "fewer than two faces" would send someone looking for a
+    detector miss that is not there."""
+
+    def __init__(self, px: float):
+        super().__init__(f"smaller face would train at {px:.0f} px (< {PAIR_MIN_PX:.0f})")
+        self.px = px
 
 
 def _decode(image_bytes: bytes):
@@ -226,12 +284,18 @@ def detect(image_bytes: bytes, framing: str = "face", upscale: bool = False) -> 
 
     # PAIR: one crop per image, of both people, or nothing. Fewer than two faces means it is
     # not a pair photo to the detector, and a one-face crop is exactly what must not happen
-    # here (wanly-api#436); the caller sees it in `no_face`. Face 0's detection rides along
+    # here (wanly-api#436); the caller sees it in `no_face`. Two faces too far apart for the
+    # smaller to reach PAIR_MIN_PX raise PairTooFarApart (#209). Face 0's detection rides along
     # (its score, its embedding), as the largest face always has.
     if framing == "pair":
         if len(faces) < 2:
             return []
-        windows = [(faces[0], pair_box(box(faces[0]), box(faces[1]), w, h))]
+        a, b = box(faces[0]), box(faces[1])
+        window = pair_box(a, b, w, h)
+        px = pair_face_px(window, min(a[3] - a[1], b[3] - b[1]))
+        if PAIR_MIN_PX > 0 and px < PAIR_MIN_PX:
+            raise PairTooFarApart(px)
+        windows = [(faces[0], window)]
     else:
         windows = [(f, None) for f in faces]
 
@@ -257,11 +321,16 @@ def detect(image_bytes: bytes, framing: str = "face", upscale: bool = False) -> 
             continue
         # UP FIRST, when asked (#206): a small crop is brought to the ceiling before anything
         # else, and never past it -- the cap below would only throw the extra away.
+        #
+        # A PAIR crop is sized by AREA, not long edge (#209, area_edge): it is the one framing
+        # that is not square-ish, and the trainer caps area.
+        h_c, w_c = crop.shape[:2]
+        cap = area_edge(w_c, h_c) if framing == "pair" else MAX_EDGE
         upscaled = False
         if upscale:
             from wanly_worker.services.face_crop import upscale as up
             before = crop.shape[:2]
-            crop = up.upscale_bgr(crop, min(up.TARGET_EDGE, MAX_EDGE))
+            crop = up.upscale_bgr(crop, cap if framing == "pair" else min(up.TARGET_EDGE, cap))
             upscaled = crop.shape[:2] != before
         # DOWNSCALE, THEN JPEG. Both matter, and the reason is the wire, not the disk.
         #
@@ -275,8 +344,8 @@ def detect(image_bytes: bytes, framing: str = "face", upscale: bool = False) -> 
         # bucket_no_upscale, so a larger crop is downscaled during latent caching regardless.
         h_c, w_c = crop.shape[:2]
         longest = max(h_c, w_c)
-        if longest > MAX_EDGE:
-            scale = MAX_EDGE / longest
+        if longest > cap:
+            scale = cap / longest
             crop = cv2.resize(crop, (max(1, int(w_c * scale)), max(1, int(h_c * scale))),
                               interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])

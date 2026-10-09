@@ -76,7 +76,8 @@ class CropRequest(BaseModel):
     #: "face" (the square crop, and the default) or "head_shoulders" (#187): a 4:5 portrait
     #: from just above the hairline to the upper chest.
     #: "pair" (wanly-api#436): ONE crop per image holding both of its two largest faces, for a
-    #: composition set; an image with fewer than two faces comes back in `no_face`.
+    #: composition set; an image with fewer than two faces comes back in `no_face`, and so does
+    #: one whose faces are too far apart to crop together (#209, also in `too_far_apart`).
     framing: Literal["face", "head_shoulders", "pair"] = "face"
     #: Real-ESRGAN each crop up to the trainer's ceiling (#206) when it is smaller than that.
     upscale: bool = False
@@ -111,6 +112,11 @@ class CropResponse(BaseModel):
     #: face" is the number that tells you the source set is wrong. With framing="pair": images
     #: with fewer than TWO faces -- not a pair photo, so nothing is cropped from them.
     no_face: list[int]
+    #: framing="pair" (#209): the images in `no_face` that DO have two faces, too far apart for
+    #: any crop of both to train the smaller at fd.PAIR_MIN_PX. A subset of `no_face`, not a
+    #: separate list, so a caller that predates it (wanly-api#440 reads only `no_face`) still
+    #: treats them as "no crop for this photo", which is right; this only says why.
+    too_far_apart: list[int] = Field(default_factory=list)
     cos_floor: float
     #: The framing these crops were cut to, echoed (#187). A service that predates framing
     #: ignores the request field and sends face crops; without this the caller could not tell.
@@ -151,8 +157,13 @@ def _crop(req: CropRequest) -> CropResponse:
     mean = fd.reference_mean(req.reference) if req.reference else []
     faces: list[CropFace] = []
     no_face: list[int] = []
+    too_far_apart: list[int] = []
     for i, b64 in enumerate(req.images):
-        found = fd.detect(base64.b64decode(b64), req.framing, upscale=req.upscale)
+        try:
+            found = fd.detect(base64.b64decode(b64), req.framing, upscale=req.upscale)
+        except fd.PairTooFarApart:
+            found = []
+            too_far_apart.append(i)
         if not found:
             no_face.append(i)
             continue
@@ -166,7 +177,8 @@ def _crop(req: CropRequest) -> CropResponse:
                 embedding=f.embedding,
                 upscaled=f.upscaled,
             ))
-    return CropResponse(faces=faces, no_face=no_face, cos_floor=fd.COS_FLOOR,
+    return CropResponse(faces=faces, no_face=no_face, too_far_apart=too_far_apart,
+                        cos_floor=fd.COS_FLOOR,
                         framing=req.framing, upscale=req.upscale)
 
 
