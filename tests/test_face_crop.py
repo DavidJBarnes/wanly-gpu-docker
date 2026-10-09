@@ -590,3 +590,72 @@ class TestTheEndpoints:
         img = cv2.imdecode(np.frombuffer(base64.b64decode(small["b64"]), np.uint8), 1)
         assert img.shape[:2] == (1024, 697)
         assert big["upscaled"] is False and big["b64"] is None
+
+
+# ------------------------------------------------------------------ wanly-api#436: pair framing
+
+class TestPairFraming:
+    """A composition set is captioned with BOTH triggers. A one-face crop under that caption
+    teaches the pair LoRA that one face is both people (wanly-api#430), so the composition
+    fix crops both people: the union of the two largest faces, head-and-shoulders room around."""
+
+    # Two 100 px faces side by side, a little apart, in a big photo.
+    A = (400.0, 500.0, 480.0, 600.0)
+    B = (700.0, 520.0, 780.0, 620.0)
+
+    def _contains(self, win, *boxes):
+        left, top, right, bottom = win
+        return all(left <= b[0] and top <= b[1] and b[2] <= right and b[3] <= bottom
+                   for b in boxes)
+
+    def test_it_holds_both_faces_with_room_round_them(self):
+        win = fd.pair_box(self.A, self.B, 3000, 3000)
+        left, top, right, bottom = win
+        assert self._contains(win, self.A, self.B)
+        assert top == 500 - 60                                   # 0.6 face heights above
+        assert left == 400 - 80 and right == 780 + 80            # 0.8 either side
+        assert 0.8 <= (right - left) / (bottom - top) <= 1.5
+
+    def test_a_wide_pair_is_deepened_downward_not_cropped(self):
+        far = (2000.0, 500.0, 2080.0, 600.0)
+        left, top, right, bottom = fd.pair_box(self.A, far, 4000, 4000)
+        assert (right - left) / (bottom - top) == pytest.approx(1.5, abs=0.01)
+        assert top == 440 and self._contains((left, top, right, bottom), self.A, far)
+
+    def test_a_stacked_pair_is_widened_to_a_portrait(self):
+        below = (420.0, 900.0, 500.0, 1000.0)
+        left, top, right, bottom = fd.pair_box(self.A, below, 3000, 3000)
+        assert (right - left) / (bottom - top) == pytest.approx(0.8, abs=0.01)
+        assert self._contains((left, top, right, bottom), self.A, below)
+
+    def test_it_never_leaves_the_photo_and_never_drops_a_face(self):
+        cases = [((5, 5, 105, 105), (300, 10, 400, 110), (420, 300)),       # tight photo
+                 ((0, 0, 80, 100), (900, 880, 1000, 1000), (1000, 1000)),     # opposite corners
+                 ((-10, 50, 90, 150), (600, 40, 700, 140), (700, 400))]       # box past the edge
+        for a, b, (w, h) in cases:
+            win = fd.pair_box(a, b, w, h)
+            left, top, right, bottom = win
+            assert 0 <= left < right <= w and 0 <= top < bottom <= h
+            clamp = lambda x: (max(0, x[0]), max(0, x[1]), min(w, x[2]), min(h, x[3]))
+            assert self._contains(win, clamp(a), clamp(b))
+
+    def test_detect_makes_one_crop_of_both(self, monkeypatch):
+        _detector(monkeypatch, [_FakeFace(list(self.A)), _FakeFace(list(self.B))])
+        out = fd.detect(_jpeg(2000, 2000), "pair")
+        assert len(out) == 1 and out[0].index == 0
+        assert out[0].width == 860 - 320
+
+    def test_fewer_than_two_faces_is_no_crop_at_all(self, monkeypatch):
+        """Never a one-face crop under a two-person caption."""
+        _detector(monkeypatch, [_FakeFace(list(self.A))])
+        assert fd.detect(_jpeg(2000, 2000), "pair") == []
+
+    def test_the_service_takes_echoes_and_advertises_it(self, monkeypatch):
+        import asyncio
+        import base64
+        from wanly_worker.services.face_crop import app as svc
+        _detector(monkeypatch, [_FakeFace(list(self.A))])
+        one = base64.b64encode(_jpeg(2000, 2000)).decode()
+        out = asyncio.run(svc.crop(svc.CropRequest(images=[one], framing="pair")))
+        assert out.framing == "pair" and out.faces == [] and out.no_face == [0]
+        assert "pair" in asyncio.run(svc.health())["features"]

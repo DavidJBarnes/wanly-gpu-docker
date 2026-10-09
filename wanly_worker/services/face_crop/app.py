@@ -19,7 +19,8 @@ from wanly_worker.services.face_crop import upscale as up
 #: What this build can do, on /health (#206). wanly-api checks it before starting a job that
 #: needs one of them, rather than discovering half way through that an older service ignored a
 #: field it did not know -- which is what an older service does with `upscale`.
-FEATURES = ["crop", "embed", "head_shoulders", "measure"]
+#: "pair" (wanly-api#436): framing="pair", the two-person crop for composition sets.
+FEATURES = ["crop", "embed", "head_shoulders", "measure", "pair"]
 
 
 def features() -> list[str]:
@@ -74,7 +75,9 @@ class CropRequest(BaseModel):
     largest_only: bool = True
     #: "face" (the square crop, and the default) or "head_shoulders" (#187): a 4:5 portrait
     #: from just above the hairline to the upper chest.
-    framing: Literal["face", "head_shoulders"] = "face"
+    #: "pair" (wanly-api#436): ONE crop per image holding both of its two largest faces, for a
+    #: composition set; an image with fewer than two faces comes back in `no_face`.
+    framing: Literal["face", "head_shoulders", "pair"] = "face"
     #: Real-ESRGAN each crop up to the trainer's ceiling (#206) when it is smaller than that.
     upscale: bool = False
 
@@ -105,7 +108,8 @@ class CropFace(BaseModel):
 class CropResponse(BaseModel):
     faces: list[CropFace]
     #: Images the detector found nothing in. Named rather than counted, because "10 of 38 had no
-    #: face" is the number that tells you the source set is wrong.
+    #: face" is the number that tells you the source set is wrong. With framing="pair": images
+    #: with fewer than TWO faces -- not a pair photo, so nothing is cropped from them.
     no_face: list[int]
     cos_floor: float
     #: The framing these crops were cut to, echoed (#187). A service that predates framing
