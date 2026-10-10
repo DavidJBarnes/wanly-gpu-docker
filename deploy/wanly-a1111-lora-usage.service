@@ -1,0 +1,16 @@
+[Unit]
+Description=Report the LoRAs A1111 has used to wanly-api
+Documentation=https://github.com/DavidJBarnes/wanly-gpu-docker/issues/211
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The user that owns A1111's output folders and deploy/worker.env (QUEUE_URL, QUEUE_API_KEY).
+User=david
+ExecStart=/usr/bin/python3 -I /home/david/wanly-gpu-docker/deploy/a1111-lora-usage.py
+# Reading text chunks is cheap, but the first run walks every saved image once.
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal

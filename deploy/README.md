@@ -517,3 +517,20 @@ rendering?" has no meaning on a box in caption mode. The gate checks the contain
 render` could never switch back, refusing forever on the absence of the very service it is
 there to restore. The worker-status signal still covers a claim, and a container with no
 `ltx-engine` holds none.
+
+## A1111 LoRA-usage reporter (3090b, #211)
+
+SDXL character LoRAs are used by hand in A1111, so the Characters page learns whether one has
+been tried from A1111's own saved PNGs (their `parameters` text chunk names every
+`<lora:Name:w>`). `a1111-lora-usage.py` walks the output folders, counts images per LoRA name,
+and POSTs the totals to wanly-api (`/lora-usage`, QUEUE_URL + QUEUE_API_KEY from `worker.env`).
+
+```
+cd ~/wanly-gpu-docker && git pull
+python3 -I deploy/a1111-lora-usage.py --dry-run      # read-only: prints totals, posts nothing
+sudo deploy/install-a1111-lora-usage.sh             # the 15-minute timer
+sudo systemctl start wanly-a1111-lora-usage.service # first run now
+```
+
+Folders: `A1111_OUTPUT_DIRS` (default StabilityMatrix's Text2Img and Img2Img). State (which files
+were read): `~/.local/state/wanly/a1111-lora-usage.json`, written only after a successful POST.
