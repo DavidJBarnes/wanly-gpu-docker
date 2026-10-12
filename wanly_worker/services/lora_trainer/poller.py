@@ -678,6 +678,8 @@ class Poller:
             body["error_message"] = job.error
         if job.loss_log:
             body["loss_log"] = job.loss_log
+        if job.caption_tags:
+            body["caption_tags"] = job.caption_tags
         if job.phase in ("training", "collecting", "completed"):
             epochs = self._epochs(job)
             if epochs:

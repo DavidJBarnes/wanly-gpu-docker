@@ -17,7 +17,9 @@ signature is checked: a run whose captions all collapse to it is refused.
 from __future__ import annotations
 
 import csv
+import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 THRESHOLD = 0.35
@@ -85,12 +87,54 @@ def looks_broken(captions: list[str]) -> bool:
     return True
 
 
+def _prefix_tokens(prefix: str) -> set[str]:
+    return {t.strip() for t in prefix.split(",") if t.strip()}
+
+
+def _ranked(c: Counter) -> list[list]:
+    """[[tag, count], ...], most frequent first, ties alphabetical -- stable across runs."""
+    return [[t, n] for t, n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def tally(prefix: str, tag_lists: list[list[str]]) -> dict:
+    """What the tagger's tags became across one group's captions (wanly-api#462).
+
+    A feature the caption NAMES is learned onto that tag, not onto the trigger -- Joana v4's
+    `earrings` (58 of 73 captions) is why her earrings had to be prompted. So the run reports
+    which tags landed (`kept`, the ones in the captions) and which were removed in favour of
+    the trigger (`stripped`), each with how many images carried it. The prefix's own tokens
+    (trigger, class tags) are not tags the tagger chose and are left out of both; the meta
+    tags (EXCLUDE_TAGS) are neither kept nor a fixed feature, so they are left out too.
+    """
+    skip = _prefix_tokens(prefix)
+    kept: Counter = Counter()
+    stripped: Counter = Counter()
+    for tags in tag_lists:
+        for t in set(tags) - skip - EXCLUDE_TAGS:
+            (stripped if _stripped(t) else kept)[t] += 1
+    return {"images": len(tag_lists), "kept": _ranked(kept), "stripped": _ranked(stripped)}
+
+
+def tally_captions(prefix: str, captions: list[str]) -> dict:
+    """`tally` from finished caption files, when the tagger's raw output is not available.
+
+    Only `kept` is recoverable from a caption -- a stripped tag left no trace in it -- so
+    `stripped` is None, which the console says out loud rather than showing as "nothing
+    stripped". Used for runs staged before the tally existed (the backfill) and as the
+    fallback when the tagger wrote no tally file."""
+    skip = _prefix_tokens(prefix)
+    kept: Counter = Counter()
+    for c in captions:
+        kept.update({t.strip() for t in c.split(",") if t.strip()} - skip)
+    return {"images": len(captions), "kept": _ranked(kept), "stripped": None}
+
+
 def _images(d: Path) -> list[Path]:
     return sorted(p for p in d.iterdir()
                   if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
 
 
-def main(image_dir: str, trigger: str, model_dir: str) -> int:
+def main(image_dir: str, trigger: str, model_dir: str, tally_path: str | None = None) -> int:
     import numpy as np
     import onnxruntime as ort
     from PIL import Image
@@ -106,6 +150,7 @@ def main(image_dir: str, trigger: str, model_dir: str) -> int:
     #: What the TAGGER said, behind a one-token prefix: a pair's prefix ("k3lly, 1girl", #184)
     #: is several tags, and they must not count as evidence the tagger saw anything.
     tagged = []
+    raw: list[list[str]] = []
     for path in _images(Path(image_dir)):
         a = np.array(Image.open(path).convert("RGB"))[:, :, ::-1]  # RGB -> BGR
         h, w = a.shape[:2]
@@ -116,6 +161,7 @@ def main(image_dir: str, trigger: str, model_dir: str) -> int:
         a = np.array(Image.fromarray(a[:, :, ::-1]).resize((448, 448), Image.LANCZOS))[:, :, ::-1]
         probs = session.run([out], {inp: np.expand_dims(a.astype(np.float32), 0)})[0][0]
         tags = [names[i] for i, p in enumerate(probs) if p > THRESHOLD]
+        raw.append(tags)
         text = caption(trigger, tags)
         tagged.append(caption("_", tags))
         path.with_suffix(".txt").write_text(text + "\n")
@@ -126,12 +172,15 @@ def main(image_dir: str, trigger: str, model_dir: str) -> int:
         print("every caption is the broken-preprocessing signature "
               f"({', '.join(sorted(GARBAGE))}) -- refusing to train on them", flush=True)
         return 3
+    if tally_path:
+        Path(tally_path).write_text(json.dumps(tally(trigger, raw)))
     print(f"tagged {len(written)} images", flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("usage: wd14.py <image_dir> <trigger> <wd14_model_dir>", file=sys.stderr)
+    if len(sys.argv) not in (4, 5):
+        print("usage: wd14.py <image_dir> <trigger> <wd14_model_dir> [tally.json]",
+              file=sys.stderr)
         sys.exit(2)
     sys.exit(main(*sys.argv[1:]))

@@ -663,6 +663,21 @@ class TestCheckpointsGoStraightToS3:
         assert sent[-1]["status"] == "completed"
         assert "2 checkpoint(s) published" in sent[-1]["progress_log"]
 
+    def test_the_caption_tag_tally_rides_the_report(self, tmp_path, monkeypatch):
+        """wanly-api#462: sent when the run has one, absent (never blanked) when not."""
+        p, job = self._poller(tmp_path, monkeypatch), self._job()
+        job.phase, job.message = "staging", "tagging (WD14) done"
+        sent = []
+
+        async def fake_patch(j, body):
+            sent.append(body)
+        p._patch = fake_patch
+        _run(p._report(job))
+        job.caption_tags = {"images": 1, "groups": []}
+        _run(p._report(job))
+        assert "caption_tags" not in sent[0]
+        assert sent[1]["caption_tags"] == {"images": 1, "groups": []}
+
     def test_the_file_is_streamed_not_read_whole(self):
         import inspect
         from wanly_worker.services.lora_trainer import poller as mod
@@ -1774,11 +1789,50 @@ class TestSDXL:
              "captions": ["k3lly, woman, a sentence about a kitchen", "another sentence"]}]))
         assert run == recipe.run_dir("k3lly", 3, "sdxl")
         assert len(calls) == 1 and calls[0][1].endswith("wd14.py")
-        assert calls[0][2:] == [str(run / "data"), "k3lly", recipe.WD14_DIR]
+        assert calls[0][2:] == [str(run / "data"), "k3lly", recipe.WD14_DIR,
+                                str(run / "logs" / "tags.json")]
         assert (run / "data" / "sel_000.txt").read_text() == "k3lly, smile\n"
         toml = (run / "dataset.toml").read_text()
         assert "num_repeats = 8" in toml and "keep_tokens = 1" in toml
         assert "shuffle_caption = false" in toml and "bucket_no_upscale = true" in toml
+
+    def test_the_tagger_tally_is_recorded_on_the_job(self, monkeypatch):
+        """wanly-api#462: the tags that landed (and the ones stripped) ride the run to the API."""
+        import json
+        from wanly_worker.services.lora_trainer import pipeline
+
+        async def fake_cmd(job, run, label, argv, logfile, cwd=None):
+            for img in sorted((run / "data").iterdir()):
+                img.with_suffix(".txt").write_text("k3lly, earrings\n")
+            open(argv[-1], "w").write(json.dumps(
+                {"images": 2, "kept": [["earrings", 2]], "stripped": [["freckles", 1]]}))
+        monkeypatch.setattr(pipeline, "_stage_cmd", fake_cmd)
+        job = self._job()
+        _run(pipeline.stage(job, [{"images": [("a.png", b"x"), ("b.png", b"y")],
+                                   "num_repeats": 8, "captions": ["k3lly"] * 2}]))
+        assert job.caption_tags == {"images": 2, "groups": [
+            {"images": 2, "kept": [["earrings", 2]], "stripped": [["freckles", 1]],
+             "label": "k3lly", "kind": "identity"}]}
+
+    def test_without_a_tally_file_the_captions_are_counted(self, monkeypatch):
+        """A tagger that wrote no tally still leaves captions; stripped is then unknowable."""
+        from wanly_worker.services.lora_trainer import pipeline
+
+        async def fake_cmd(job, run, label, argv, logfile, cwd=None):
+            d = Path(argv[2])
+            for i, img in enumerate(sorted(p for p in d.iterdir() if p.suffix != ".txt")):
+                img.with_suffix(".txt").write_text(
+                    "k3lly, d@vid, 1girl, 1boy, hug" if "data2" in str(d)
+                    else f"{argv[3]}, smile" + (", earrings" if i == 0 else "") + "\n")
+        monkeypatch.setattr(pipeline, "_stage_cmd", fake_cmd)
+        job = self._job(character="KellyDavid")
+        _run(pipeline.stage(job, self._pair_groups()))
+        g = job.caption_tags["groups"]
+        assert job.caption_tags["images"] == 5
+        assert [x["label"] for x in g] == ["k3lly, 1girl", "d@vid, 1boy",
+                                           "k3lly, d@vid, 1girl, 1boy"]
+        assert g[0]["kept"] == [["smile", 2], ["earrings", 1]] and g[0]["stripped"] is None
+        assert g[2]["kept"] == [["hug", 2]] and g[2]["kind"] == "composition"
 
     def test_a_regularization_group_is_refused(self):
         from wanly_worker.services.lora_trainer import pipeline
@@ -1901,6 +1955,24 @@ class TestWD14Captions:
                 "opaque_glasses"]
         assert caption("j0ana", ["rectangular_eyewear", "grey-framed_eyewear", *keep]) == \
             ", ".join(["j0ana", *keep])
+
+    def test_the_tally_splits_kept_from_stripped_and_skips_the_prefix(self):
+        """wanly-api#462. Counts are per IMAGE (a tag twice in one list is one image), the
+        prefix's tokens and the meta tags are in neither list, ties sort by name."""
+        from wanly_worker.services.lora_trainer.wd14 import tally
+        got = tally("k3lly, 1girl", [
+            ["1girl", "earrings", "earrings", "freckles", "glasses", "smile", "explicit"],
+            ["1girl", "earrings", "freckles", "hoop_earrings"],
+            ["k3lly", "earrings", "brown-framed_eyewear"]])
+        assert got == {"images": 3,
+                       "kept": [["earrings", 3], ["hoop_earrings", 1], ["smile", 1]],
+                       "stripped": [["freckles", 2], ["brown-framed_eyewear", 1],
+                                    ["glasses", 1]]}
+
+    def test_a_tally_from_captions_cannot_know_what_was_stripped(self):
+        from wanly_worker.services.lora_trainer.wd14 import tally_captions
+        got = tally_captions("j0ana", ["j0ana, earrings, smile", "j0ana, earrings", "j0ana"])
+        assert got == {"images": 3, "kept": [["earrings", 2], ["smile", 1]], "stripped": None}
 
     def test_broken_preprocessing_is_recognised(self):
         from wanly_worker.services.lora_trainer.wd14 import looks_broken
