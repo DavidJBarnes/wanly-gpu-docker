@@ -709,7 +709,8 @@ class TestCheckpointsGoStraightToS3:
         import inspect
         from wanly_worker.services.lora_trainer import poller as mod
         src = inspect.getsource(mod.Poller._drain_uploads)
-        assert 'await self._patch(job, {"progress_log": status})' in src
+        assert 'body["progress_log"] = status' in src and "await self._patch(job, body)" in src
+        assert '"epochs": self._epochs(job)' in src    # the row's bar (console#673)
 
 
 class TestARestartFailsWhatItInterrupted:
@@ -896,6 +897,45 @@ class TestOnlyWantedCheckpointsGoUp:
         assert [e["label"] for e in epochs] == ["e01", "e02", "final"]
         assert epochs[0]["step"] == 270 and epochs[0]["loss"] == 0.8
         assert epochs[2]["step"] == 1200 and epochs[2]["loss"] == 0.7
+
+    def test_epochs_carry_upload_progress(self, tmp_path, monkeypatch):
+        """console#673: the row shows how far an upload has got, not "uploading soon"."""
+        p, job = self._setup(tmp_path, monkeypatch, "final")
+        out = [f for f in p._local_checkpoints(job)]
+        p._current["j1"] = "final"
+        p._sent["j1"] = (300, 650)
+        p._queue["j1"] = [f for f in out if f.name == "p@y_v2-000001.comfy.safetensors"]
+        by = {e["label"]: e for e in p._epochs(job)}
+        assert by["final"]["upload"] == {"sent": 300, "size": 650}
+        assert by["e01"]["upload"] == {"queued": True}
+        assert "upload" not in by["e02"]
+
+    def test_a_finished_runs_upload_is_reported_until_it_lands(self, tmp_path, monkeypatch):
+        """The watcher reports while the uploader runs, and once more after, which clears it."""
+        from wanly_worker.services.lora_trainer import poller as mod
+        p, job = self._setup(tmp_path, monkeypatch, "final")
+        monkeypatch.setattr(mod, "UPLOAD_REPORT_S", 0.01)
+        sent: list[dict] = []
+
+        async def capture(_job, body):
+            sent.append(body)
+        p._patch = capture
+
+        async def go():
+            async def upload():
+                p._current["j1"] = "final"
+                for n in (100, 400, 650):
+                    p._sent["j1"] = (n, 650)
+                    await asyncio.sleep(0.03)
+                p._current.pop("j1")
+                p._sent.pop("j1")
+            p._uploader["j1"] = asyncio.create_task(upload())
+            await asyncio.sleep(0)
+            await p._watch_uploads(job)
+        _run(go())
+        finals = [next(e for e in b["epochs"] if e["label"] == "final") for b in sent]
+        assert any(f.get("upload", {}).get("sent") == 100 for f in finals)
+        assert "upload" not in finals[-1]
 
     def test_finished_jobs_are_polled_for_requests(self):
         import inspect

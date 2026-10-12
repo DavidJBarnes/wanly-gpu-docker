@@ -28,6 +28,8 @@ QUEUE_API_KEY = os.environ.get("QUEUE_API_KEY", "")
 #: Slow on purpose. A training job is a rare event and a 50-minute unit of work; polling hard
 #: buys nothing and puts a request per second on the API for no reason.
 POLL_INTERVAL_S = int(os.environ.get("TRAIN_POLL_INTERVAL_S", "60"))
+#: How often a finished run's upload progress is reported while it goes up (console#673).
+UPLOAD_REPORT_S = 10
 #: A checkpoint is uploaded once its size has stopped changing for this long. The trainer
 #: writes safetensors in place, not via a rename, so a file that is still growing is a file
 #: that is still being written.
@@ -96,6 +98,10 @@ class Poller:
         #: (bytes sent, bytes total). The trainer streams the file itself, so it knows.
         self._current: dict[str, str] = {}
         self._sent: dict[str, tuple[int, int]] = {}
+        #: Per job, the task that mirrors upload progress into `epochs` while a FINISHED run's
+        #: checkpoints go up (console#673). A training run reports every tick anyway; a
+        #: finished one otherwise said nothing for the eighteen minutes a checkpoint takes.
+        self._watcher: dict[str, asyncio.Task] = {}
         #: The file going up right now. Popped from the queue when the upload starts, it
         #: was neither queued nor published for twelve minutes, and the sweep that runs
         #: every ten seconds while the queue drains put it straight back -- so the final
@@ -275,6 +281,10 @@ class Poller:
                 _log(f"{job.character} v{job.version}: asked to publish {sorted(asked)}")
             self._requested[job.id] = asked
             self._sweep_checkpoints(job)
+            uploading = self._uploader.get(job.id)
+            watcher = self._watcher.get(job.id)
+            if (uploading and not uploading.done()) and (watcher is None or watcher.done()):
+                self._watcher[job.id] = asyncio.create_task(self._watch_uploads(job))
             # A RUN THE RESTART INTERRUPTED MID-UPLOAD. Training had finished (the store says
             # completed) but the container died before "completed" reached the API, so the
             # row still says running with "0 of 1 in the bucket" and nothing will ever
@@ -530,14 +540,42 @@ class Poller:
         can list the ones that stayed behind and offer them.
         """
         per_epoch = job.per_epoch
+        current = self._current.get(job.id)
+        queued = {_label(p) for p in self._queue.get(job.id, [])}
         out = []
         for path in self._local_checkpoints(job):
             label = _label(path)
             step = job.steps if label == "final" else min(job.steps, int(label[1:]) * per_epoch)
             before = [l for s_, l in job.loss_log if s_ <= step]
-            out.append({"label": label, "step": step,
-                        "loss": round(before[-1], 4) if before else None})
+            entry = {"label": label, "step": step,
+                     "loss": round(before[-1], 4) if before else None}
+            # HOW FAR ITS UPLOAD HAS GOT (console#673), so the row can say more than
+            # "uploading soon" for eighteen minutes. Absent when it is not going up.
+            if label == current:
+                sent, size = self._sent.get(job.id, (0, 0))
+                entry["upload"] = {"sent": sent, "size": size}
+            elif label in queued:
+                entry["upload"] = {"queued": True}
+            out.append(entry)
         return out
+
+    async def _watch_uploads(self, job: Job) -> None:
+        """Report `epochs` while a finished run's uploads go up, and once more after.
+
+        The last report is what clears the progress: the label is out of `_current` by then,
+        so its entry goes back to having no `upload`, and the checkpoint is in the bucket.
+        """
+        last = None
+        while True:
+            task = self._uploader.get(job.id)
+            busy = task is not None and not task.done()
+            epochs = self._epochs(job)
+            if epochs != last:
+                await self._patch(job, {"epochs": epochs})
+                last = epochs
+            if not busy:
+                return
+            await asyncio.sleep(UPLOAD_REPORT_S)
 
     def _upload_status(self, job: Job) -> str:
         total = len([p for p in self._local_checkpoints(job) if self._wanted(job, p)])
@@ -577,9 +615,12 @@ class Poller:
             if not busy and time.time() > settle_deadline:
                 return
             status = self._upload_status(job)
+            # `epochs` every time: it carries the bytes sent for the row's bar (console#673).
+            body = {"epochs": self._epochs(job)}
             if status != last:
-                await self._patch(job, {"progress_log": status})
+                body["progress_log"] = status
                 last = status
+            await self._patch(job, body)
             await asyncio.sleep(10)
 
     async def _publish(self, job: Job, path: Path) -> None:
