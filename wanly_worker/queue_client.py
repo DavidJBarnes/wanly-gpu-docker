@@ -31,6 +31,8 @@ import asyncio
 import os
 import socket
 
+from wanly_worker import phase as _phase
+
 
 def _log(msg: str) -> None:
     """print(), not logging.
@@ -127,6 +129,9 @@ class QueueClient:
         self._client = client
         self.worker_id: str | None = None
         self._task: asyncio.Task | None = None
+        #: Set when the phase changes (wanly-gpu-daemon#189), so the next beat goes now rather
+        #: than up to INTERVAL_S later. Created lazily, on the loop that waits on it.
+        self._wake: asyncio.Event | None = None
 
     # ------------------------------------------------------------------ payloads
 
@@ -192,6 +197,9 @@ class QueueClient:
             "kind": worker_kind(self.provides()),
             "kinds": worker_kinds(self.provides()),
             "provides": self.provides(),
+            # What the box is doing (booting, switching modes) -- so a busy box reads as busy
+            # from its first second, not as "offline" (wanly-gpu-daemon#189).
+            "phase": _phase.snapshot(),
         }
         try:
             r = await self._client.post(f"{QUEUE_URL}/workers", json=body,
@@ -215,6 +223,7 @@ class QueueClient:
             "status": self.status(),
             "provides": self.provides(),
             "gpu_stats": self._gpu_stats(),
+            "phase": _phase.snapshot(),
         }
         try:
             r = await self._client.post(f"{QUEUE_URL}/workers/{self.worker_id}/heartbeat",
@@ -248,10 +257,20 @@ class QueueClient:
 
     # ------------------------------------------------------------------ loop
 
+    def poke(self) -> None:
+        """Beat now: the phase changed, and a 15 s switch step must not wait 30 s to show."""
+        if self._wake is not None:
+            self._wake.set()
+
     async def run(self) -> None:
+        self._wake = asyncio.Event()
         await self.register()
         while True:
-            await asyncio.sleep(INTERVAL_S)
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+            self._wake.clear()
             await self.beat()
 
     def start(self) -> None:

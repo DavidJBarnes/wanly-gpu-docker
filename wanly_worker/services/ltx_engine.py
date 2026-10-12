@@ -159,9 +159,9 @@ class RenderDaemon(Service):
     name = "render-daemon"
     port = 0
     summary = "wanly-gpu-daemon: registers, claims segments, drives the engine"
-    #: The daemon syncs every character LoRA it lacks before it registers; a fresh pod with
-    #: several 650 MB files takes minutes. It also cannot answer a port -- readiness is the
-    #: file it writes after registering.
+    #: Readiness is the file the daemon writes after registering. Since wanly-gpu-daemon#189
+    #: it registers BEFORE the LoRA sync, so this is seconds; the hour stays as the bound for
+    #: an older daemon that still syncs first.
     ready_timeout_s = 3600.0
     cwd = DAEMON_DIR
     #: A segment in flight is allowed to finish: a render is up to ~27 minutes. Docker's own
@@ -177,7 +177,18 @@ class RenderDaemon(Service):
             raise PreflightError(f"{env} was not written by {FETCH_DAEMON}")
         print("Daemon config:", flush=True)
         print(render_env_dump(env.read_text()), flush=True)
-        for stale in (READY_FILE,):
+
+    def prestart(self) -> None:
+        """Clear the last run's handshake before EVERY start, not just the first.
+
+        This lived in preflight(), which runs once per container. A mode switch back into
+        render starts the daemon again without it, so the ready file from the previous run
+        was still there: the supervisor called the daemon ready the moment it spawned and
+        stood down as registrar while the daemon had registered nothing -- the box went
+        offline for the whole LoRA sync (wanly-gpu-daemon#189, 3090a 2026-10-12). The id
+        file goes too: it names the row the daemon deleted on its way out, and the trainer
+        would drain and claim against that dead row until the new id was written."""
+        for stale in (READY_FILE, WORKER_ID_FILE):
             try:
                 os.unlink(stale)
             except FileNotFoundError:

@@ -101,14 +101,23 @@ def test_the_daemon_is_told_where_to_say_so():
 
 
 def test_a_stale_ready_file_is_removed_before_the_daemon_starts(tmp_path, monkeypatch):
+    """Before EVERY start, not only the first (wanly-gpu-daemon#189). preflight() runs once
+    per container; a mode switch back into render skipped it, the previous run's ready file
+    was still there, and the supervisor stood down as registrar the instant the daemon
+    spawned -- the box was offline for the daemon's whole LoRA sync."""
     monkeypatch.setattr(mod, "READY_FILE", str(tmp_path / "ready"))
-    monkeypatch.setattr(mod, "DAEMON_DIR", str(tmp_path))
-    monkeypatch.setattr(mod, "FETCH_DAEMON", str(tmp_path / "fetch.sh"))
-    (tmp_path / "fetch.sh").write_text("#!/bin/sh\nexit 0\n")
-    (tmp_path / ".env").write_text("ENGINE=ltx\n")
+    monkeypatch.setattr(mod, "WORKER_ID_FILE", str(tmp_path / "worker-id"))
     (tmp_path / "ready").write_text("ready\n")
-    mod.RenderDaemon().preflight()
+    (tmp_path / "worker-id").write_text("dead-row\n")
+    mod.RenderDaemon().prestart()
     assert not (tmp_path / "ready").exists()
+    assert not (tmp_path / "worker-id").exists()   # names the row the daemon deleted
+
+
+def test_prestart_runs_on_every_start_including_a_mode_switch():
+    src = inspect.getsource(sup_mod.Supervisor._start_one)
+    assert "svc.prestart()" in src
+    assert src.index("svc.prestart()") < src.index("create_subprocess_exec")
 
 
 def test_the_supervisor_honours_per_service_timeouts(monkeypatch):
