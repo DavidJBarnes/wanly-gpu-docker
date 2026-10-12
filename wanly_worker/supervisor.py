@@ -27,6 +27,7 @@ import signal
 import subprocess
 import time
 
+from wanly_worker import phase
 from wanly_worker.service import PreflightError, Service
 
 #: How long a service gets to start answering before the boot is called a failure. Generous:
@@ -112,7 +113,11 @@ class Supervisor:
                 continue
             try:
                 st.preflighted = True
-                st.service.preflight()
+                phase.step(f"preparing {st.service.name}", service=st.service.name)
+                # Off the event loop: ComfyUI's preflight is download_models.sh, which runs for
+                # up to an hour on a cold pod, and the registrar's heartbeat shares this loop
+                # (wanly-gpu-daemon#189 -- a busy box must never look offline).
+                await asyncio.to_thread(st.service.preflight)
             except PreflightError as e:
                 if not getattr(st.service, "essential", True):
                     st.error = str(e)
@@ -137,6 +142,8 @@ class Supervisor:
         env = {**os.environ, **svc.env()}
         argv = svc.command()
         timeout = svc.ready_timeout_s or READY_TIMEOUT_S
+        phase.step(f"starting {svc.name}", service=svc.name)
+        svc.prestart()
         print(f"starting {svc.name}: {' '.join(argv)}"
               + (f"  (log: {svc.log_path})" if svc.log_path else ""), flush=True)
         # A child with its own log file keeps the boot log readable; its tail is printed if it
@@ -250,8 +257,9 @@ class Supervisor:
                 # the SWITCH (the caller reports it and puts the box back), whether or not the
                 # service is essential at boot: the switch exists to run exactly this service.
                 st.preflighted = True
+                phase.step(f"preparing {st.service.name}", service=st.service.name)
                 try:
-                    st.service.preflight()
+                    await asyncio.to_thread(st.service.preflight)
                 except PreflightError as e:
                     st.preflighted = False
                     st.error = str(e)

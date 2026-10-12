@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from wanly_worker import gpu_pin, registry
+from wanly_worker import gpu_pin, phase, registry
 from wanly_worker.queue_client import QueueClient, export_identity
 from wanly_worker.supervisor import Supervisor, gpu_snapshot
 
@@ -115,20 +115,25 @@ async def lifespan(app: FastAPI):
         _fatal(e)
         raise
     async with httpx.AsyncClient() as client:
-        global _client
+        global _client, _queue, _poller
         _client = client
+        # BEFORE the services start, reporting phase=booting (wanly-gpu-daemon#189). This used
+        # to wait until everything was up, on the grounds that "online" thirty seconds early is
+        # a lie -- but the honest alternative turned out to be a box that was "offline" for the
+        # whole boot, including a render daemon syncing 650 MB of LoRA at 0.4 MB/s. With the
+        # phase on the row the page says "Booting: starting comfyui", which is the truth.
+        phase.booting()
+        _queue = QueueClient(_sup, client)
+        phase.on_change(_queue.poke)
+        _queue.start()
         try:
             await _sup.start(client, active=names)
         except Exception as e:
             _fatal(e)
             raise
-        # AFTER the services are up, so the first thing the API hears is the truth. Registering
-        # before would advertise a box that is still staging, and a Workers page that says
-        # "online" thirty seconds early is the same class of lie as `online-idle` on a dead
-        # ComfyUI.
-        global _queue, _poller
-        _queue = QueueClient(_sup, client)
-        _queue.start()
+        # The render daemon, if this mode runs one, registered as it came up: hand it the row.
+        _queue.rebalance()
+        phase.ready()
         # The trainer claims its own work, but only on a box EQUIPPED with it -- a captioner-only
         # box must not poll for training jobs it could never run. Started whatever the boot
         # mode (#164): finished runs' publish and delete requests are answered in every mode,
@@ -383,6 +388,7 @@ def _begin(target: str, names: list[str]) -> None:
     global _pending, _mode_error, _mode_task
     _mode_error = None
     _pending = target
+    phase.switching(_mode, target)
     print(f"mode: {_mode} -> {target} ({','.join(names)}) — "
           f"a segment in flight will finish first", flush=True)
     _mode_task = asyncio.create_task(_switch(target, names))
@@ -412,6 +418,7 @@ async def _switch(target: str, names: list[str]) -> None:
             # LEAVING motion mode: let the captions FINISH, then drop the model. Dropping
             # first would pull the card out from under a caption that is still running.
             if "image-description" in leaving and before == "motion":
+                phase.step("letting queued captions finish")
                 await _drain_captions()
             if "image-description" in leaving:
                 await imgdesc.service.release(_client)
@@ -421,8 +428,15 @@ async def _switch(target: str, names: list[str]) -> None:
                 found = _vram_used()
                 touched = True
                 # Stop only: everything that stays is already up, so this starts nothing.
+                phase.step("stopping " + ", ".join(leaving))
                 await _sup.apply([n for n in before_names if n in names], _client)
                 _active = [n for n in before_names if n in names]
+                # The render daemon deregisters as it exits, deleting the row. Take it over NOW
+                # rather than after the new mode is up, so the box reads "switching" and not
+                # gone for the unload wait and the starts (wanly-gpu-daemon#189).
+                if _queue is not None:
+                    _queue.rebalance()
+                phase.step("waiting for the card to empty")
                 await _wait_for_empty_card(before, target, found)
 
             touched = True
@@ -466,6 +480,7 @@ async def _switch(target: str, names: list[str]) -> None:
                 print(f"!! could not restore {before}: {e2}", flush=True)
     finally:
         _pending = None
+        phase.ready()
 
 
 @app.post("/mode")

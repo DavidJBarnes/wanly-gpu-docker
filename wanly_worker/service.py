@@ -60,6 +60,15 @@ class Service(abc.ABC):
     def command(self) -> list[str]:
         """argv for the process to run."""
 
+    def prestart(self) -> None:
+        """Runs before EVERY start of the process -- boot and each mode switch into it.
+
+        preflight() runs once per container; this is for state a previous run of the same
+        process leaves behind. The render daemon's ready file is the case that needed it
+        (wanly-gpu-daemon#189): left over from the last run, it made a mode switch into render
+        call the daemon ready -- and stand the supervisor down as registrar -- the instant the
+        process spawned, before it had registered anything."""
+
     def env(self) -> dict[str, str]:
         """Environment to add on top of the container's own."""
         return {}
