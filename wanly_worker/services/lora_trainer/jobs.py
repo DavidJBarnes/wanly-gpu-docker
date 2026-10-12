@@ -55,6 +55,10 @@ class Job:
     checkpoints: list[str] = field(default_factory=list)
     #: [[step, avr_loss], ...] as read off the progress bar, one point per step seen.
     loss_log: list = field(default_factory=list)
+    #: SDXL only (wanly-api#462): the WD14 tags that landed in the captions, per group --
+    #: {images, groups: [{label, kind, images, kept: [[tag, n]], stripped: [[tag, n]]}]}.
+    #: Empty for LTX, whose captions are sentences, and on state files from before it existed.
+    caption_tags: dict = field(default_factory=dict)
     output: str = ""
     #: The wanly-api row this came from, when it was claimed rather than posted directly.
     remote_id: str = ""

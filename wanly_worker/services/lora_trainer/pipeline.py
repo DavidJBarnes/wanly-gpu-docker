@@ -11,6 +11,7 @@ run looks hung. That has cost real evenings.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -18,7 +19,7 @@ import signal
 import time
 from pathlib import Path
 
-from wanly_worker.services.lora_trainer import recipe
+from wanly_worker.services.lora_trainer import recipe, wd14
 from wanly_worker.services.lora_trainer.jobs import Job
 
 #: The trainer emits "  45%|####  | 540/1200 [..., 2.35s/it]".
@@ -317,6 +318,7 @@ async def _stage_sdxl(job: Job, groups: list[dict]) -> Path:
         (run / sub).mkdir(parents=True, exist_ok=True)
 
     subsets = []
+    tallies = []
     for gi, (g, prefix) in enumerate(zip(groups, prefixes)):
         # Group 0 keeps the bare dir, so a solo run stages exactly as it did before #184.
         data_dir = run / "data" if gi == 0 else run / f"data{gi}"
@@ -327,18 +329,34 @@ async def _stage_sdxl(job: Job, groups: list[dict]) -> Path:
         for i, (name, blob) in enumerate(g["images"]):
             ext = Path(name).suffix.lower() or ".jpg"
             (data_dir / f"sel_{i:03d}{ext}").write_bytes(blob)
+        tally_file = run / "logs" / ("tags.json" if gi == 0 else f"tags{gi}.json")
         await _stage_cmd(job, run, "tagging (WD14)" if gi == 0 else f"tagging group {gi} (WD14)",
                          [recipe.SDXL_PYTHON, str(Path(__file__).with_name("wd14.py")),
-                          str(data_dir), prefix, recipe.WD14_DIR],
+                          str(data_dir), prefix, recipe.WD14_DIR, str(tally_file)],
                          "00_tag.log" if gi == 0 else f"00_tag{gi}.log", cwd=str(run))
+        tallies.append(dict(_group_tally(data_dir, prefix, tally_file),
+                            label=prefix, kind=g.get("kind") or "identity"))
         subsets.append({"data": str(data_dir), "num_repeats": g["num_repeats"],
                         "keep_tokens": len([t for t in prefix.split(",") if t.strip()])})
+    # WHAT THE CAPTIONS NAME (wanly-api#462): reported with the run, so a feature the trigger
+    # was meant to carry but a tag took instead (Joana's earrings) is visible on the console.
+    job.caption_tags = {"images": sum(t["images"] for t in tallies), "groups": tallies}
     if len(subsets) == 1:
         toml = recipe.sdxl_dataset_toml(run, subsets[0]["num_repeats"])
     else:
         toml = recipe.sdxl_dataset_toml(run, 0, subsets=subsets)
     (run / "dataset.toml").write_text(toml)
     return run
+
+
+def _group_tally(data_dir: Path, prefix: str, tally_file: Path) -> dict:
+    """One group's tag tally: the tagger's own (kept AND stripped), else what the caption
+    files say (kept only). A tally is a report, never a reason to fail a staged run."""
+    try:
+        return json.loads(tally_file.read_text())
+    except (OSError, ValueError):
+        caps = [p.read_text().strip() for p in sorted(data_dir.glob("*.txt"))]
+        return wd14.tally_captions(prefix, caps)
 
 
 def _sdxl_prefix(gi: int, g: dict) -> str:
