@@ -590,6 +590,38 @@ class TestTheEndpoints:
         img = cv2.imdecode(np.frombuffer(base64.b64decode(small["b64"]), np.uint8), 1)
         assert img.shape[:2] == (1024, 697)
         assert big["upscaled"] is False and big["b64"] is None
+        assert out["target_edge"] is None   # the old contract, echoed as unset
+
+    def test_target_edge_makes_a_high_res_copy(self, monkeypatch):
+        """#214: the dataset Upscale asks for 2x/4x past the 1024 ceiling, and the service
+        honours it and says so -- an older one ignores the field and caps at 1024."""
+        import asyncio
+        import base64
+        from wanly_worker.services.face_crop import app as svc
+        calls = TestCropWithUpscale()._fake_up(monkeypatch)
+        b = lambda x: base64.b64encode(x).decode()
+        out = asyncio.run(svc.upscale(svc.UpscaleRequest(images=[b(_jpeg(900, 600))],
+                                                         target_edge=1800)))
+        assert out["target_edge"] == 1800 and calls[0][1] == 1800
+        img = out["images"][0]
+        assert img["upscaled"] is True and (img["width"], img["height"]) == (1800, 1200)
+
+    def test_target_edge_is_bounded(self):
+        from pydantic import ValidationError
+        from wanly_worker.services.face_crop import app as svc
+        for bad in (100, svc.MAX_TARGET_EDGE + 1):
+            with pytest.raises(ValidationError):
+                svc.UpscaleRequest(images=["x"], target_edge=bad)
+        assert svc.UpscaleRequest(images=["x"], target_edge=4096).target_edge == 4096
+
+    def test_health_advertises_upscale_target_only_with_weights(self, monkeypatch):
+        import asyncio
+        from wanly_worker.services.face_crop import app as svc
+        from wanly_worker.services.face_crop import upscale as up
+        monkeypatch.setattr(up, "available", lambda: True)
+        assert "upscale_target" in asyncio.run(svc.health())["features"]
+        monkeypatch.setattr(up, "available", lambda: False)
+        assert "upscale_target" not in asyncio.run(svc.health())["features"]
 
 
 # ------------------------------------------------------------------ wanly-api#436: pair framing

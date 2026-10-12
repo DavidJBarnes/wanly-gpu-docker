@@ -26,8 +26,11 @@ FEATURES = ["crop", "embed", "head_shoulders", "measure", "pair"]
 def features() -> list[str]:
     """FEATURES, plus "upscale" only when the weights are actually here. The code is fetched
     fresh at every boot (fetch_engine.sh) but the weights come with the IMAGE, so this code can
-    run in an older image that has none -- and must not advertise what it cannot do there."""
-    return FEATURES + (["upscale"] if up.available() else [])
+    run in an older image that has none -- and must not advertise what it cannot do there.
+
+    "upscale_target" (#214): /upscale honours `target_edge`, the dataset Upscale's high-res
+    copies. Code-only, so it rides with "upscale"."""
+    return FEATURES + (["upscale", "upscale_target"] if up.available() else [])
 
 app = FastAPI(title="wanly face-crop")
 
@@ -86,6 +89,19 @@ class CropRequest(BaseModel):
 class ImagesRequest(BaseModel):
     """/measure and /upscale: just the images, base64, as for /crop."""
     images: list[str] = Field(min_length=1, max_length=200)
+
+
+#: The largest long edge /upscale will make on request (#214). One native 4x pass reaches it
+#: from 1024 px; a 4096 px float tensor on CPU is ~200 MB, which this box can afford, and
+#: anything bigger is a wire and S3 cost for detail no consumer of a dataset uses.
+MAX_TARGET_EDGE = 4096
+
+
+class UpscaleRequest(ImagesRequest):
+    """/upscale. `target_edge` unset is the old contract: up to the trainer's 1024 ceiling,
+    for Fix small faces. Set, it is the dataset Upscale (#214): a high-res copy, the long
+    edge brought to exactly this (MIN_FACTOR still applies -- a near-no-op is declined)."""
+    target_edge: int | None = Field(default=None, ge=256, le=MAX_TARGET_EDGE)
 
 
 class CropFace(BaseModel):
@@ -195,7 +211,7 @@ async def measure(req: ImagesRequest):
 
 
 @app.post("/upscale")
-async def upscale(req: ImagesRequest):
+async def upscale(req: UpscaleRequest):
     """Whole images brought up to the trainer's ceiling with Real-ESRGAN (#206) -- the tiny
     close-ups, where there is nothing to crop and the whole frame is already the face.
 
@@ -204,17 +220,23 @@ async def upscale(req: ImagesRequest):
     """
     if not up.available():
         raise HTTPException(status_code=503, detail="upscale weights are missing from this image")
-    return {"images": await asyncio.to_thread(lambda: [_upscale_one(b) for b in req.images]),
-            "format": fd.IMAGE_FORMAT, "upscale": True}
+    asked = getattr(req, "target_edge", None)
+    target = asked or min(up.TARGET_EDGE, fd.MAX_EDGE)
+    return {"images": await asyncio.to_thread(
+                lambda: [_upscale_one(b, target) for b in req.images]),
+            "format": fd.IMAGE_FORMAT, "upscale": True,
+            # Echoed (#214): an older service ignores the field and caps at 1024, and wanly-api
+            # must not store that as the high-res copy it asked for.
+            "target_edge": asked}
 
 
-def _upscale_one(b64: str) -> dict | None:
+def _upscale_one(b64: str, target: int) -> dict | None:
     import cv2
     img = fd._decode(base64.b64decode(b64))
     if img is None:
         return None
     h, w = img.shape[:2]
-    out = up.upscale_bgr(img, min(up.TARGET_EDGE, fd.MAX_EDGE))
+    out = up.upscale_bgr(img, target)
     if out is img:
         return {"upscaled": False, "b64": None, "source_width": w, "source_height": h,
                 "width": w, "height": h}
