@@ -329,6 +329,9 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 # 23 GiB free" until the container is recreated. Seen 2026-09-10, six minutes after a reboot.
 # CDI (`/var/run/cdi/nvidia.yaml`, kept fresh by nvidia-cdi-refresh) puts the devices in the
 # spec itself, where a reload preserves them. Needs Docker >= 28 and the toolkit's CDI spec.
+# That spec is on tmpfs and the toolkit writes it only AFTER docker at boot, so docker cannot
+# restore this container after a reboot unless wanly-cdi-spec.service (install-cdi-spec.sh)
+# writes it first (#213).
 #
 # IMAGE_DESCRIPTION_MODEL DEFAULTS TO joycaption HERE even though the image's own default is a
 # Qwen tag (wanly-gpu-docker#129): joycaption:beta-one runs on every GPU we own, whereas a

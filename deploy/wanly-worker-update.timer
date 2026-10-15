@@ -18,6 +18,20 @@ Documentation=https://github.com/DavidJBarnes/wanly-gpu-docker/issues/72
 # that is almost always unchanged. It is set by having to wait for idle: a render is 10-13
 # minutes, so 30 minutes reliably finds a gap within the hour.
 OnCalendar=*:0/30
+# PLUS one tick shortly after every boot (wanly-gpu-docker#213). If the worker failed to come
+# back at boot -- the CDI spec race, or anything else that leaves it Exited -- update-worker.sh
+# recreates a dead container on its first check (#105). Without this that first check waited
+# for the next :00/:30 slot plus up to 5 minutes of jitter: 3090a sat dead 8 to 31 minutes
+# after its boots on 10-07 and 10-12, and on 10-11 David got there by hand first.
+#
+# This is NOT the #76 trap. That was OnBootSec paired with OnUnitActiveSec and nothing else,
+# so once the boot elapse passed there was nothing left to schedule from. OnCalendar above
+# always has a next elapse; OnBootSec only adds one extra elapse per boot.
+#
+# Two minutes, not zero: docker restores its containers in the first seconds after it starts,
+# and a check that ran before that would see an Exited worker docker was about to start, and
+# race it. A healthy worker on a current image makes this tick a no-op (a manifest check).
+OnBootSec=2min
 # Do not have every box on the network pull at the same instant.
 RandomizedDelaySec=5min
 # Catch up after downtime rather than waiting for the next slot.
