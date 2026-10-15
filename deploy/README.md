@@ -25,8 +25,45 @@ git clone https://github.com/DavidJBarnes/wanly-gpu-docker.git ~/wanly-gpu-docke
 cd ~/wanly-gpu-docker/deploy
 cp worker.env.example worker.env
 $EDITOR worker.env          # QUEUE_API_KEY and the host paths
+sudo ./install-cdi-spec.sh  # or the worker does not come back after a reboot (#213)
 ./run-worker.sh
 ```
+
+## Coming back after a reboot (#213)
+
+The container runs with `--restart unless-stopped` and gets its GPU through CDI
+(`--device nvidia.com/gpu=...`), which docker resolves from `/var/run/cdi/nvidia.yaml`. That
+file is on tmpfs, so it is gone after every boot, and the toolkit's `nvidia-cdi-refresh.service`
+that rewrites it is ordered `After=multi-user.target` -- which waits for docker. So docker
+always restores the worker first, the start fails with `CDI device injection failed:
+unresolvable CDI devices nvidia.com/gpu=all`, and docker never retries. Not a race: 3090a lost
+it on 6 boots out of 6 (2026-10-07 to 10-13); 3090b on 10-07 and 10-15.
+
+```bash
+sudo ~/wanly-gpu-docker/deploy/install-cdi-spec.sh
+```
+
+installs `wanly-cdi-spec.service`, which writes the same spec the same way, but `Before=` docker
+and pulled in by docker itself. It verifies docker is ordered after it, runs it once, and
+checks the spec lists `GPU_UUID` from `worker.env` when one is set. The spec stays on tmpfs and
+is regenerated from the loaded driver every boot, so a driver update cannot leave it stale --
+which is why this is not a persistent `/etc/cdi` spec. Not a `docker.service` drop-in with
+`After=nvidia-cdi-refresh.service` either: that is an ordering cycle through multi-user.target.
+
+After the next boot, check it won:
+
+```bash
+journalctl -b -u wanly-cdi-spec -u docker -o short-precise --no-pager \
+  | grep -E 'Generated CDI spec|Starting docker|unresolvable'
+```
+
+`Generated CDI spec` comes before `Starting docker`, and there is no `unresolvable` line.
+
+The backstop is the update timer: it ticks 2 minutes after every boot (`OnBootSec`), and
+`update-worker.sh` recreates a container that exists but is not running (#105). So a worker that
+fails at boot for any other reason is back within minutes, not at the next half-hour slot --
+**on a box that has the timer**. 3090b did not, which is why it stayed dead until a hand
+`docker start`.
 
 ## Keeping it current
 
@@ -51,6 +88,13 @@ Check on it with:
 systemctl list-timers wanly-worker-update.timer
 journalctl -u wanly-worker-update.service -n 50
 ```
+
+3090a runs the timer as a lingering **user** unit instead (`~/.config/systemd/user`), so there
+it is `systemctl --user list-timers` and `journalctl --user -u wanly-worker-update.service`.
+`install-timer.sh` refuses to add a system copy beside a user one: the two would lock in
+different places and could both recreate the worker at once (#97). To update the user copy,
+copy only the `.timer` (the user `.service` differs on purpose) and `systemctl --user
+daemon-reload`.
 
 ## One container per GPU (#83)
 

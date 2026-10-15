@@ -26,6 +26,22 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# ONE COPY OF THE TIMER PER BOX (wanly-gpu-docker#213). 3090a runs these units as lingering
+# USER units (~/.config/systemd/user), not system ones. Installing the system copy beside them
+# gives two timers, and they do not share update-worker.sh's lock: the user unit locks under
+# $XDG_RUNTIME_DIR, a system unit with User= has no XDG_RUNTIME_DIR and locks under /run/lock.
+# Two unlocked updaters is the double-recreate #97 fixed. Refuse rather than quietly add one.
+owner="${SUDO_USER:-david}"
+owner_home=$(getent passwd "$owner" | cut -d: -f6 || true)
+if [ -n "$owner_home" ] && [ -e "$owner_home/.config/systemd/user/timers.target.wants/wanly-worker-update.timer" ]; then
+    echo "!! $owner already runs wanly-worker-update.timer as a USER timer."
+    echo "!! Update that copy instead (no sudo). The timer only: the user .service is a"
+    echo "!! different file (no User=, no docker.service dependency, both invalid in a user unit)."
+    echo "!!   cp $HERE/wanly-worker-update.timer $owner_home/.config/systemd/user/"
+    echo "!!   systemctl --user daemon-reload && systemctl --user list-timers wanly-worker-update.timer"
+    exit 1
+fi
+
 for unit in wanly-worker-update.service wanly-worker-update.timer; do
     [ -f "$HERE/$unit" ] || { echo "!! $HERE/$unit is missing — is this checkout current?"; exit 1; }
     install -m 644 "$HERE/$unit" "$UNIT_DIR/$unit"

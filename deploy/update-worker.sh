@@ -79,7 +79,8 @@ fi
 # digest comparison below says "nothing to do", and every health check fails -- which every
 # later check reads as BUSY and walks away. A dead container cannot be busy; its processes
 # are gone. Recreate it here, BEFORE the pull and the idle checks, so recovery is one timer
-# tick (~35 minutes with the randomized delay), not one human.
+# tick (~35 minutes with the randomized delay), not one human. After a BOOT it is the timer's
+# OnBootSec tick, 2-7 minutes in -- the backstop for the CDI boot race (#213).
 #
 # run-worker.sh is the recreate path rather than `docker start`: it is the documented
 # converge (safe to re-run, mounts/env from worker.env), and if the CDI spec is momentarily

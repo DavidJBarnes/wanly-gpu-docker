@@ -1,0 +1,61 @@
+[Unit]
+Description=Write the NVIDIA CDI spec before docker restores the GPU worker
+Documentation=https://github.com/DavidJBarnes/wanly-gpu-docker/issues/213
+# WHY THIS UNIT EXISTS (wanly-gpu-docker#213)
+#     The worker is created with `--device nvidia.com/gpu=...` (CDI, #95) and restart policy
+#     unless-stopped. Docker resolves that device from /var/run/cdi/nvidia.yaml, which lives on
+#     tmpfs and is gone after every boot. The toolkit's own nvidia-cdi-refresh.service rewrites
+#     it, but that unit is ordered `After=multi-user.target` -- and multi-user.target waits for
+#     docker.service. So on EVERY boot docker comes up first, logs "CDI directory does not
+#     exist, skipping", tries to restore the worker, fails with `CDI device injection failed:
+#     unresolvable CDI devices nvidia.com/gpu=all`, and never retries (RestartCount 0). The
+#     spec lands about a second later. Not a race: 3090a failed 6 boots out of 6.
+#
+# WHY NOT A docker.service DROP-IN `After=nvidia-cdi-refresh.service`
+#     It is an ordering CYCLE: docker < multi-user.target < nvidia-cdi-refresh < docker.
+#     systemd breaks a cycle by deleting a job from the boot transaction, which could be
+#     docker's start. And the vendor's `After=multi-user.target` cannot be removed from a
+#     drop-in (systemd does not let dependency lists be reset), only by replacing the
+#     vendor's unit file, which a toolkit upgrade would put back.
+#
+# WHY NOT A PERSISTENT /etc/cdi SPEC
+#     A spec generated once into /etc/cdi survives the reboot, but it also survives a DRIVER
+#     UPDATE: it names the old driver's library files, and nothing in the toolkit refreshes
+#     /etc/cdi. Docker would then inject a mismatched driver into the worker -- exactly at the
+#     boot after an update, the one moment nobody is watching. Regenerating into tmpfs every
+#     boot means the spec always describes the driver that is actually loaded.
+#
+# So: generate the SAME file the vendor unit writes, the same way (its Environment and
+# EnvironmentFile, so any override in nvidia-cdi-refresh.env applies to both), just earlier --
+# before docker.service. The vendor unit still runs after multi-user.target and its .path unit
+# still regenerates on a driver/toolkit install mid-session; both write identical content
+# (checked on 3090a and 3090b, 2026-10-15). The spec names every card by index AND by UUID, so
+# GPU_UUID pinning resolves exactly as it does today.
+ConditionPathExists=/usr/bin/nvidia-ctk
+# The driver must be loaded and answering. gpu-power-limit.service (on both 3090s) runs
+# nvidia-smi before docker on the same ordering, so this is a proven slot. After= on a unit a
+# box does not have is ignored.
+After=systemd-modules-load.service gpu-power-limit.service nvidia-persistenced.service
+Before=docker.service
+
+[Service]
+# No RemainAfterExit: the unit goes inactive once the spec is written, so the Wants= from the
+# next docker start (a manual `systemctl restart docker` included) runs it again.
+Type=oneshot
+Environment=NVIDIA_CTK_CDI_OUTPUT_FILE_PATH=/var/run/cdi/nvidia.yaml
+EnvironmentFile=-/etc/nvidia-container-toolkit/nvidia-cdi-refresh.env
+# Wait (bounded) for the driver to answer, then generate regardless. udev normally has it
+# loaded seconds into boot; the wait only matters on a slow or degraded boot, and 30 s is the
+# most this ever delays docker. A spec generated against a missing driver would fail anyway,
+# and the update timer's boot tick is the backstop for that case.
+# `$$` is a literal `$` to systemd, which would otherwise expand `$i` itself (to nothing).
+ExecStartPre=/bin/sh -c 'i=0; while [ $$i -lt 30 ]; do nvidia-smi -L >/dev/null 2>&1 && exit 0; i=$$((i+1)); sleep 1; done; echo "nvidia-smi did not answer in 30s; generating anyway"'
+ExecStart=/usr/bin/nvidia-ctk cdi generate
+# A hung NVML must not hold docker (and every other container on the box) forever.
+TimeoutStartSec=90
+
+[Install]
+# Pulled in by docker.service itself, so it runs whenever docker starts -- at boot, and on a
+# manual `systemctl restart docker` -- and is ordered before it by Before= above. Wants, not
+# Requires: if the spec cannot be written, docker must still start for the non-GPU containers.
+WantedBy=docker.service
