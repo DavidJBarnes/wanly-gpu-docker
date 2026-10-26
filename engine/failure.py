@@ -56,28 +56,76 @@ def memory_cap(cgroup_dir: Path | None = None) -> int | None:
     return None if raw == "max" else int(raw)
 
 
+#: The container's own /proc. Docker gives the container a private PID namespace, so this
+#: lists the processes sharing the container's memory cap and nothing else on the host.
+PROC_DIR = Path(os.environ.get("ENGINE_PROC_DIR", "/proc"))
+
+
+def largest_processes(proc_dir: Path | None = None, n: int = 4) -> list[tuple[int, str]]:
+    """The `n` largest processes by resident memory: [(rss_bytes, command line)], biggest first.
+
+    Read at failure time, seconds after the kill. Whatever pushed the container over its cap
+    is usually still running then (on 2026-10-26 the hologram ran 3 more minutes), which makes
+    this the evidence, where the previous message could only guess (wanly-gpu-docker#223).
+    """
+    procs = []
+    for d in (proc_dir or PROC_DIR).iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            rss_kb = 0
+            for line in (d / "status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    break
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+        except (OSError, ValueError):
+            continue        # exited while we looked, or a kernel thread with no status
+        argv = [a.decode(errors="replace") for a in argv if a]
+        if not argv or not rss_kb:
+            continue
+        cmd = " ".join([os.path.basename(argv[0])] + argv[1:])
+        procs.append((rss_kb * 1024, cmd[:80]))
+    procs.sort(reverse=True)
+    return procs[:n]
+
+
+def _describe(procs: list[tuple[int, str]]) -> str:
+    return "; ".join(f"{rss / 2**30:.1f} GiB {cmd}" for rss, cmd in procs)
+
+
 def comfy_gone(msg: str) -> bool:
     """True when the failure is "ComfyUI stopped answering", not something it reported."""
     return any(s in msg for s in _COMFY_GONE)
 
 
-def explain_comfy_gone(msg: str, new_oom_kills: int | None, cap: int | None) -> str:
+def explain_comfy_gone(msg: str, new_oom_kills: int | None, cap: int | None,
+                       procs: list[tuple[int, str]] | None = None) -> str:
     """Why ComfyUI vanished mid-render (wanly-gpu-docker#166).
 
     On 2026-10-03 a render on 3090a failed as a bare "Connection refused" on /history: the
     kernel had OOM-killed ComfyUI at the container's 54 GiB cap when the in-container
     captioner loaded Qwen3-VL 32B beside it. The supervisor then restarted the container, so
     by the time anyone looked the evidence was in `journalctl -k` only. Say it here instead.
+
+    It used to add "most often the image-description captioner". On 2026-10-26 that sent the
+    reader the wrong way: the captioner was not even running on 3090b, and the other big
+    process was an AR hologram in the render daemon (wanly-gpu-daemon#192). So name what is
+    actually resident (`procs`, from largest_processes()) instead of guessing (#223).
     """
     cap_s = f"{cap / 2**30:.0f} GiB" if cap else "no cap"
     if new_oom_kills:
         return (msg + f" — ComfyUI was OOM-killed: the container hit its memory cap "
                 f"({cap_s}, memory.max) and the kernel killed {new_oom_kills} process(es) "
-                "during this render. Something else in the container needed RAM at the same "
-                "time — most often the image-description captioner loading its model mid-render. "
-                "Host evidence: `journalctl -k | grep -i oom`. Raising WORKER_MEMORY_LIMIT "
-                "trades this for the host-wide swap thrash in wanly-gpu-docker#166; keep the "
-                "captioner off the box while it renders instead.")
+                "during this render, so something else in the container needed RAM at the "
+                "same time. "
+                + (f"Largest processes in the container seconds after the kill: "
+                   f"{_describe(procs)}. " if procs else
+                   "The container's processes could not be listed. ")
+                + "The kernel's own table of what each process held at the kill: "
+                "`journalctl -k | grep -iA30 oom` on the host. Raising WORKER_MEMORY_LIMIT "
+                "trades this for the host-wide swap thrash in wanly-gpu-docker#166; stop the "
+                "other process sharing the box while it renders instead.")
     if new_oom_kills == 0:
         return (msg + " — ComfyUI stopped answering mid-render: the process exited or "
                 f"restarted. It was NOT OOM-killed (no OOM kill in the container's cgroup, cap "
@@ -103,7 +151,13 @@ def explain_failure(msg: str, width: int, height: int, num_frames: int,
     if comfy_gone(msg):
         now = oom_kills()
         new = None if now is None or oom_kills_before is None else now - oom_kills_before
-        return explain_comfy_gone(msg, new, memory_cap())
+        procs = None
+        if new:
+            try:
+                procs = largest_processes()
+            except OSError:
+                pass
+        return explain_comfy_gone(msg, new, memory_cap(), procs)
     if lost_gpu_access(msg):
         return (msg + " — the process could not allocate on the GPU at all (0 bytes held), "
                 "which is lost GPU device access, not a full card: it happens when systemd "

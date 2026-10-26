@@ -60,6 +60,56 @@ def test_refused_connection_with_a_new_oom_kill_blames_the_memory_cap(tmp_path, 
     assert "did not fit" not in out, "a host-RAM kill is not a VRAM problem"
 
 
+def _proc(tmp_path, procs):
+    """A fake /proc: {pid: (rss_kb, argv list)}. Kernel threads have an empty cmdline."""
+    root = tmp_path / "proc"
+    root.mkdir()
+    (root / "self").mkdir()           # non-numeric entries are skipped
+    for pid, (rss_kb, argv) in procs.items():
+        d = root / str(pid)
+        d.mkdir()
+        (d / "status").write_text(f"Name:\tx\nVmRSS:\t{rss_kb} kB\n" if rss_kb is not None
+                                  else "Name:\tkthread\n")
+        (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    return root
+
+
+def test_an_oom_kill_names_what_is_actually_resident_not_the_captioner(tmp_path, monkeypatch):
+    """2026-10-26, 3090b: the message blamed the captioner, which was not running. The other
+    big process was the render daemon matting an AR hologram (#223)."""
+    import engine.failure as f
+    monkeypatch.setattr(f, "CGROUP_DIR", _cgroup(tmp_path, oom_kill=1, cap="27917287424"))
+    monkeypatch.setattr(f, "PROC_DIR", _proc(tmp_path, {
+        3167: (4_600_000, ["/usr/bin/python3", "-m", "daemon.main"]),
+        2476: (360_000, ["python3", "-m", "uvicorn", "wanly_worker.control:app"]),
+        3151: (340_000, ["python3", "app.py", "--port", "8190"]),
+        2735: (3_000, ["tee", "-a", "/workspace/logs/daemon.log"]),
+        2733: (2_000, ["/bin/bash", "/app/start.sh"]),
+        7: (None, []),
+    }))
+    out = f.explain_failure(COMFY_REFUSED, 1216, 832, 241, oom_kills_before=0)
+    assert "26 GiB" in out and "ComfyUI was OOM-killed" in out
+    assert "captioner" not in out, "no guessing at a process that may not exist"
+    assert "4.4 GiB python3 -m daemon.main" in out
+    assert out.index("daemon.main") < out.index("uvicorn"), "biggest first"
+    assert "start.sh" not in out, "only the top four"
+
+
+def test_largest_processes_skips_kernel_threads_and_vanished_pids(tmp_path):
+    from engine.failure import largest_processes
+    root = _proc(tmp_path, {10: (None, []), 11: (2048, ["sleep", "9"])})
+    (root / "12").mkdir()             # exited between listdir and read
+    assert largest_processes(root) == [(2048 * 1024, "sleep 9")]
+
+
+def test_an_unlistable_proc_still_explains_the_kill(tmp_path, monkeypatch):
+    import engine.failure as f
+    monkeypatch.setattr(f, "CGROUP_DIR", _cgroup(tmp_path, oom_kill=1))
+    monkeypatch.setattr(f, "PROC_DIR", tmp_path / "absent")
+    out = f.explain_failure(COMFY_REFUSED, 1216, 832, 241, oom_kills_before=0)
+    assert "ComfyUI was OOM-killed" in out and "could not be listed" in out
+
+
 def test_refused_connection_without_an_oom_kill_says_it_was_not_the_cap(tmp_path, monkeypatch):
     import engine.failure as f
     monkeypatch.setattr(f, "CGROUP_DIR", _cgroup(tmp_path, oom_kill=3))
