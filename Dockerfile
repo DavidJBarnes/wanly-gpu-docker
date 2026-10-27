@@ -22,6 +22,36 @@
 #
 # The daemon is still cloned at boot rather than baked (see start.sh). The image
 # is the environment; the daemon is the code.
+# ---------------------------------------------------------------- llama.cpp (#225)
+#
+# llama-server for the Sulphur-2 prompt enhancer (wanly_worker/services/prompt_enhance). Not
+# ollama, which serves every other model here: the enhancer's vision projector is a separate
+# mmproj GGUF and ollama's import does not take one for qwen35.
+#
+# BUILT FROM SOURCE, NOT THE RELEASE BINARIES: those are built on Ubuntu 24.04 and need glibc
+# 2.38; this image is 22.04 (2.35), and they fail to load here -- verified in the live scene
+# container on 3090a. Built on the SAME CUDA 12.4 / 22.04 base as the image, so it links the
+# runtime's own cuBLAS and nothing else. Pinned to the commit of release b11559. Static, so
+# the output is one binary. sm_75 (the 2070) and sm_86 (the 3090s) only -- every arch is
+# minutes of nvcc. Only when WITH_TRAINER=1 (the :full tag); the lean tag gets an empty dir.
+# The registry build cache keeps this stage, so only a changed pin pays the compile.
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS llamacpp
+ARG WITH_TRAINER=0
+ARG LLAMA_CPP_COMMIT=f2cc7282ce0042641df55e0e563b75e824e2b647
+RUN mkdir -p /out && if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
+      apt-get update && apt-get install -y --no-install-recommends git cmake build-essential ca-certificates \
+      && rm -rf /var/lib/apt/lists/* \
+      && git init /src && cd /src \
+      && git fetch --depth 1 https://github.com/ggml-org/llama.cpp.git "$LLAMA_CPP_COMMIT" \
+      && git checkout FETCH_HEAD \
+      && cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86" \
+           -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF \
+           -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+      && cmake --build build --target llama-server -j"$(nproc)" \
+      && cp build/bin/llama-server /out/ \
+      && rm -rf /src; \
+    fi
+
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -330,34 +360,9 @@ RUN set -eux; mkdir -p "$FACE_UPSCALE_MODELS_DIR" && cd "$FACE_UPSCALE_MODELS_DI
 
 # ---------------------------------------------------------------- prompt-enhance (#225)
 #
-# llama.cpp's llama-server, for the Sulphur-2 prompt enhancer (wanly_worker/services/
-# prompt_enhance). Not ollama, which serves every other model here: the enhancer's vision
-# projector is a separate mmproj GGUF and ollama's import does not take one for qwen35.
-# The official prebuilt CUDA 12.8 build plus its cudart/cuBLAS bundle, pinned by release and
-# sha256, in their own directory: app.py puts it on LD_LIBRARY_PATH for llama-server alone, so
-# these CUDA libraries never meet torch's. CUDA 12.8 needs driver 570+; both boxes run 580.
-# :full only, like the other called services -- RunPod pods never run it.
-ARG LLAMA_CPP_BUILD=b11559
-RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
-      cd /tmp && base="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_BUILD}" \
-      && curl -fsSL --retry 3 -o l.tgz "$base/llama-${LLAMA_CPP_BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz" \
-      && curl -fsSL --retry 3 -o c.tgz "$base/cudart-llama-${LLAMA_CPP_BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz" \
-      && printf '%s  %s\n' \
-           47e9eedc66aedc844d8a6c5dae6850705d687798abe7f42889473ca1ce4161c5 l.tgz \
-           c9688702bc6f5bcc8e9bea509cb805558324a07dc7c49737633ae5a5f397ffd2 c.tgz \
-         | sha256sum -c - \
-      && mkdir -p lc /opt/llama.cpp && tar xzf l.tgz -C lc && tar xzf c.tgz -C lc \
-      && bin="$(dirname "$(find lc -type f -name llama-server | head -1)")" \
-      && cp -a "$bin"/. /opt/llama.cpp/ \
-      && find lc -name '*.so*' -exec cp -an {} /opt/llama.cpp/ \; \
-      && rm -rf lc l.tgz c.tgz \
-      && missing="$(LD_LIBRARY_PATH=/opt/llama.cpp ldd /opt/llama.cpp/llama-server /opt/llama.cpp/libggml-cuda.so 2>/dev/null \
-                    | grep 'not found' | grep -v 'libcuda.so' || true)" \
-      && if [ -n "$missing" ]; then echo "llama.cpp is missing libraries: $missing"; exit 1; fi \
-      && test -x /opt/llama.cpp/llama-server; \
-    else \
-      echo "built without prompt-enhance (WITH_TRAINER=0) — the lean :latest tag"; \
-    fi
+# llama.cpp's llama-server, BUILT in the stage at the top of this file (see there for why).
+# An empty directory on the lean tag.
+COPY --from=llamacpp /out/ /opt/llama.cpp/
 
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/

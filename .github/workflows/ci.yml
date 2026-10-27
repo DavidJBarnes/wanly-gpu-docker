@@ -50,3 +50,45 @@ jobs:
         run: |
           pip install "ruff>=0.5"
           python -m ruff check --select F821 --output-format concise engine/ wanly_worker/
+
+  # llama-server for prompt-enhance (#225), built in the Dockerfile's `llamacpp` stage. The
+  # image itself is built only on main/next, so without this a broken pin or a glibc mismatch
+  # (the release binaries need glibc 2.38; the image is 22.04's 2.35 -- the reason for building
+  # from source) would first show up after merge. Builds the stage, proves the binary loads on
+  # the image's own runtime base, and keeps it as an artifact so it can be run on the real
+  # card before merging.
+  llama-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the llamacpp stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: llamacpp
+          build-args: WITH_TRAINER=1
+          outputs: type=local,dest=llamacpp-out
+          cache-from: type=registry,ref=davidjbarnes/wanly-gpu-docker:buildcache
+      - name: Loads on the image's runtime base (glibc 2.35, CUDA 12.4)
+        run: |
+          ls -la llamacpp-out/out/llama-server
+          docker run --rm -v "$PWD/llamacpp-out/out:/opt/llama.cpp:ro" \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -c '
+              set -e
+              mkdir -p /tmp/stub && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1
+              # The runtime image has the same libs; the devel one adds only the driver stub,
+              # which stands in for the host driver a GPU box mounts.
+              LD_LIBRARY_PATH=/tmp/stub ldd /opt/llama.cpp/llama-server | tee /tmp/ldd
+              ! grep "not found" /tmp/ldd
+              LD_LIBRARY_PATH=/tmp/stub /opt/llama.cpp/llama-server --version'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-server
+          path: llamacpp-out/out/llama-server
+          retention-days: 7
