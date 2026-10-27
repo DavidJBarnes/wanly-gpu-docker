@@ -328,6 +328,37 @@ RUN set -eux; mkdir -p "$FACE_UPSCALE_MODELS_DIR" && cd "$FACE_UPSCALE_MODELS_DI
     | sha256sum -c - \
  && chmod -R a+rX /opt/face-crop
 
+# ---------------------------------------------------------------- prompt-enhance (#225)
+#
+# llama.cpp's llama-server, for the Sulphur-2 prompt enhancer (wanly_worker/services/
+# prompt_enhance). Not ollama, which serves every other model here: the enhancer's vision
+# projector is a separate mmproj GGUF and ollama's import does not take one for qwen35.
+# The official prebuilt CUDA 12.8 build plus its cudart/cuBLAS bundle, pinned by release and
+# sha256, in their own directory: app.py puts it on LD_LIBRARY_PATH for llama-server alone, so
+# these CUDA libraries never meet torch's. CUDA 12.8 needs driver 570+; both boxes run 580.
+# :full only, like the other called services -- RunPod pods never run it.
+ARG LLAMA_CPP_BUILD=b11559
+RUN if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
+      cd /tmp && base="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_BUILD}" \
+      && curl -fsSL --retry 3 -o l.tgz "$base/llama-${LLAMA_CPP_BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz" \
+      && curl -fsSL --retry 3 -o c.tgz "$base/cudart-llama-${LLAMA_CPP_BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz" \
+      && printf '%s  %s\n' \
+           47e9eedc66aedc844d8a6c5dae6850705d687798abe7f42889473ca1ce4161c5 l.tgz \
+           c9688702bc6f5bcc8e9bea509cb805558324a07dc7c49737633ae5a5f397ffd2 c.tgz \
+         | sha256sum -c - \
+      && mkdir -p lc /opt/llama.cpp && tar xzf l.tgz -C lc && tar xzf c.tgz -C lc \
+      && bin="$(dirname "$(find lc -type f -name llama-server | head -1)")" \
+      && cp -a "$bin"/. /opt/llama.cpp/ \
+      && find lc -name '*.so*' -exec cp -an {} /opt/llama.cpp/ \; \
+      && rm -rf lc l.tgz c.tgz \
+      && missing="$(LD_LIBRARY_PATH=/opt/llama.cpp ldd /opt/llama.cpp/llama-server /opt/llama.cpp/libggml-cuda.so 2>/dev/null \
+                    | grep 'not found' | grep -v 'libcuda.so' || true)" \
+      && if [ -n "$missing" ]; then echo "llama.cpp is missing libraries: $missing"; exit 1; fi \
+      && test -x /opt/llama.cpp/llama-server; \
+    else \
+      echo "built without prompt-enhance (WITH_TRAINER=0) — the lean :latest tag"; \
+    fi
+
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 COPY engine/ /opt/engine/
 COPY download_models.sh /app/download_models.sh
@@ -368,5 +399,5 @@ ENV WANLY_IMAGE_REF=$GIT_SHA
 # ComfyUI, ltx-engine, the control API, sshd; then image-description (ollama), face-crop and
 # face-edit, which wanly-api calls across the network; image-edit (edit mode only, console#548)
 # likewise. The trainer and image-edit's own ComfyUI bind loopback and are not exposed.
-EXPOSE 8188 8190 8081 22 11434 8084 8085 8086
+EXPOSE 8188 8190 8081 22 11434 8084 8085 8086 11438
 CMD ["/app/start.sh"]
