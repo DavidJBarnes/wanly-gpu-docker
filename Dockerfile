@@ -52,6 +52,11 @@ RUN mkdir -p /out && if [ "$WITH_TRAINER" = "1" ]; then set -eux; \
       && rm -rf /src; \
     fi
 
+# Just the binary, for CI's artifact. Exporting the stage above copies the whole devel image
+# (GBs) to the runner, which outlasted the job's timeout on its own.
+FROM scratch AS llamacpp-bin
+COPY --from=llamacpp /out/ /
+
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \

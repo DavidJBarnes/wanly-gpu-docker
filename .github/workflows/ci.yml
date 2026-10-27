@@ -71,14 +71,17 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          target: llamacpp
+          target: llamacpp-bin
           build-args: WITH_TRAINER=1
           outputs: type=local,dest=llamacpp-out
-          cache-from: type=registry,ref=davidjbarnes/wanly-gpu-docker:buildcache
+          cache-from: |
+            type=registry,ref=davidjbarnes/wanly-gpu-docker:buildcache
+            type=gha,scope=llamacpp
+          cache-to: type=gha,scope=llamacpp,mode=max
       - name: Loads on the image's runtime base (glibc 2.35, CUDA 12.4)
         run: |
-          ls -la llamacpp-out/out/llama-server
-          docker run --rm -v "$PWD/llamacpp-out/out:/opt/llama.cpp:ro" \
+          ls -la llamacpp-out/llama-server
+          docker run --rm -v "$PWD/llamacpp-out:/opt/llama.cpp:ro" \
             nvidia/cuda:12.4.1-devel-ubuntu22.04 bash -c '
               set -e
               mkdir -p /tmp/stub && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1
@@ -90,5 +93,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: llama-server
-          path: llamacpp-out/out/llama-server
+          path: llamacpp-out/llama-server
           retention-days: 7
