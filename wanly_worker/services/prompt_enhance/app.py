@@ -49,7 +49,11 @@ REQUEST_TIMEOUT_S = float(os.environ.get("PROMPT_ENHANCE_TIMEOUT_S", "300"))
 #: Context. A prompt is ~1k tokens out and the image ~1-2k in; the model's 262k default would
 #: spend the card's last gigabyte on KV cache nobody uses.
 CTX = int(os.environ.get("PROMPT_ENHANCE_CTX", "8192"))
-MAX_TOKENS = int(os.environ.get("PROMPT_ENHANCE_MAX_TOKENS", "1024"))
+#: Thinking included: the model reasons first (llama-server returns that apart, as
+#: reasoning_content) and spent ~600 tokens of it on a test image before an ~230-token prompt.
+#: At 1024 the reasoning alone ran out once, leaving no prompt. Thinking is left on because
+#: with it off the prompt invented details the image did not have. ~46 tok/s on the 2070.
+MAX_TOKENS = int(os.environ.get("PROMPT_ENHANCE_MAX_TOKENS", "3072"))
 #: Who to ask for the card. Default: scene-caption on this box, when it is on SERVICES.
 WATCH_S = 5.0
 LOG_PATH = os.environ.get("PROMPT_ENHANCE_LLAMA_LOG", "/tmp/prompt-enhance-llama.log")
@@ -257,8 +261,10 @@ async def enhance(request: Request):
         out = r.json()
         prompt = strip_think(out["choices"][0]["message"].get("content") or "")
         if not prompt:
-            _state.update(failures=_state["failures"] + 1, last_error="empty answer")
-            raise HTTPException(502, "the enhancer answered with nothing")
+            why = ("its reasoning used the whole max_tokens budget"
+                   if out["choices"][0].get("finish_reason") == "length" else "no reason given")
+            _state.update(failures=_state["failures"] + 1, last_error=f"empty answer: {why}")
+            raise HTTPException(502, f"the enhancer answered with nothing ({why})")
         ms = round((time.monotonic() - t0) * 1000)
         _state.update(enhances=_state["enhances"] + 1, last_ms=ms, last_at=round(time.time()),
                       last_error=None)

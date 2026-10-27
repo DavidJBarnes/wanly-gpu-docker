@@ -93,6 +93,10 @@ FAKE_SERVER = textwrap.dedent('''\
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             with open(log, "a") as fh:
                 fh.write(json.dumps({{"argv": sys.argv[1:], "body": body}}) + "\\n")
+            if body.get("max_tokens") == 1:   # the reasoning ran out the budget
+                self._send(200, {{"choices": [{{"message": {{"content": "",
+                    "reasoning_content": "The user wants"}}, "finish_reason": "length"}}]}})
+                return
             self._send(200, {{"choices": [{{"message": {{"content":
                 "<think>\\nhmm\\n</think>\\n\\nA woman turns toward the camera."}},
                 "finish_reason": "stop"}}], "usage": {{"completion_tokens": 7}}}})
@@ -169,6 +173,12 @@ class TestEnhance:
         os.remove(tmp_path / model.WEIGHTS.local)
         r = client.post("/enhance", json={"text": "x"})
         assert r.status_code == 503 and "not in" in r.json()["detail"]
+
+    def test_reasoning_that_runs_out_is_an_error_not_an_empty_prompt(self, served):
+        client, _, _ = served
+        r = client.post("/enhance", json={"text": "x", "max_tokens": 1})
+        assert r.status_code == 502 and "max_tokens" in r.json()["detail"]
+        assert client.get("/health").json()["failures"] == 1
 
     def test_needs_something_to_enhance(self, served):
         client, _, _ = served
