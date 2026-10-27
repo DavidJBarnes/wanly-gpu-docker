@@ -259,7 +259,7 @@ class TestTheExample:
     def test_scene_env_example_is_a_dedicated_captioner(self):
         s = (DEPLOY / "scene.env.example").read_text()
         assert "NAME=wanly-scene" in s
-        assert "SERVICES=scene-caption\n" in s
+        assert "SERVICES=scene-caption,prompt-enhance\n" in s, "the 2070 also runs the enhancer (#225)"
         assert "\nSCENE_CAPTION_SHARED=" not in s, "dedicated card: the sharing flag stays off"
         assert "CONTROL_PORT=8088" in s and "PRUNE_IMAGES=0" in s
         assert s.count("QUEUE_API_KEY=\n") == 1, "never a real key in the example"

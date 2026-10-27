@@ -60,6 +60,7 @@ case ",$SERVICES," in *,face-edit,*)          WANT_FACE_EDIT=1 ;; *) WANT_FACE_E
 case ",$SERVICES," in *,ltx-engine,*)         WANT_ENGINE=1 ;;    *) WANT_ENGINE=0 ;;    esac
 case ",$SERVICES," in *,image-edit,*)         WANT_IMAGE_EDIT=1 ;; *) WANT_IMAGE_EDIT=0 ;; esac
 case ",$SERVICES," in *,scene-caption,*)      WANT_SCENE=1 ;;     *) WANT_SCENE=0 ;;     esac
+case ",$SERVICES," in *,prompt-enhance,*)     WANT_ENHANCE=1 ;;   *) WANT_ENHANCE=0 ;;   esac
 
 # THE RENDER STACK'S MOUNTS AND PORTS ARE THE RENDER STACK'S (console#547). They used to be
 # unconditional, which made a box that renders nothing -- the 2070, running face-edit beside
@@ -151,6 +152,24 @@ if [ "$WANT_SCENE" = "1" ]; then
     # each edit then asks JoyCaption to unload first, and hands the card back after.
     # SCENE_CAPTION_MODES keeps it to some modes (#199): 3090b runs it in edit mode only.
     for v in SCENE_CAPTION_SHARED SCENE_CAPTION_MODES SCENE_CAPTION_YIELD_WAIT_S IMAGE_EDIT_SCENE_RESUME_IDLE_S MODEL_LIMIT_RATE; do
+        if [ -n "${!v:-}" ]; then SCENE_ENV_ARGS+=(-e "$v=${!v}"); fi
+    done
+fi
+if [ "$WANT_ENHANCE" = "1" ]; then
+    # prompt-enhance (#225): the Sulphur-2 enhancer's two GGUFs (~6.2 GB) live under the ollama
+    # store mount (PROMPT_ENHANCE_MODEL_DIR, /root/.ollama/prompt-enhance) so a recreate keeps
+    # them. Beside scene-caption on one card the two take turns (scene-caption yields per run).
+    : "${OLLAMA_HOST_STORE:?prompt-enhance is enabled — set OLLAMA_HOST_STORE in $ENV_FILE (its files live there)}"
+    if [ "$WANT_OLLAMA" != "1" ] && [ "$WANT_SCENE" != "1" ]; then
+        MOUNTS+=(-v "$OLLAMA_HOST_STORE:/root/.ollama")
+    fi
+    PORTS+=(-p "${PROMPT_ENHANCE_PORT:-11438}:11438")
+    if ss -tlnp 2>/dev/null | grep -q ":${PROMPT_ENHANCE_PORT:-11438} " \
+       && ! docker port "$NAME" 2>/dev/null | grep -q ":${PROMPT_ENHANCE_PORT:-11438}$"; then
+        echo "!! something already listens on ${PROMPT_ENHANCE_PORT:-11438}, and it is not $NAME."
+        exit 1
+    fi
+    for v in PROMPT_ENHANCE_IDLE_S PROMPT_ENHANCE_CTX PROMPT_ENHANCE_MAX_TOKENS PROMPT_ENHANCE_AUTO_FETCH; do
         if [ -n "${!v:-}" ]; then SCENE_ENV_ARGS+=(-e "$v=${!v}"); fi
     done
 fi

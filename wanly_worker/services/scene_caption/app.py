@@ -45,8 +45,11 @@ from fastapi.responses import JSONResponse
 MODEL = "joycaption:beta-one"
 OLLAMA_PORT = int(os.environ.get("SCENE_CAPTION_OLLAMA_PORT", "11437"))
 OLLAMA = f"http://127.0.0.1:{OLLAMA_PORT}"
-#: The flag. Off by default: a dedicated card has nobody to yield to.
-SHARED = os.environ.get("SCENE_CAPTION_SHARED", "0").strip() == "1"
+#: The flag. Off by default: a dedicated card has nobody to yield to -- unless prompt-enhance is
+#: on the same SERVICES line (#225): the 2070 cannot hold both models, so they take turns.
+SHARED = (os.environ.get("SCENE_CAPTION_SHARED", "0").strip() == "1"
+          or "prompt-enhance" in {n.strip().lower()
+                                  for n in os.environ.get("SERVICES", "").split(",")})
 #: How long a caption waits for a lent-out card before it is refused (503 -> wanly-api falls
 #: back). Under wanly-api's scene_caption_timeout_s (900) on purpose, so the refusal arrives as
 #: a refusal and not as a timeout.

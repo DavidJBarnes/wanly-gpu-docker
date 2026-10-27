@@ -28,6 +28,7 @@ from wanly_worker.services.image_description import ImageDescription
 from wanly_worker.services.image_edit import image_edit_group
 from wanly_worker.services.lora_trainer import LoraTrainer
 from wanly_worker.services.ltx_engine import ltx_engine_group
+from wanly_worker.services.prompt_enhance.service import PromptEnhance
 from wanly_worker.services.scene_caption.service import scene_caption_group
 
 #: Every service the image can run, by the name the SERVICES flag uses. A value is a factory
@@ -45,6 +46,9 @@ KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
     # yields per edit (SCENE_CAPTION_SHARED) rather than being stopped by a mode -- unless
     # SCENE_CAPTION_MODES keeps it to some modes (#199, 3090b until the 2070).
     "scene-caption": scene_caption_group,
+    # The Sulphur-2 prompt enhancer (#225), loaded per request. Called, claims nothing. Meant
+    # for the scene box beside scene-caption, which it asks to yield the card while it runs.
+    "prompt-enhance": PromptEnhance,
 }
 
 #: Services whose presence changes what KIND of worker this box is. The API's claim gates key
@@ -123,7 +127,12 @@ MODE_ONLY = {"image-edit": "edit"}
 #: for the reason MODE_ONLY exists: a caption landing mid-edit or mid-run would load a 20 GB
 #: vision model onto a card that already has its tenant. face-crop and face-edit stay --
 #: CPU-first and ~2 GB at most.
-_MODE_EXCLUDES = {"edit": {"image-description"}, "train": {"image-description"}}
+_MODE_EXCLUDES = {"edit": {"image-description", "prompt-enhance"},
+                  "train": {"image-description", "prompt-enhance"}}
+
+#: Called services that load a real model onto the GPU on demand, so never beside a render on
+#: the same box (#173). scene-caption is not here: its own SCENE_CAPTION_MODES scopes it.
+GPU_CALLED = {"image-description", "prompt-enhance"}
 
 
 def canonical_mode(raw: str | None) -> str:
@@ -206,7 +215,7 @@ def _select_mode(names: list[str], raw: str | None) -> list[str]:
         # or its 24 GB card, so on a box that renders, the captioner runs in motion mode only.
         # The API-side guard (refuse captions while rendering) stays, but it matched boxes by
         # hostname and let this one through; the box itself is the authority now.
-        rendering = [n for n in mine if n != "image-description"]
+        rendering = [n for n in mine if n not in GPU_CALLED]
         return rendering or mine or list(names)
     excluded = _MODE_EXCLUDES.get(mode, set())
     if mode == "train":
