@@ -77,6 +77,7 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
             char_loras: list | None = None,
             content_loras: list | None = None,
             img_compression: int | None = None,
+            stage2_sigmas: str | None = None,
             text_to_video: bool = False) -> dict:
     """Patch the validated graph with this render's configuration.
 
@@ -117,6 +118,11 @@ def resolve(graph: dict, image_name: str, width: int, height: int, *,
         for v in g.values():
             if isinstance(v, dict) and v.get("class_type") == "LTXVPreprocess":
                 v["inputs"]["img_compression"] = int(img_compression)
+
+    # Stage 2's noise schedule (console#717), a global from Settings. None leaves the template's
+    # value, so a render with nothing set hashes exactly as it did.
+    if stage2_sigmas:
+        g["360"]["inputs"]["sigmas"] = stage2_sigmas
 
     g["121"]["inputs"]["text"] = prompt
     if negative:
@@ -245,6 +251,11 @@ def base_model_note(graph: dict) -> str:
             name = n["inputs"]["ckpt_name"]
             return name[: -len(".safetensors")] if name.endswith(".safetensors") else name
     return "unknown"
+
+
+def stage2_sigmas_note(graph: dict) -> str:
+    """Stage 2's noise schedule, read off the resolved graph like the notes around it."""
+    return f"stage2 sigmas {graph['360']['inputs']['sigmas']}"
 
 
 def lora_stack_note(graph: dict) -> str:

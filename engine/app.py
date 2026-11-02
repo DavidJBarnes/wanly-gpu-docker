@@ -231,6 +231,11 @@ class JobRequest(BaseModel):
     # Video CRF applied to the conditioning frame before it anchors the render. None leaves
     # the workflow's own value alone; 0 is meaningful and bypasses the encode entirely.
     img_compression: int | None = Field(default=None, ge=0, le=51)
+    # Stage 2's ManualSigmas on the recipe path (console#717). None leaves the workflow's own
+    # schedule. The API validates this; the pattern is the last line, because ManualSigmas
+    # pulls numbers out with a regex and would misread anything but plain decimals.
+    stage2_sigmas: str | None = Field(
+        default=None, pattern=r"^\d*\.?\d+(\s*,\s*\d*\.?\d+)+$")
     # The pose's content LoRA -- motion and act -- chained ahead of the character LoRA on
     # both stage branches. Named explicitly rather than reusing `loras[0]`, which the recipe
     # path already spends on the CHARACTER LoRA; one list carrying two different roles by
@@ -887,6 +892,7 @@ def run_job(job: Job):
                     for c in job.req.content_loras
                 ],
                 img_compression=job.req.img_compression,
+                stage2_sigmas=job.req.stage2_sigmas,
                 text_to_video=t2v,
             )
             # IDENTITY REFERENCE (#156), right after resolve() and only when asked for. A
@@ -934,7 +940,8 @@ def run_job(job: Job):
                 f"recipe {job.req.recipe!r} · {mode} · "
                 f"base {recipe_mod.base_model_note(graph)} · "
                 f"{recipe_mod.lora_stack_note(graph)} · "
-                f"{recipe_mod.identity_note(graph)} · graph {gh[:12]}"
+                f"{recipe_mod.identity_note(graph)} · "
+                f"{recipe_mod.stage2_sigmas_note(graph)} · graph {gh[:12]}"
             )
             # base_model_note(graph), NOT the local `ck`. `ck` is assigned inside the
             # `for lo in job.req.loras` loop above, so a render with NO character LoRA never
@@ -1241,7 +1248,7 @@ def purge_all_jobs(keep_recent: int = 5):
 
 
 #: See health(). "identity_ref": add_identity_ref (#156).
-FEATURES = {"identity_ref"}
+FEATURES = {"identity_ref", "stage2_sigmas"}
 
 
 @app.get("/health")
