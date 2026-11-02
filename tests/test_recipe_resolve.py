@@ -438,3 +438,24 @@ def test_the_id_table_is_the_only_cap():
     src = inspect.getsource(recipe_mod.resolve)
     assert "len(CHAR_NODE_IDS)" in src
     assert recipe_mod.CHAR_NODE_IDS == ("962", "963")
+
+
+def _resolve(graph, **kw):
+    return recipe_mod.resolve(graph, "x.png", 1216, 832, prompt="p", **kw)
+
+
+def test_stage2_sigmas_unset_leaves_the_graph_and_its_hash_alone(graph):
+    """console#717: nothing set in Settings must not move the regression hash."""
+    plain = _resolve(graph)
+    assert plain["360"]["inputs"]["sigmas"] == graph["360"]["inputs"]["sigmas"]
+    assert recipe_mod.graph_hash(plain) == recipe_mod.graph_hash(_resolve(graph, stage2_sigmas=None))
+
+
+def test_stage2_sigmas_set_patches_only_the_stage2_schedule(graph):
+    plain, low = _resolve(graph), _resolve(graph, stage2_sigmas="0.725, 0.4219, 0.0")
+    assert low["360"]["inputs"]["sigmas"] == "0.725, 0.4219, 0.0"
+    assert recipe_mod.graph_hash(low) != recipe_mod.graph_hash(plain)
+    low["360"]["inputs"]["sigmas"] = plain["360"]["inputs"]["sigmas"]
+    assert low == plain
+    assert "0.725, 0.4219, 0.0" in recipe_mod.stage2_sigmas_note(
+        _resolve(graph, stage2_sigmas="0.725, 0.4219, 0.0"))
