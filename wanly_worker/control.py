@@ -107,6 +107,10 @@ async def lifespan(app: FastAPI):
         if "ltx-engine" in names:
             from wanly_worker.services.ltx_engine import WORKER_ID_FILE
             os.environ["WORKER_ID_FILE"] = WORKER_ID_FILE
+        elif "hologram" in names:
+            # The other way round: the queue client writes it, the hologram worker reads it.
+            from wanly_worker.services.hologram import WORKER_ID_FILE
+            os.environ["WORKER_ID_FILE"] = WORKER_ID_FILE
         # Built from what the box is EQUIPPED for, started for what the mode asks. A service
         # that only runs in another mode (image-edit, console#548) has to exist here for
         # POST /mode to start it later; it is held stopped until then.

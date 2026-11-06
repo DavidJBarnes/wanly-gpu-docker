@@ -207,9 +207,27 @@ class QueueClient:
             r.raise_for_status()
             self.worker_id = r.json()["id"]
             _log(f"registered with wanly-api as {body['friendly_name']} ({self.worker_id})")
+            self._write_id_file()
         except Exception as e:
             # Non-fatal, on purpose. See the module docstring.
             _log(f"could not register with wanly-api ({e}) — continuing anyway")
+
+    def _write_id_file(self) -> None:
+        """Hand the row id to the hologram worker, which claims against it (#228).
+
+        Only when hologram runs here: on a render box the render daemon writes this file, and
+        a second writer would be a race over who the box is. Rewritten on every registration,
+        because a re-registration after a 404 can land on a new id.
+        """
+        path = os.environ.get("WORKER_ID_FILE")
+        if not (path and self.worker_id and "hologram" in self.provides()):
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(f"{self.worker_id}\n")
+        except OSError as e:
+            _log(f"could not write {path} ({e}) — holograms will not be claimed")
 
     async def beat(self) -> None:
         if not self.worker_id:

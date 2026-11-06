@@ -61,6 +61,7 @@ case ",$SERVICES," in *,ltx-engine,*)         WANT_ENGINE=1 ;;    *) WANT_ENGINE
 case ",$SERVICES," in *,image-edit,*)         WANT_IMAGE_EDIT=1 ;; *) WANT_IMAGE_EDIT=0 ;; esac
 case ",$SERVICES," in *,scene-caption,*)      WANT_SCENE=1 ;;     *) WANT_SCENE=0 ;;     esac
 case ",$SERVICES," in *,prompt-enhance,*)     WANT_ENHANCE=1 ;;   *) WANT_ENHANCE=0 ;;   esac
+case ",$SERVICES," in *,hologram,*)           WANT_HOLOGRAM=1 ;;  *) WANT_HOLOGRAM=0 ;;  esac
 
 # THE RENDER STACK'S MOUNTS AND PORTS ARE THE RENDER STACK'S (console#547). They used to be
 # unconditional, which made a box that renders nothing -- the 2070, running face-edit beside
@@ -170,6 +171,12 @@ if [ "$WANT_ENHANCE" = "1" ]; then
         exit 1
     fi
     for v in PROMPT_ENHANCE_IDLE_S PROMPT_ENHANCE_CTX PROMPT_ENHANCE_MAX_TOKENS PROMPT_ENHANCE_AUTO_FETCH; do
+        if [ -n "${!v:-}" ]; then SCENE_ENV_ARGS+=(-e "$v=${!v}"); fi
+    done
+fi
+if [ "$WANT_HOLOGRAM" = "1" ]; then
+    # hologram (#228): CPU-only, no mounts, no ports. Its two knobs, when the env file sets them.
+    for v in ONNX_THREADS HOLOGRAM_MIN_HEADROOM_GB; do
         if [ -n "${!v:-}" ]; then SCENE_ENV_ARGS+=(-e "$v=${!v}"); fi
     done
 fi
