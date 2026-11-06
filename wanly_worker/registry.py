@@ -24,6 +24,7 @@ from typing import Callable
 from wanly_worker.service import Service
 from wanly_worker.services.face_crop import FaceCrop
 from wanly_worker.services.face_edit import FaceEdit
+from wanly_worker.services.hologram import HologramWorker
 from wanly_worker.services.image_description import ImageDescription
 from wanly_worker.services.image_edit import image_edit_group
 from wanly_worker.services.lora_trainer import LoraTrainer
@@ -49,6 +50,9 @@ KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
     # The Sulphur-2 prompt enhancer (#225), loaded per request. Called, claims nothing. Meant
     # for the scene box beside scene-caption, which it asks to yield the card while it runs.
     "prompt-enhance": PromptEnhance,
+    # AR holograms + smashcut concats on the CPU (#228). Claims work, but CPU work: it runs in
+    # every mode and is no card's tenant. Meant for the scene box, off the render boxes.
+    "hologram": HologramWorker,
 }
 
 #: Services whose presence changes what KIND of worker this box is. The API's claim gates key
@@ -59,10 +63,18 @@ KNOWN: dict[str, Callable[[], list[Service] | Service]] = {
 KIND_BY_SERVICE = {"ltx-engine": "render", "lora-trainer": "trainer"}
 
 
+#: Services that claim CPU-only work. Kept OUT of KIND_BY_SERVICE on purpose: the modes read
+#: that as "the card's tenant" -- a render box drops its GPU-called services beside one, and
+#: motion/edit/train drop it -- and a hologram needs neither. It changes only what the box may
+#: claim, which wanly-api reads from `kinds`.
+CPU_KIND_BY_SERVICE = {"hologram": "hologram"}
+
+
 def kinds_for(names: list[str]) -> list[str]:
     """What this box registers as, render first (wanly-api's `kind` is kinds[0]). A box that
     runs only image-description is a `service`: it takes no work of any kind."""
     out = [KIND_BY_SERVICE[n] for n in names if n in KIND_BY_SERVICE]
+    out += [CPU_KIND_BY_SERVICE[n] for n in names if n in CPU_KIND_BY_SERVICE]
     if "render" in out:
         out = ["render", *[k for k in out if k != "render"]]
     return out or ["service"]
